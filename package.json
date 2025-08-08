@@ -1,6 +1,6 @@
 {
   "name": "quico",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A pure JavaScript implementation of QUIC, HTTP/3, QPACK, and WebTransport for Node.js",
   "main": "index.js",
   "scripts": {
@@ -18,11 +18,11 @@
   },
   "homepage": "https://github.com/colocohen/quico",
   "dependencies": {
-    "@noble/curves": "^1.9.6",
-    "@noble/hashes": "^1.8.0",
-    "@peculiar/x509": "^1.13.0",
-    "@stablelib/aes": "^2.0.1",
-    "@stablelib/gcm": "^2.0.1",
-    "flat-ranges": "^1.0.1"
+    "@noble/curves": ">=1.9.6",
+    "@noble/hashes": ">=1.8.0",
+    "@peculiar/x509": ">=1.13.0",
+    "@stablelib/aes": ">=2.0.1",
+    "@stablelib/gcm": ">=2.0.1",
+    "flat-ranges": ">=1.0.2"
   }
 }

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/colocohen/quico/raw/main/quico.svg" width="220" alt="QUICO Logo"/>
+  <img src="https://github.com/colocohen/quico/raw/main/quico.svg" width="450" alt="QUICO"/>
 </p>
 
 <h1 align="center">QUICO</h1>
