@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>WebTransport Datagram Echo Client</title>
+</head>
+<body>
+  <h1>WebTransport Datagram Echo</h1>
+  <button id="sendBtn">Send "Hello QUIC"</button>
+  <pre id="log"></pre>
+
+  <script>
+    const log = (msg) => {
+      console.log(msg);
+      document.getElementById('log').textContent += msg + '\n';
+    };
+
+    let transport;
+    let writer;
+
+    async function connect() {
+      try {
+        transport = new WebTransport('https://localhost:4433/');
+        await transport.ready;
+        log('✅ Connected to WebTransport server');
+
+        // שליחה
+        writer = transport.datagrams.writable.getWriter();
+
+        // קבלה
+        const reader = transport.datagrams.readable.getReader();
+        (async function readLoop() {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const text = new TextDecoder().decode(value);
+            log('📥 Received: ' + text);
+          }
+        })();
+      } catch (err) {
+        log('❌ Connection failed: ' + err);
+      }
+    }
+
+    document.getElementById('sendBtn').addEventListener('click', async () => {
+      if (!writer) {
+        log('Not connected yet...');
+        return;
+      }
+      const msg = 'Hello QUIC';
+      await writer.write(new TextEncoder().encode(msg));
+      log('📤 Sent: ' + msg);
+    });
+
+    connect();
+  </script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "name": "quico",
+  "version": "0.1.0",
+  "description": "A pure JavaScript implementation of QUIC, HTTP/3, QPACK, and WebTransport for Node.js",
+  "main": "index.js",
+  "scripts": {
+    "start": "node examples/webtransport_datagram_echo/server.js"
+  },
+  "keywords": ["quic", "http3", "h3", "webtransport", "datagram", "udp", "qpack", "tls", "tls1.3", "nodejs"],
+  "author": "colocohen",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/quico.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/quico/issues"
+  },
+  "homepage": "https://github.com/colocohen/quico",
+  "dependencies": {
+    "@noble/curves": "^1.9.6",
+    "@noble/hashes": "^1.8.0",
+    "@peculiar/x509": "^1.13.0",
+    "@stablelib/aes": "^2.0.1",
+    "@stablelib/gcm": "^2.0.1",
+    "flat-ranges": "^1.0.1"
+  }
+}
