@@ -37,18 +37,6 @@ npm install quico
 
 ## 🏃 Quick start
 
-### Step 1: Generate a self-signed certificate
-
-To test QUICO locally, you’ll need a TLS certificate.  
-Generate one using OpenSSL:
-
-```bash
-mkdir certs
-openssl req -x509 -newkey rsa:2048 -nodes -keyout certs/localhost.key -out certs/localhost.crt -days 365
-```
-
-### Step 2: Create a basic HTTP/3 server
-
 ```js
 const fs = require('fs');
 const quico = require('quico');
@@ -73,9 +61,26 @@ server.listen(4433, function () {
   console.log('🚀 QUIC server running on https://localhost:4433');
 });
 ```
-
-> ✅ You must launch Chrome with `--enable-quic` and `--origin-to-force-quic-on=localhost:4433`  
 > 📂 For more examples, see [`examples/`](./examples)
+
+
+## 🧪 Testing
+
+QUIC requires **TLS 1.3 with an ECDSA certificate**.
+RSA self-signed certificates usually fail with QUIC/HTTP3.
+For local development the easiest option is [mkcert](https://github.com/FiloSottile/mkcert),
+which generates locally trusted ECDSA certificates automatically.
+
+This project supports ALPN `"h3"` only
+(final version, not draft variants like `h3-29` or `h3-32`).
+You must explicitly force h3 when testing.
+
+> ✅ Launch Chrome with:
+> `--enable-quic --quic-version=h3 --ignore-certificate-errors --origin-to-force-quic-on=localhost:4433`
+>
+> ✅ Or test with Curl:
+> `curl --http3 -vvv --trace-time --trace-ascii - https://localhost:4433 --insecure`
+
 
 ## 🛣 Roadmap
 
