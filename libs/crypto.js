@@ -16,110 +16,35 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  */
 
-var nobleHashes={
-  hmac: require("@noble/hashes/hmac.js")['hmac'],
-  hkdf: require("@noble/hashes/hkdf.js")['hkdf'],
-  hkdf_extract: require("@noble/hashes/hkdf.js")['extract'],
-  hkdf_expand: require("@noble/hashes/hkdf.js")['expand'],
-  sha256: require("@noble/hashes/sha2.js")['sha256'],
-};
 
-var { p256 } = require('@noble/curves/p256');
-var { x25519 } = require('@noble/curves/ed25519');
-var { sha256, sha384 } = require('@noble/hashes/sha2');
+import { hmac } from '@noble/hashes/hmac.js';
+import { hkdf, extract as hkdf_extract, expand as hkdf_expand } from '@noble/hashes/hkdf.js';
+import { sha256, sha384 } from '@noble/hashes/sha2.js';
 
-var crypto = require('crypto');
+import { p256 } from '@noble/curves/nist.js';
+import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 
-var { AES } = require('@stablelib/aes');
-var { GCM } = require('@stablelib/gcm');
+var nobleHashes = { hmac, hkdf, hkdf_extract, hkdf_expand, sha256 };
 
-var x509 = require('@peculiar/x509');
+import * as crypto from 'crypto';
 
-var {
+import {
   concatUint8Arrays,
   writeVarInt,
   readVarInt
-} = require('./utils');
+} from './utils.js';
 
 
 
-
-
-function get_cipher_info(cipher_suite) {
-  switch (cipher_suite) {
-    case 0x1301: // TLS_AES_128_GCM_SHA256
-      return { keylen: 16, ivlen: 12, hash: sha256,str: 'sha256' };
-    case 0x1302: // TLS_AES_256_GCM_SHA384
-      return { keylen: 32, ivlen: 12, hash: sha384,str: 'sha384' };
-    case 0x1303: // TLS_CHACHA20_POLY1305_SHA256
-      return { keylen: 32, ivlen: 12, hash: sha256,str: 'sha256' };
-    default:
-      throw new Error("Unsupported cipher suite: 0x" + cipher_suite.toString(16));
-  }
+function getHashFn(hashName) {
+  if (hashName === 'sha256') return sha256;
+  if (hashName === 'sha384') return sha384;
+  throw new Error('Unsupported hash: ' + hashName);
 }
 
-
-
-
-function build_server_hello(server_random, public_key, session_id, cipher_suite, group) {
-    var legacy_version = [0x03, 0x03];
-    var random = Array.from(server_random);
-    var session_id_bytes = Array.from(session_id);
-    var session_id_length = session_id_bytes.length & 0xff;
-
-    var cipher_suite_bytes = [(cipher_suite >> 8) & 0xff, cipher_suite & 0xff];
-    var compression_method = [0x00];
-
-    var key = Array.from(public_key);
-    var key_length = [(key.length >> 8) & 0xff, key.length & 0xff];
-    var group_bytes = [(group >> 8) & 0xff, group & 0xff];
-    var key_exchange = [...group_bytes, ...key_length, ...key];
-    var key_share_extension = (() => {
-        var extension_type = [0x00, 0x33];
-        var extension_length = [(key_exchange.length >> 8) & 0xff, key_exchange.length & 0xff];
-        return [...extension_type, ...extension_length, ...key_exchange];
-    })();
-
-    var supported_versions_extension = [
-        0x00, 0x2b,
-        0x00, 0x02,
-        0x03, 0x04
-    ];
-
-    var params_bytes = [
-      0x00, 0x01,  0x00, 0x04,  0x00, 0x00, 0x10, 0x00, // initial_max_data = 4096
-      0x00, 0x03,  0x00, 0x04,  0x00, 0x00, 0x08, 0x00  // max_packet_size = 2048
-    ];
-
-    
-
-    var extensions = [
-      ...supported_versions_extension,
-      ...key_share_extension
-    ];
-    var extensions_length = [(extensions.length >> 8) & 0xff, extensions.length & 0xff];
-
-    var handshake_body = [
-        ...legacy_version,
-        ...random,
-        session_id_length,
-        ...session_id_bytes,
-        ...cipher_suite_bytes,
-        ...compression_method,
-        ...extensions_length,
-        ...extensions
-    ];
-
-    var body_length = handshake_body.length;
-    var handshake = [
-        0x02, // handshake type: ServerHello
-        (body_length >> 16) & 0xff,
-        (body_length >> 8) & 0xff,
-        body_length & 0xff,
-        ...handshake_body
-    ];
-
-    return Uint8Array.from(handshake); // ✔️ מחזיר רק Handshake Message
+function getHashLen(hashName) {
+  var fn = getHashFn(hashName);
+  return fn.outputLen|0;
 }
 
 
@@ -205,130 +130,7 @@ function build_alpn_ext(protocol) {
     return ext;
 }
 
-function build_encrypted_extensions(extensions) {
-    var ext_bytes = [];
-    for (var ext of extensions) {
-        ext_bytes.push((ext.type >> 8) & 0xff, ext.type & 0xff);
-        ext_bytes.push((ext.data.length >> 8) & 0xff, ext.data.length & 0xff);
-        ext_bytes.push(...ext.data);
-    }
-    var ext_len = ext_bytes.length;
-    var ext_len_bytes = [(ext_len >> 8) & 0xff, ext_len & 0xff];
-    var body = [...ext_len_bytes, ...ext_bytes];
-    var hs_len = body.length;
-    var header = [0x08, (hs_len >> 16) & 0xff, (hs_len >> 8) & 0xff, hs_len & 0xff];
-    return Uint8Array.from([...header, ...body]);
-}
 
-function build_certificate(certificates) {
-    var context = [0x00];
-    var cert_list = [];
-    for (var cert of certificates) {
-        var extensions = cert.extensions instanceof Uint8Array ? cert.extensions : new Uint8Array(0);
-        cert_list.push((cert.cert.length >> 16) & 0xff, (cert.cert.length >> 8) & 0xff, cert.cert.length & 0xff);
-        cert_list.push(...cert.cert);
-        cert_list.push((extensions.length >> 8) & 0xff, extensions.length & 0xff);
-        cert_list.push(...extensions);
-    }
-    var total_len = cert_list.length;
-    var list_len = [(total_len >> 16) & 0xff, (total_len >> 8) & 0xff, total_len & 0xff];
-    var body = [...context, ...list_len, ...cert_list];
-    var hs_len = body.length;
-    var header = [0x0b, (hs_len >> 16) & 0xff, (hs_len >> 8) & 0xff, hs_len & 0xff];
-    return Uint8Array.from([...header, ...body]);
-}
-
-
-
-function build_certificate_verify(algorithm, signature) {
-    var sig_len = signature.length;
-    var total_len = 4 + sig_len;
-    var header = [
-        0x0f,
-        (total_len >> 16) & 0xff,
-        (total_len >> 8) & 0xff,
-        total_len & 0xff,
-        (algorithm >> 8) & 0xff, algorithm & 0xff,
-        (sig_len >> 8) & 0xff, sig_len & 0xff
-    ];
-    return Uint8Array.from([...header, ...signature]);
-}
-
-function build_finished(verify_data) {
-    var length = verify_data.length;
-    var header = [0x14, (length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff];
-    return Uint8Array.from([...header, ...verify_data]);
-}
-
-
-
-function handle_client_hello(parsed) {
-
-  
-  var supported_groups = [0x001d, 0x0017]; // X25519, secp256r1
-  var supported_cipher_suites = [0x1301, 0x1302];//0x1303, 
-
-  var selected_alpn=null;
-  var selected_group=null;
-  var selected_cipher=null;
-
-  var client_public_key=null;
-
-  var server_private_key=null;
-  var server_public_key=null;
-  var shared_secret=null;
-
-  for(var i in supported_cipher_suites){
-    if(parsed.cipher_suites.includes(supported_cipher_suites[i])==true){
-      selected_cipher=supported_cipher_suites[i];
-      break;
-    }
-  }
-
-  for(var i in supported_groups){
-    if(selected_group==null){
-      for(var i2 in parsed.key_shares){
-        if(parsed.key_shares[i2].group==supported_groups[i]){
-          selected_group=parsed.key_shares[i2].group;
-          client_public_key=parsed.key_shares[i2].pubkey;
-          break;
-        }
-      }
-    }
-  }
-
-  
-
-  if(selected_group!==null){
-
-    if (selected_group === 0x001d) { // X25519
-      server_private_key = crypto.randomBytes(32);
-      server_public_key = x25519.getPublicKey(server_private_key);
-      shared_secret = x25519.getSharedSecret(server_private_key, client_public_key);
-    } else if (selected_group === 0x0017) { // secp256r1 (P-256)
-      server_private_key = p256.utils.randomPrivateKey();
-      server_public_key = p256.getPublicKey(server_private_key, false);
-      var client_point = p256.ProjectivePoint.fromHex(client_public_key);
-      var shared_point = client_point.multiply(
-          BigInt('0x' + Buffer.from(server_private_key).toString('hex'))
-      );
-      shared_secret = shared_point.toRawBytes().slice(0, 32);
-    }
-
-  }
-
-
-  return {
-    selected_cipher: selected_cipher,
-    selected_group: selected_group,
-    client_public_key: client_public_key,
-    server_private_key: new Uint8Array(server_private_key),
-    server_public_key: server_public_key,
-    shared_secret: shared_secret
-  }
-
-
-}
 
 
 
@@ -433,13 +235,6 @@ function parse_transport_parameters(buf, start) {
 
 
 
-function parse_tls_message(data) {
-    var view = new Uint8Array(data);
-    var type = view[0];
-    var length = (view[1] << 16) | (view[2] << 8) | view[3];
-    var body = new Uint8Array(view.buffer, view.byteOffset + 4, length);
-    return { type, length, body };
-}
 function parse_tls_client_hello2(body) {
   var view = new Uint8Array(body);
   var ptr = 0;
@@ -770,25 +565,25 @@ function parse_tls_client_hello(body) {
 
 ////////////////////////////////
 		
-function hmac(hash, key, data) {
+function hmac2(hash, key, data) {
     return new Uint8Array(crypto.createHmac(hash, key).update(data).digest());
 }
-function hkdf_extract(salt, ikm, hash_func) {
+function hkdf_extract2(salt, ikm, hash_func) {
   return nobleHashes.hkdf_extract(hash_func, ikm, salt);
 }
 
 
-function hkdf_expand(prk, info, length, hash_func) {
+function hkdf_expand2(prk, info, length, hash_func) {
   return nobleHashes.hkdf_expand(hash_func, prk, info, length);
 }
 
 
 
 function build_hkdf_label(label, context, length) {
-  const prefix = "tls13 ";
-  const full = new TextEncoder().encode(prefix + label);
+  var prefix = "tls13 ";
+  var full = new TextEncoder().encode(prefix + label);
 
-  const info = new Uint8Array(
+  var info = new Uint8Array(
       2 + 1 + full.length + 1 + context.length);
 
   // length (2-bytes, BE)
@@ -800,7 +595,7 @@ function build_hkdf_label(label, context, length) {
   info.set(full, 3);
 
   // context length + bytes
-  const ctxOfs = 3 + full.length;
+  var ctxOfs = 3 + full.length;
   info[ctxOfs] = context.length;
   info.set(context, ctxOfs + 1);
 
@@ -808,64 +603,12 @@ function build_hkdf_label(label, context, length) {
 }
 
 function hkdf_expand_label(secret, label, context, length, hash_func) {
-  const info = build_hkdf_label(label, context, length);
-  return hkdf_expand(secret, info, length, hash_func);   // hash = sha384/sha256
+  var info = build_hkdf_label(label, context, length);
+  return hkdf_expand2(secret, info, length, hash_func);   // hash = sha384/sha256
 }
 
 
-function hash_transcript(messages,hash_func) {
-    var total_len = messages.reduce((sum, m) => sum + m.length, 0);
-    var total = new Uint8Array(total_len);
-    var offset = 0;
-    for (var m of messages) {
-        total.set(m, offset);
-        offset += m.length;
-    }
-    return hash_func(total);
-}
 
-function tls_derive_app_secrets(handshake_secret, transcript, hash_func) {
-  const hashLen = hash_func.outputLen;
-  const empty = new Uint8Array(0);
-  var zero = new Uint8Array(hash_func.outputLen);
-
-  var derived_secret = hkdf_expand_label(handshake_secret, "derived", hash_func(empty), hash_func.outputLen, hash_func);
-  var master_secret = hkdf_extract(derived_secret, zero, hash_func);
-
-  // שלב 3: חישוב hash של ה־transcript עד server Finished
-  const transcript_hash = hash_transcript(transcript, hash_func);
-
-  // שלב 4: גזירת סודות התעבורה
-  const client_app = hkdf_expand_label(master_secret, 'c ap traffic', transcript_hash, hashLen, hash_func);
-  const server_app = hkdf_expand_label(master_secret, 's ap traffic', transcript_hash, hashLen, hash_func);
-
-  return {
-    client_application_traffic_secret: client_app,
-    server_application_traffic_secret: server_app
-  };
-}
-
-
-function tls_derive_handshake_secrets(shared_secret, transcript, hash_func) {
-  var zero = new Uint8Array(hash_func.outputLen);
-  var empty = new Uint8Array();
-
-  var early_secret = hkdf_extract(empty, zero, hash_func); // salt, ikm
-  var derived_secret = hkdf_expand_label(early_secret, "derived", hash_func(empty), hash_func.outputLen, hash_func);
-  var handshake_secret = hkdf_extract(derived_secret, shared_secret, hash_func);
-
-  var transcript_hash = hash_transcript(transcript, hash_func);
-
-  var client_hts = hkdf_expand_label(handshake_secret, "c hs traffic", transcript_hash, hash_func.outputLen, hash_func);
-  var server_hts = hkdf_expand_label(handshake_secret, "s hs traffic", transcript_hash, hash_func.outputLen, hash_func);
-
-  return {
-    handshake_secret,
-    client_handshake_traffic_secret: client_hts,
-    server_handshake_traffic_secret: server_hts,
-    transcript_hash
-  };
-}
 
 function aead_decrypt(key, iv, packetNumber, ciphertextWithTag, aad, callback) {
   try {
@@ -884,11 +627,11 @@ function aead_decrypt(key, iv, packetNumber, ciphertextWithTag, aad, callback) {
                key.length === 16 ? 'aes-128-gcm' :
                (() => { throw new Error("Unsupported key length: " + key.length); })();
 
-    const decipher = crypto.createDecipheriv(algo, key, nonce);
+    var decipher = crypto.createDecipheriv(algo, key, nonce);
     decipher.setAuthTag(tag);
     decipher.setAAD(aad);
 
-    const decrypted = decipher.update(ciphertext);
+    var decrypted = decipher.update(ciphertext);
     decipher.final();
 
     callback(null, decrypted);
@@ -924,7 +667,7 @@ function aes_gcm_decrypt(ciphertext, tag, key, nonce, aad) {
   }
 }
 
-const INITIAL_SALTS = {
+var INITIAL_SALTS = {
     // QUIC v1 (RFC 9001)
     0x00000001: new Uint8Array([
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
@@ -955,15 +698,15 @@ const INITIAL_SALTS = {
 };
 
 function quic_derive_init_secrets(client_dcid, version, direction) {
-    const hash_func = sha256;
+    var hash_func = sha256;
     //console.log(version);
-    const salt = INITIAL_SALTS[version] || null;
+    var salt = INITIAL_SALTS[version] || null;
     if (!salt) throw new Error("Unsupported QUIC version: 0x" + version.toString(16));
 
-    const label = direction === 'read' ? 'client in' : 'server in';
-    const initial_secret = hkdf_extract(salt, client_dcid, hash_func);
+    var label = direction === 'read' ? 'client in' : 'server in';
+    var initial_secret = hkdf_extract2(salt, client_dcid, hash_func);
 
-    const initial_secret2 = hkdf_expand_label(
+    var initial_secret2 = hkdf_expand_label(
         initial_secret,
         label,
         new Uint8Array(0),
@@ -971,39 +714,41 @@ function quic_derive_init_secrets(client_dcid, version, direction) {
         hash_func
     );
 
-    const key = hkdf_expand_label(initial_secret2, 'quic key', new Uint8Array(0), 16, hash_func);  // AES-128-GCM
-    const iv  = hkdf_expand_label(initial_secret2, 'quic iv', new Uint8Array(0), 12, hash_func);
-    const hp  = hkdf_expand_label(initial_secret2, 'quic hp', new Uint8Array(0), 16, hash_func);
+    var key = hkdf_expand_label(initial_secret2, 'quic key', new Uint8Array(0), 16, hash_func);  // AES-128-GCM
+    var iv  = hkdf_expand_label(initial_secret2, 'quic iv', new Uint8Array(0), 12, hash_func);
+    var hp  = hkdf_expand_label(initial_secret2, 'quic hp', new Uint8Array(0), 16, hash_func);
 
     return { key, iv, hp };
 }
 
 
-function quic_derive_from_tls_secrets(traffic_secret, hash_func = sha256) {
-    if(traffic_secret){
-    const key = hkdf_expand_label(traffic_secret, 'quic key', new Uint8Array(0), 16, hash_func);
-    const iv  = hkdf_expand_label(traffic_secret, 'quic iv', new Uint8Array(0), 12, hash_func);
-    const hp  = hkdf_expand_label(traffic_secret, 'quic hp', new Uint8Array(0), 16, hash_func);
+function quic_derive_from_tls_secrets(traffic_secret, hash_name) {
+  var hash_func  = getHashFn(hash_name);
+
+  if(traffic_secret){
+    var key = hkdf_expand_label(traffic_secret, 'quic key', new Uint8Array(0), 16, hash_func);
+    var iv  = hkdf_expand_label(traffic_secret, 'quic iv', new Uint8Array(0), 12, hash_func);
+    var hp  = hkdf_expand_label(traffic_secret, 'quic hp', new Uint8Array(0), 16, hash_func);
 
     return { key, iv, hp };
-    }
+  }
 }
 
 
 
 function compute_nonce(iv, packetNumber) {
-    const nonce = new Uint8Array(iv); // עותק של ה־IV המקורי (12 בתים)
-    const pnBuffer = new Uint8Array(12); // 12 בתים, מיושר לימין
+    var nonce = new Uint8Array(iv); // עותק של ה־IV המקורי (12 בתים)
+    var pnBuffer = new Uint8Array(12); // 12 בתים, מיושר לימין
 
     // הכנס את packetNumber לימין של pnBuffer
-    let n = packetNumber;
-    for (let i = 11; n > 0 && i >= 0; i--) {
+    var n = packetNumber;
+    for (var i = 11; n > 0 && i >= 0; i--) {
         pnBuffer[i] = n & 0xff;
         n >>= 8;
     }
 
     // בצע XOR בין ה־IV לבין pnBuffer
-    for (let i = 0; i < 12; i++) {
+    for (var i = 0; i < 12; i++) {
         nonce[i] ^= pnBuffer[i];
     }
 
@@ -1020,32 +765,32 @@ function aes_ecb_encrypt(keyBytes, plaintext) {
     throw new Error("Plaintext must be a multiple of 16 bytes");
   }
 
-  const cipher = crypto.createCipheriv('aes-' + (keyBytes.length * 8) + '-ecb', keyBytes, null);
+  var cipher = crypto.createCipheriv('aes-' + (keyBytes.length * 8) + '-ecb', keyBytes, null);
   cipher.setAutoPadding(false);
 
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  var encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   return new Uint8Array(encrypted);
 }
 
 
 function aead_encrypt(key, iv, packetNumber, plaintext, aad) {
   try {
-    const algo = key.length === 32 ? 'aes-256-gcm' :
+    var algo = key.length === 32 ? 'aes-256-gcm' :
                  key.length === 16 ? 'aes-128-gcm' :
                  (() => { throw new Error("Unsupported key length: " + key.length); })();
 
-    const nonce = compute_nonce(iv, packetNumber);
+    var nonce = compute_nonce(iv, packetNumber);
 
-    const cipher = crypto.createCipheriv(algo, Buffer.from(key), Buffer.from(nonce));
+    var cipher = crypto.createCipheriv(algo, Buffer.from(key), Buffer.from(nonce));
     cipher.setAAD(Buffer.from(aad));
 
-    const encrypted = Buffer.concat([
+    var encrypted = Buffer.concat([
       cipher.update(Buffer.from(plaintext)),
       cipher.final()
     ]);
-    const tag = cipher.getAuthTag();
+    var tag = cipher.getAuthTag();
 
-    const result = new Uint8Array(encrypted.length + tag.length);
+    var result = new Uint8Array(encrypted.length + tag.length);
     result.set(encrypted, 0);
     result.set(tag, encrypted.length);
 
@@ -1086,9 +831,9 @@ function apply_header_protection(packet, pnOffset, hpKey, pnLength) {
 
 
 function aes128ecb(sample,hpKey) {
-    const cipher = crypto.createCipheriv('aes-128-ecb', Buffer.from(hpKey), null);
+    var cipher = crypto.createCipheriv('aes-128-ecb', Buffer.from(hpKey), null);
     cipher.setAutoPadding(false);
-    const input = Buffer.from(sample);
+    var input = Buffer.from(sample);
     return new Uint8Array(Buffer.concat([cipher.update(input), cipher.final()]));
 }
 
@@ -1100,8 +845,8 @@ function expandPacketNumber(truncated, pnLen, largestReceived) {
 }
 
 function decode_packet_number(array, offset, pnLength) {
-  let value = 0;
-  for (let i = 0; i < pnLength; i++) {
+  var value = 0;
+  for (var i = 0; i < pnLength; i++) {
     value = (value << 8) | array[offset + i];
   }
   return value;
@@ -1144,43 +889,43 @@ function remove_header_protection(array, pnOffset, hpKey, isShort) {
 function decrypt_quic_packet(array, read_key, read_iv, read_hp, dcid, largest_pn) {
   if (!(array instanceof Uint8Array)) throw new Error("Invalid input");
 
-  const firstByte = array[0];
-  const isShort = (firstByte & 0x80) === 0;
-  const isLong = !isShort;
+  var firstByte = array[0];
+  var isShort = (firstByte & 0x80) === 0;
+  var isLong = !isShort;
 
-  let keyPhase = false;
-  let pnOffset = 0;
-  let pnLength = 0;
-  let aad = null;
-  let ciphertext = null;
-  let tag = null;
-  let packetNumber = null;
-  let nonce = null;
+  var keyPhase = false;
+  var pnOffset = 0;
+  var pnLength = 0;
+  var aad = null;
+  var ciphertext = null;
+  var tag = null;
+  var packetNumber = null;
+  var nonce = null;
 
   if (isLong) {
     // ---------- ניתוח Long Header ----------
-    const view = new DataView(array.buffer, array.byteOffset, array.byteLength);
-    const version = view.getUint32(1);
-    const dcidLen = array[5];
+    var view = new DataView(array.buffer, array.byteOffset, array.byteLength);
+    var version = view.getUint32(1);
+    var dcidLen = array[5];
 
-    let offset = 6;
-    const parsed_dcid = array.slice(offset, offset + dcidLen);
+    var offset = 6;
+    var parsed_dcid = array.slice(offset, offset + dcidLen);
     offset += dcidLen;
 
-    const scidLen = array[offset++];
-    const scid = array.slice(offset, offset + scidLen);
+    var scidLen = array[offset++];
+    var scid = array.slice(offset, offset + scidLen);
     offset += scidLen;
 
-    const typeBits = (firstByte & 0x30) >> 4;
-    const typeMap = ['initial', '0rtt', 'handshake', 'retry'];
-    const packetType = typeMap[typeBits];
+    var typeBits = (firstByte & 0x30) >> 4;
+    var typeMap = ['initial', '0rtt', 'handshake', 'retry'];
+    var packetType = typeMap[typeBits];
 
     if (packetType === 'initial') {
-      const tokenLen = readVarInt(array, offset);
+      var tokenLen = readVarInt(array, offset);
       offset += tokenLen.byteLength + tokenLen.value;
     }
 
-    const len = readVarInt(array, offset);
+    var len = readVarInt(array, offset);
     offset += len.byteLength;
 
     pnOffset = offset;
@@ -1192,13 +937,13 @@ function decrypt_quic_packet(array, read_key, read_iv, read_hp, dcid, largest_pn
       packetNumber = decode_and_expand_packet_number(array, pnOffset, pnLength, largest_pn);
       nonce = compute_nonce(read_iv, packetNumber);
 
-      const payloadStart = pnOffset + pnLength;
-      const payloadLength = len.value - pnLength;
-      const payloadEnd = payloadStart + payloadLength;
+      var payloadStart = pnOffset + pnLength;
+      var payloadLength = len.value - pnLength;
+      var payloadEnd = payloadStart + payloadLength;
 
       if (payloadEnd > array.length) throw new Error("Truncated long header packet");
 
-      const payload = array.slice(payloadStart, payloadEnd);
+      var payload = array.slice(payloadStart, payloadEnd);
       if (payload.length < 16) throw new Error("Encrypted payload too short");
 
       ciphertext = payload.slice(0, payload.length - 16);
@@ -1212,7 +957,7 @@ function decrypt_quic_packet(array, read_key, read_iv, read_hp, dcid, largest_pn
     // ---------- ניתוח Short Header ----------
     // פורמט: 1 byte header + DCID + Packet Number + Payload
 
-    const dcidLen = dcid.length;
+    var dcidLen = dcid.length;
     pnOffset = 1 + dcidLen;
 
     // הסרת הגנת כותרת
@@ -1224,8 +969,8 @@ function decrypt_quic_packet(array, read_key, read_iv, read_hp, dcid, largest_pn
       packetNumber = decode_and_expand_packet_number(array, pnOffset, pnLength, largest_pn);
       nonce = compute_nonce(read_iv, packetNumber);
 
-      const payloadStart = pnOffset + pnLength;
-      const payload = array.slice(payloadStart);
+      var payloadStart = pnOffset + pnLength;
+      var payload = array.slice(payloadStart);
       if (payload.length < 16) throw new Error("Encrypted payload too short");
 
       ciphertext = payload.slice(0, payload.length - 16);
@@ -1237,7 +982,7 @@ function decrypt_quic_packet(array, read_key, read_iv, read_hp, dcid, largest_pn
     
   }
 
-  const plaintext = aes_gcm_decrypt(ciphertext, tag, read_key, nonce, aad);
+  var plaintext = aes_gcm_decrypt(ciphertext, tag, read_key, nonce, aad);
 
   return {
     packet_number: packetNumber,
@@ -1259,7 +1004,7 @@ function extract_tls_messages_from_chunks(chunks, from_offset) {
   }
 
   // אם לא קיבלנו שום דבר – נחזיר ריק
-  if (buffers.length === 0) return [];
+  if (buffers.length === 0) return false;
 
   var combined = concatUint8Arrays(buffers);
   var tls_messages = [];
@@ -1359,6 +1104,7 @@ function build_quic_header(packetType, dcid, scid, token, lengthField, pnLen) {
 
 
 function encrypt_quic_packet(packetType, encodedFrames, writeKey, writeIv, writeHp, packetNumber, dcid, scid, token) {
+
   var pnLength;
   if (packetNumber <= 0xff) pnLength = 1;
   else if (packetNumber <= 0xffff) pnLength = 2;
@@ -1665,25 +1411,25 @@ function encode_quic_frames(frames) {
 
 
 function parse_quic_frames(buf) {
-  let offset = 0;
-  const frames = [];
-  const textDecoder = new TextDecoder();
+  var offset = 0;
+  var frames = [];
+  var textDecoder = new TextDecoder();
 
   function safeReadVarInt() {
     if (offset >= buf.length) return null;
-    const res = readVarInt(buf, offset);
+    var res = readVarInt(buf, offset);
     if (!res || typeof res.byteLength !== 'number') return null;
     offset += res.byteLength;
     return res;
   }
 
   while (offset < buf.length) {
-    const start = offset;
-    let type = buf[offset++];
+    var start = offset;
+    var type = buf[offset++];
 
     if (type >= 0x80) {
       offset--; // backtrack and read full varint
-      const t = safeReadVarInt();
+      var t = safeReadVarInt();
       if (!t) break;
       type = t.value;
     }
@@ -1695,67 +1441,67 @@ function parse_quic_frames(buf) {
       frames.push({ type: 'ping' });
 
     } else if ((type & 0xfe) === 0x02) {
-      const hasECN = (type & 0x01) === 0x01;
-      const largest = safeReadVarInt(); if (!largest) break;
-      const delay = safeReadVarInt(); if (!delay) break;
-      const rangeCount = safeReadVarInt(); if (!rangeCount) break;
-      const firstRange = safeReadVarInt(); if (!firstRange) break;
+      var hasECN = (type & 0x01) === 0x01;
+      var largest = safeReadVarInt(); if (!largest) break;
+      var delay = safeReadVarInt(); if (!delay) break;
+      var rangeCount = safeReadVarInt(); if (!rangeCount) break;
+      var firstRange = safeReadVarInt(); if (!firstRange) break;
 
-      const ranges = [];
-      for (let i = 0; i < rangeCount.value; i++) {
-        const gap = safeReadVarInt(); if (!gap) break;
-        const len = safeReadVarInt(); if (!len) break;
+      var ranges = [];
+      for (var i = 0; i < rangeCount.value; i++) {
+        var gap = safeReadVarInt(); if (!gap) break;
+        var len = safeReadVarInt(); if (!len) break;
         ranges.push({ gap: gap.value, length: len.value });
       }
 
-      let ecn = null;
+      var ecn = null;
       if (hasECN) {
-        const ect0 = safeReadVarInt(); if (!ect0) break;
-        const ect1 = safeReadVarInt(); if (!ect1) break;
-        const ce = safeReadVarInt(); if (!ce) break;
+        var ect0 = safeReadVarInt(); if (!ect0) break;
+        var ect1 = safeReadVarInt(); if (!ect1) break;
+        var ce = safeReadVarInt(); if (!ce) break;
         ecn = { ect0: ect0.value, ect1: ect1.value, ce: ce.value };
       }
 
       frames.push({ type: 'ack', largest: largest.value, delay: delay.value, firstRange: firstRange.value, ranges, ecn });
 
     } else if (type === 0x04) {
-      const id = safeReadVarInt(); if (!id) break;
+      var id = safeReadVarInt(); if (!id) break;
       if (offset + 2 > buf.length) break;
-      const error = buf[offset++] << 8 | buf[offset++];
-      const finalSize = safeReadVarInt(); if (!finalSize) break;
+      var error = buf[offset++] << 8 | buf[offset++];
+      var finalSize = safeReadVarInt(); if (!finalSize) break;
       frames.push({ type: 'reset_stream', id: id.value, error, finalSize: finalSize.value });
 
     } else if (type === 0x05) {
-      const id = safeReadVarInt(); if (!id) break;
+      var id = safeReadVarInt(); if (!id) break;
       if (offset + 2 > buf.length) break;
-      const error = buf[offset++] << 8 | buf[offset++];
+      var error = buf[offset++] << 8 | buf[offset++];
       frames.push({ type: 'stop_sending', id: id.value, error });
 
     } else if (type === 0x06) {
-      const off = safeReadVarInt(); if (!off) break;
-      const len = safeReadVarInt(); if (!len) break;
+      var off = safeReadVarInt(); if (!off) break;
+      var len = safeReadVarInt(); if (!len) break;
       if (offset + len.value > buf.length) break;
-      const data = buf.slice(offset, offset + len.value); offset += len.value;
+      var data = buf.slice(offset, offset + len.value); offset += len.value;
       frames.push({ type: 'crypto', offset: off.value, data });
 
     } else if (type === 0x07) {
-      const len = safeReadVarInt(); if (!len) break;
+      var len = safeReadVarInt(); if (!len) break;
       if (offset + len.value > buf.length) break;
-      const token = buf.slice(offset, offset + len.value); offset += len.value;
+      var token = buf.slice(offset, offset + len.value); offset += len.value;
       frames.push({ type: 'new_token', token });
 
     } else if ((type & 0xe0) === 0x00) {
-      const fin  = !!(type & 0x01);
-      const lenb = !!(type & 0x02);
-      const offb = !!(type & 0x04);
+      var fin  = !!(type & 0x01);
+      var lenb = !!(type & 0x02);
+      var offb = !!(type & 0x04);
 
-      const stream_id = safeReadVarInt(); if (!stream_id) break;
-      const offset_val = offb ? safeReadVarInt() : { value: 0 }; if (!offset_val) break;
-      const length_val = lenb ? safeReadVarInt() : { value: buf.length - offset }; if (!length_val) break;
+      var stream_id = safeReadVarInt(); if (!stream_id) break;
+      var offset_val = offb ? safeReadVarInt() : { value: 0 }; if (!offset_val) break;
+      var length_val = lenb ? safeReadVarInt() : { value: buf.length - offset }; if (!length_val) break;
 
       if (offset + length_val.value > buf.length) break;
 
-      const data = buf.slice(offset, offset + length_val.value); offset += length_val.value;
+      var data = buf.slice(offset, offset + length_val.value); offset += length_val.value;
 
       frames.push({
         type: 'stream',
@@ -1765,60 +1511,60 @@ function parse_quic_frames(buf) {
         data
       });
     } else if (type === 0x09) {
-      const max = safeReadVarInt(); if (!max) break;
+      var max = safeReadVarInt(); if (!max) break;
       frames.push({ type: 'max_data', max: max.value });
 
     } else if (type === 0x0a) {
-      const id = safeReadVarInt(); if (!id) break;
-      const max = safeReadVarInt(); if (!max) break;
+      var id = safeReadVarInt(); if (!id) break;
+      var max = safeReadVarInt(); if (!max) break;
       frames.push({ type: 'max_stream_data', id: id.value, max: max.value });
 
     } else if (type === 0x12 || type === 0x13) {
-      const max = safeReadVarInt(); if (!max) break;
+      var max = safeReadVarInt(); if (!max) break;
       frames.push({ type: type === 0x12 ? 'max_streams_bidi' : 'max_streams_uni', max: max.value });
 
     } else if (type === 0x14) {
-      const max = safeReadVarInt(); if (!max) break;
+      var max = safeReadVarInt(); if (!max) break;
       frames.push({ type: 'data_blocked', max: max.value });
 
     } else if (type === 0x15) {
-      const id = safeReadVarInt(); if (!id) break;
+      var id = safeReadVarInt(); if (!id) break;
       frames.push({ type: 'stream_data_blocked', id: id.value });
 
     } else if (type === 0x16 || type === 0x17) {
-      const max = safeReadVarInt(); if (!max) break;
+      var max = safeReadVarInt(); if (!max) break;
       frames.push({ type: type === 0x16 ? 'streams_blocked_bidi' : 'streams_blocked_uni', max: max.value });
 
     } else if (type === 0x18) {
-      const seq = safeReadVarInt(); if (!seq) break;
-      const retire = safeReadVarInt(); if (!retire) break;
+      var seq = safeReadVarInt(); if (!seq) break;
+      var retire = safeReadVarInt(); if (!retire) break;
       if (offset >= buf.length) break;
-      const len = buf[offset++];
+      var len = buf[offset++];
       if (offset + len + 16 > buf.length) break;
-      const connId = buf.slice(offset, offset + len); offset += len;
-      const token = buf.slice(offset, offset + 16); offset += 16;
+      var connId = buf.slice(offset, offset + len); offset += len;
+      var token = buf.slice(offset, offset + 16); offset += 16;
       frames.push({ type: 'new_connection_id', seq: seq.value, retire: retire.value, connId, token });
 
     } else if (type === 0x19) {
-      const seq = safeReadVarInt(); if (!seq) break;
+      var seq = safeReadVarInt(); if (!seq) break;
       frames.push({ type: 'retire_connection_id', seq: seq.value });
 
     } else if (type === 0x1a || type === 0x1b) {
       if (offset + 8 > buf.length) break;
-      const data = buf.slice(offset, offset + 8); offset += 8;
+      var data = buf.slice(offset, offset + 8); offset += 8;
       frames.push({ type: type === 0x1a ? 'path_challenge' : 'path_response', data });
 
     } else if (type === 0x1c || type === 0x1d) {
       if (offset + 2 > buf.length) break;
-      const error = buf[offset++] << 8 | buf[offset++];
-      let frameType = null;
+      var error = buf[offset++] << 8 | buf[offset++];
+      var frameType = null;
       if (type === 0x1c) {
-        const ft = safeReadVarInt(); if (!ft) break;
+        var ft = safeReadVarInt(); if (!ft) break;
         frameType = ft.value;
       }
-      const reasonLen = safeReadVarInt(); if (!reasonLen) break;
+      var reasonLen = safeReadVarInt(); if (!reasonLen) break;
       if (offset + reasonLen.value > buf.length) break;
-      const reason = textDecoder.decode(buf.slice(offset, offset + reasonLen.value)); offset += reasonLen.value;
+      var reason = textDecoder.decode(buf.slice(offset, offset + reasonLen.value)); offset += reasonLen.value;
       frames.push({ type: 'connection_close', application: type === 0x1d, error, frameType, reason });
 
     } else if (type === 0x1e) {
@@ -1828,8 +1574,8 @@ function parse_quic_frames(buf) {
       frames.push({ type: 'immediate_ack' });
 
     } else if (type === 0x30 || type === 0x31) {
-      let contextId = null;
-      let len = null;
+      var contextId = null;
+      var len = null;
 
       if (type === 0x31) {
         // קורא את context ID
@@ -1844,7 +1590,7 @@ function parse_quic_frames(buf) {
 
       if (offset + len.value > buf.length) break;
 
-      const data = buf.slice(offset, offset + len.value);
+      var data = buf.slice(offset, offset + len.value);
       offset += len.value;
 
       frames.push({
@@ -1854,11 +1600,11 @@ function parse_quic_frames(buf) {
       });
 
     } else if (type === 0xaf) {
-      const seq = safeReadVarInt(); if (!seq) break;
-      const packetTolerance = safeReadVarInt(); if (!packetTolerance) break;
+      var seq = safeReadVarInt(); if (!seq) break;
+      var packetTolerance = safeReadVarInt(); if (!packetTolerance) break;
       if (offset >= buf.length) break;
-      const ackDelayExponent = buf[offset++];
-      const maxAckDelay = safeReadVarInt(); if (!maxAckDelay) break;
+      var ackDelayExponent = buf[offset++];
+      var maxAckDelay = safeReadVarInt(); if (!maxAckDelay) break;
       frames.push({
         type: 'ack_frequency',
         seq: seq.value,
@@ -1888,31 +1634,31 @@ function parse_quic_packet(array, offset0 = 0) {
   if (!(array instanceof Uint8Array)) return null;
   if (offset0 >= array.length) return null;
 
-  const firstByte = array[offset0];
-  const isLongHeader = (firstByte & 0x80) !== 0;
+  var firstByte = array[offset0];
+  var isLongHeader = (firstByte & 0x80) !== 0;
 
   if (isLongHeader) {
     if (offset0 + 6 > array.length) return null;
 
-    const version = ((array[offset0+1] << 24) | (array[offset0+2] << 16) | (array[offset0+3] << 8) | array[offset0+4]) >>> 0;
+    var version = ((array[offset0+1] << 24) | (array[offset0+2] << 16) | (array[offset0+3] << 8) | array[offset0+4]) >>> 0;
 
-    const dcidLen = array[offset0+5];
-    let offset = offset0 + 6;
+    var dcidLen = array[offset0+5];
+    var offset = offset0 + 6;
 
     if (offset + dcidLen + 1 > array.length) return null;
-    const dcid = array.slice(offset, offset + dcidLen);
+    var dcid = array.slice(offset, offset + dcidLen);
     offset += dcidLen;
 
-    const scidLen = array[offset++];
+    var scidLen = array[offset++];
     if (offset + scidLen > array.length) return null;
-    const scid = array.slice(offset, offset + scidLen);
+    var scid = array.slice(offset, offset + scidLen);
     offset += scidLen;
 
     // Version negotiation
     if (version === 0) {
-      const supportedVersions = [];
+      var supportedVersions = [];
       while (offset + 4 <= array.length) {
-        const v = (array[offset] << 24) | (array[offset+1] << 16) | (array[offset+2] << 8) | array[offset+3];
+        var v = (array[offset] << 24) | (array[offset+1] << 16) | (array[offset+2] << 8) | array[offset+3];
         supportedVersions.push(v);
         offset += 4;
       }
@@ -1927,12 +1673,12 @@ function parse_quic_packet(array, offset0 = 0) {
       };
     }
 
-    const packetTypeBits = (firstByte & 0x30) >> 4;
-    const typeMap = ['initial', '0rtt', 'handshake', 'retry'];
-    const packetType = typeMap[packetTypeBits] || 'unknown';
+    var packetTypeBits = (firstByte & 0x30) >> 4;
+    var typeMap = ['initial', '0rtt', 'handshake', 'retry'];
+    var packetType = typeMap[packetTypeBits] || 'unknown';
 
     if (packetType === 'retry') {
-      const odcid = array.slice(offset);
+      var odcid = array.slice(offset);
       return {
         form: 'long',
         type: 'retry',
@@ -1945,10 +1691,10 @@ function parse_quic_packet(array, offset0 = 0) {
     }
 
     // === קריאה של Token אם זה Initial ===
-    let token = null;
+    var token = null;
     if (packetType === 'initial') {
       try {
-        const tokenLen = readVarInt(array, offset);
+        var tokenLen = readVarInt(array, offset);
         offset += tokenLen.byteLength;
         if (offset + tokenLen.value > array.length) return null;
         token = array.slice(offset, offset + tokenLen.value);
@@ -1960,11 +1706,11 @@ function parse_quic_packet(array, offset0 = 0) {
 
     // === כאן בא השלב הקריטי: לקרוא את Length ===
     try {
-      const lengthInfo = readVarInt(array, offset);
+      var lengthInfo = readVarInt(array, offset);
       offset += lengthInfo.byteLength;
 
-      const payloadLength = lengthInfo.value;
-      const totalLength = offset - offset0 + payloadLength;
+      var payloadLength = lengthInfo.value;
+      var totalLength = offset - offset0 + payloadLength;
 
       if (offset0 + totalLength > array.length) return null;
 
@@ -1981,7 +1727,7 @@ function parse_quic_packet(array, offset0 = 0) {
       return null;
     }
   } else {
-    const totalLength = array.length - offset0; // לא ניתן לדעת בדיוק, אז נניח שזה האחרון
+    var totalLength = array.length - offset0; // לא ניתן לדעת בדיוק, אז נניח שזה האחרון
     return {
       form: 'short',
       type: '1rtt',
@@ -1998,8 +1744,8 @@ function parse_quic_datagram(array) {
     var pkt = parse_quic_packet(array, offset);
     if (!pkt || !pkt.totalLength) break;
 
-    const start = offset;
-    const end = offset + pkt.totalLength;
+    var start = offset;
+    var end = offset + pkt.totalLength;
 
     // slice רק אם חייב
     pkt.raw = (start === 0 && end === array.length)
@@ -2077,31 +1823,19 @@ function build_new_session_ticket(session_id_bytes, options) {
 }
 
 
-module.exports = {
+export {
   extract_tls_messages_from_chunks,
-  get_cipher_info,
-  build_certificate,
   decrypt_quic_packet,
   quic_derive_init_secrets,
   quic_derive_from_tls_secrets,
-  parse_tls_message,
   parse_tls_client_hello,
-  build_server_hello,
-  tls_derive_handshake_secrets,
   build_quic_ext,
-  build_encrypted_extensions,
   hkdf_expand_label,
-  hmac,
-  hash_transcript,
-  handle_client_hello,
-  build_certificate_verify,
   encode_quic_frames,
   encrypt_quic_packet,
   parse_quic_datagram,
   parse_quic_packet,
   parse_quic_frames,
   build_alpn_ext,
-  build_finished,
-  tls_derive_app_secrets,
   parse_transport_parameters
 };

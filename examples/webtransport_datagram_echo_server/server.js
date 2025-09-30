@@ -1,27 +1,21 @@
-var quico = require('../../index');  // או './index' אם אתה מריץ מהשורש
-var fs = require('fs');
+import quico from 'quico';
+import fs from 'node:fs';
+import tls from 'lemon-tls';
 
 var server = quico.createServer({
   SNICallback: function (servername, cb) {
     console.log('Getting certificate for:', servername);
-    cb(null, {
-      key: fs.readFileSync('certs/localhost.key'),
-      cert: fs.readFileSync('certs/localhost.crt')
-    });
+    cb(null, tls.createSecureContext({
+      key: fs.readFileSync('./certs/localhost2.key'),
+      cert: fs.readFileSync('./certs/localhost2.crt')
+    }));
   }
-});
+},function(req,res){
+  if (req.headers[':protocol'] === 'webtransport') {
+    res.writeHead(200);
 
-server.on('webtransport', function(session) {
-  console.log('WebTransport session opened');
-
-  session.ondatagram = function(data) {
-    console.log('Datagram from client:', Buffer.from(data).toString());
-    session.send(data);
-  };
-
-  session.onclose = function() {
-    console.log('WebTransport session closed');
-  };
+    //TODO
+  }
 });
 
 server.listen(4433, function() {

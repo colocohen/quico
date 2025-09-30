@@ -15,19 +15,77 @@
   <img src="https://img.shields.io/github/license/colocohen/quico?color=brightgreen" alt="license">
 </p>
 
----
 
 > **⚠️ Project status: _Active development_.**  
 > APIs may change without notice until we reach v1.0.  
 > Use at your own risk and please report issues!
 
+
+
+## Table of Contents
+1. [What is QUIC/HTTP3?](#-what-is-quichttp3)
+2. [Why is QUICO important?](#-why-is-quico-important)
+3. [Features](#-features)
+4. [Installation](#-installation)
+5. [Node.js API Compatibility](#-nodejs-api-compatibility)
+6. [Testing](#-testing)
+7. [Roadmap](#-roadmap)
+8. [Sponsors](#-sponsors)
+9. [License](#-license)
+
+
+
+## ⚡ What is QUIC/HTTP3?
+
+**QUIC** is the future of Internet transport protocols. Created at Google and standardized by the IETF, QUIC powers **HTTP/3** and is already deployed at scale by the world’s largest platforms. It was specifically designed to overcome the limitations of TCP and deliver a faster, smoother, and more resilient web.
+
+Key advantages of QUIC include:
+
+- **Eliminating bottlenecks**: With TCP, data must arrive strictly in order. If a single packet is lost or delayed, all subsequent packets are blocked until it arrives — a phenomenon called **head-of-line blocking**. QUIC removes this bottleneck by running over UDP, so each package arrives on its own and avoids dependence on delayed pieces of data.
+
+- **UDP efficiency**: By running over UDP, QUIC bypasses decades of kernel-level constraints, enabling lightning-fast performance even on constrained devices such as smartphones, IoT hardware, or edge gateways.
+
+- **Security by default**: TLS 1.3 is built directly into the protocol. Every connection is encrypted — no exceptions, no downgrade paths.
+
+- **Seamless mobility**: Connections remain stable as devices move across networks (e.g., Wi-Fi → 4G/5G) or switch IP addresses, without breaking the session.
+
+- **Lower latency**: QUIC merges the transport and TLS handshake into fewer round-trips, significantly reducing connection setup time.
+
+- **Smarter congestion control**: Advanced congestion control algorithms (such as BBR) continuously measure bandwidth, round-trip time, and loss in real time. They dynamically adjust to real-world network conditions.
+
+
+QUIC combines **UDP speed, TCP reliability, mandatory TLS security, and adaptive multiplexing** into one powerful transport layer.
+
+**HTTP/3** (h3 in short) is the layer on top of QUIC. This is the evolution of the web’s application layer. Instead of riding over TCP, HTTP/3 maps HTTP requests and responses directly onto QUIC streams.
+HTTP/3 is also himself dramatically reduces overhead and improves efficiency - thats bring faster page loads and real-time applications that scale across the modern web.
+
+
+
+## Why is QUICO important?
+
+Node.js is the backbone of countless modern web applications, but it currently lacks a native QUIC implementation. Supporting QUIC inside Node.js requires **deep access to TLS internals** that Node’s existing TLS APIs don’t expose. Beyond that, QUIC demands a **highly complex architecture**, including intricate state machines, packet schedulers, and congestion control mechanisms.  
+
+**QUICO** brings this missing capability directly into the **Node.js ecosystem**. It is a from-scratch JavaScript implementation of **QUIC, HTTP/3 and WebTransport**, built without relying on OpenSSL or native code. At its core, it uses [LemonTLS](https://github.com/colocohen/lemon-tls) a pure JavaScript TLS 1.3 library, to provide the cryptographic expose that QUIC requires.  
+
+
+
 ## ✨ Features
-- **Pure JS QUIC**: Initial & 1-RTT packets, connection ID management, ACK & flow-control.
-- **TLS 1.3 handshake** in JavaScript (no OpenSSL binding).
-- **HTTP/3** control stream, request/response, server push, GOAWAY.
-- **WebTransport** streams & datagrams (RFC 9298) — tested with Chrome Canary.
-- **QPACK** encoder/decoder with custom Huffman table support.
-- Fully self-contained—no native addons, no external OpenSSL.
+
+- **Pure JavaScript QUIC**  
+  Full transport layer written from scratch in JS — including Initial & 1-RTT packet handling, connection ID management, acknowledgments, and flow control. No native bindings required.  
+
+- **HTTP/3**  
+  Support for control streams, request/response handling, and GOAWAY frames — the foundation of modern web transport.  
+
+- **WebTransport**  
+  Unidirectional and bidirectional streams plus datagrams (RFC 9298), tested with Chrome Canary for real-world compatibility.  
+
+- **QPACK Compression**  
+  Full encoder/decoder implementation with support for static, dynamic, and custom Huffman tables to reduce header overhead.  
+
+> ⚠️ **Note**: Currently implemented as **server-side only**. Client support is planned in the roadmap.
+
+
 
 ## 📦 Installation
 
@@ -35,38 +93,48 @@
 npm install quico
 ```
 
-## 🏃 Quick start
+
+
+## 🔗 Node.js API Compatibility
+
+One of the core design goals of QUICO is to provide a **familiar and intuitive API**.  
+If you already know how to use Node’s built-in `http` or `https` modules, working with QUICO should feel natural.
+
+QUICO exposes an API modeled after Node’s server interfaces:
+- **`createServer`** works just like in `http` / `https`, accepting request and response objects.
+- **`req` and `res` objects** follow the same semantics you already know: `req.headers`, `res.writeHead()`, `res.end()`, etc.
+
 
 ```js
-const fs = require('fs');
-const quico = require('quico');
+import fs from 'node:fs';
+import quico from 'quico';
+import tls from 'lemon-tls';
 
 const server = quico.createServer({
   SNICallback: function (servername, cb) {
-    cb(null, {
-      key: fs.readFileSync('certs/localhost.key'),
-      cert: fs.readFileSync('certs/localhost.crt')
-    });
+    cb(null, tls.createSecureContext({
+      key: fs.readFileSync('YOUR_KEY_FILE_PATH'),
+      cert: fs.readFileSync('YOUR_CERT_FILE_PATH')
+    }));
   }
 }, function (req, res) {
-  const data = new TextEncoder().encode('Hello World from HTTP/3 on Node.js!');
   res.writeHead(200, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Content-Length': data.byteLength
+    'Content-Type': 'text/html; charset=utf-8'
   });
-  res.end(data);
+  res.end('Hello World from HTTP/3 on Node.js!');
 });
 
 server.listen(4433, function () {
   console.log('🚀 QUIC server running on https://localhost:4433');
 });
 ```
+
 > 📂 For more examples, see [`examples/`](./examples)
 
 
 ## 🧪 Testing
 
-QUIC requires **TLS 1.3 with an ECDSA certificate**.
+QUIC requires TLS 1.3 with an ECDSA certificate.
 RSA self-signed certificates usually fail with QUIC/HTTP3.
 For local development the easiest option is [mkcert](https://github.com/FiloSottile/mkcert),
 which generates locally trusted ECDSA certificates automatically.

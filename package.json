@@ -3,10 +3,34 @@
   "version": "0.1.1",
   "description": "A pure JavaScript implementation of QUIC, HTTP/3, QPACK, and WebTransport for Node.js",
   "main": "index.js",
-  "scripts": {
-    "start": "node examples/webtransport_datagram_echo/server.js"
-  },
-  "keywords": ["quic", "http3", "h3", "webtransport", "datagram", "udp", "qpack", "tls", "tls1.3", "nodejs"],
+  "type": "module",
+  "keywords": [
+    "quic",
+    "http3",
+    "http",
+    "https",
+    "h3",
+    "quic-node",
+    "http3-node",
+    "quic-server",
+    "http3-server",
+    "h3-node",
+    "webtransport",
+    "websocket",
+    "datagram",
+    "udp",
+    "qpack",
+    "tls",
+    "tls1.3",
+    "tls13",
+    "nodejs",
+    "backend",
+    "real-time",
+    "low-latency",
+    "transport",
+    "http-server",
+    "socketio"
+  ],
   "author": "colocohen",
   "license": "Apache-2.0",
   "repository": {
@@ -16,13 +40,21 @@
   "bugs": {
     "url": "https://github.com/colocohen/quico/issues"
   },
-  "homepage": "https://github.com/colocohen/quico",
+  "homepage": "https://github.com/colocohen/quico#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    },
+    {
+      "type": "opencollective",
+      "url": "https://opencollective.com/quico-node"
+    }
+  ],
   "dependencies": {
-    "@noble/curves": ">=1.9.6",
-    "@noble/hashes": ">=1.8.0",
-    "@peculiar/x509": ">=1.13.0",
-    "@stablelib/aes": ">=2.0.1",
-    "@stablelib/gcm": ">=2.0.1",
-    "flat-ranges": ">=1.0.2"
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "flat-ranges": "^1.0.2",
+    "lemon-tls": "^0.1.1"
   }
 }

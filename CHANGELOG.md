@@ -23,3 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Notes
 - This is a pre-release version under heavy development.
 - API may change without notice.
+
+
+## [0.1.1] - 2025-09-30
+- Extracted the TLS implementation into a separate library: **lemon-tls**, for easier maintenance and reuse.
+- Refactored the project’s file structure for clearer organization and improved modularity.
+- Migrated the codebase from CommonJS (`require`) to **ESM** (`import/export`) for modern compatibility.

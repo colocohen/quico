@@ -16,11 +16,11 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  */
 
-var {
+import {
   concatUint8Arrays,
   writeVarInt,
   readVarInt
-} = require('./utils');
+} from './utils.js';
 
 
 var huffman_codes = new Uint32Array([
@@ -415,15 +415,15 @@ var qpack_static_table_entries = [
 
 
 function decodeVarInt(buf, prefixBits, pos) {
-  const maxPrefix = (1 << prefixBits) - 1;
-  let byte  = buf[pos];
-  let value = byte & maxPrefix;
+  var maxPrefix = (1 << prefixBits) - 1;
+  var byte  = buf[pos];
+  var value = byte & maxPrefix;
   pos++;
 
   if (value < maxPrefix)  // נגמר במרווח-הבייט הראשון
     return { value, next: pos };
 
-  let m = 0;
+  var m = 0;
   while (true) {
     byte  = buf[pos++];
     value += (byte & 0x7f) << m;
@@ -501,32 +501,32 @@ function decodeHuffman(buf) {
 
 
 function parse_qpack_header_block(buf) {
-  let pos = 0;
-  const headers = [];
+  var pos = 0;
+  var headers = [];
 
   // Required Insert Count (prefix-8)
-  const ric = decodeVarInt(buf, 8, pos);
+  var ric = decodeVarInt(buf, 8, pos);
   pos = ric.next;
 
   // Delta Base (prefix-7 + S-bit)
-  const firstDbByte = buf[pos];
-  const postBase = (firstDbByte & 0x80) !== 0; // S-bit
-  const db = decodeVarInt(buf, 7, pos);
+  var firstDbByte = buf[pos];
+  var postBase = (firstDbByte & 0x80) !== 0; // S-bit
+  var db = decodeVarInt(buf, 7, pos);
   pos = db.next;
 
   // Base Index = RIC ± DB לפי S-bit
-  const baseIndex = postBase
+  var baseIndex = postBase
     ? ric.value + db.value
     : ric.value - db.value;
 
   // Header Field Lines
   while (pos < buf.length) {
-    const byte = buf[pos];
+    var byte = buf[pos];
 
     // A. Indexed Field Line – 1xxxxxxx
     if ((byte & 0x80) === 0x80) {
-      const fromStatic = (byte & 0x40) !== 0;         // T-bit
-      const idx = decodeVarInt(buf, 6, pos);          // prefix-6
+      var fromStatic = (byte & 0x40) !== 0;         // T-bit
+      var idx = decodeVarInt(buf, 6, pos);          // prefix-6
       pos = idx.next;
       headers.push({
         type: "indexed",
@@ -538,18 +538,18 @@ function parse_qpack_header_block(buf) {
 
     // B. Literal With Name Reference – 01xxxxxx
     if ((byte & 0xC0) === 0x40) {
-      const neverIndexed = (byte & 0x20) !== 0;       // N-bit
-      const fromStatic   = (byte & 0x10) !== 0;       // T-bit
-      const nameIdx      = decodeVarInt(buf, 4, pos); // prefix-4
+      var neverIndexed = (byte & 0x20) !== 0;       // N-bit
+      var fromStatic   = (byte & 0x10) !== 0;       // T-bit
+      var nameIdx      = decodeVarInt(buf, 4, pos); // prefix-4
       pos = nameIdx.next;
 
-      const valH   = (buf[pos] & 0x80) !== 0;
-      const valLen = decodeVarInt(buf, 7, pos);       // prefix-7
+      var valH   = (buf[pos] & 0x80) !== 0;
+      var valLen = decodeVarInt(buf, 7, pos);       // prefix-7
       pos = valLen.next;
 
-      const valBytes = buf.slice(pos, pos + valLen.value);
+      var valBytes = buf.slice(pos, pos + valLen.value);
       pos += valLen.value;
-      const value = valH ? decodeHuffman(valBytes)
+      var value = valH ? decodeHuffman(valBytes)
                          : new TextDecoder().decode(valBytes);
 
       headers.push({
@@ -565,23 +565,23 @@ function parse_qpack_header_block(buf) {
 
     // C. Literal With Literal Name – 001xxxxx
     if ((byte & 0xE0) === 0x20) {
-      const neverIndexed = (byte & 0x10) !== 0;       // N-bit
-      const nameH        = (byte & 0x08) !== 0;       // H-bit
-      const nameLen      = decodeVarInt(buf, 3, pos); // prefix-3
+      var neverIndexed = (byte & 0x10) !== 0;       // N-bit
+      var nameH        = (byte & 0x08) !== 0;       // H-bit
+      var nameLen      = decodeVarInt(buf, 3, pos); // prefix-3
       pos = nameLen.next;
 
-      const nameBytes = buf.slice(pos, pos + nameLen.value);
+      var nameBytes = buf.slice(pos, pos + nameLen.value);
       pos += nameLen.value;
-      const name = nameH ? decodeHuffman(nameBytes)
+      var name = nameH ? decodeHuffman(nameBytes)
                          : new TextDecoder().decode(nameBytes);
 
-      const valH   = (buf[pos] & 0x80) !== 0;         // H-bit
-      const valLen = decodeVarInt(buf, 7, pos);       // prefix-7
+      var valH   = (buf[pos] & 0x80) !== 0;         // H-bit
+      var valLen = decodeVarInt(buf, 7, pos);       // prefix-7
       pos = valLen.next;
 
-      const valBytes = buf.slice(pos, pos + valLen.value);
+      var valBytes = buf.slice(pos, pos + valLen.value);
       pos += valLen.value;
-      const value = valH ? decodeHuffman(valBytes)
+      var value = valH ? decodeHuffman(valBytes)
                          : new TextDecoder().decode(valBytes);
 
       headers.push({
@@ -610,24 +610,24 @@ function parse_qpack_header_block(buf) {
 
 
 function parse_qpack_header_block_old(buf) {
-  let pos = 0;
-  const headers = [];
+  var pos = 0;
+  var headers = [];
 
   /* 1) Field-section prefix */
-  const ric = decodeVarInt(buf, 8, pos);   // Required Insert Count (prefix-8)
+  var ric = decodeVarInt(buf, 8, pos);   // Required Insert Count (prefix-8)
   pos = ric.next;
 
-  const db = decodeVarInt(buf, 7, pos);    // Delta Base (prefix-7)
+  var db = decodeVarInt(buf, 7, pos);    // Delta Base (prefix-7)
   pos = db.next;
 
   /* 2) Field-line representations */
   while (pos < buf.length) {
-    const byte = buf[pos];
+    var byte = buf[pos];
 
     /* A. Indexed Field Line  – 1xxxxxxx */
     if ((byte & 0x80) === 0x80) {
-      const fromStatic = (byte & 0x40) !== 0;         // T-bit
-      const idx = decodeVarInt(buf, 6, pos);          // prefix-6
+      var fromStatic = (byte & 0x40) !== 0;         // T-bit
+      var idx = decodeVarInt(buf, 6, pos);          // prefix-6
       pos = idx.next;
       headers.push({
         type: "indexed",
@@ -639,18 +639,18 @@ function parse_qpack_header_block_old(buf) {
 
     /* B. Literal Field Line + Name Reference – 01xxxxxx */
     if ((byte & 0xC0) === 0x40) {
-      const neverIndexed = (byte & 0x20) !== 0;       // N-bit
-      const fromStatic   = (byte & 0x10) !== 0;       // T-bit
-      const nameIdx      = decodeVarInt(buf, 4, pos); // prefix-4
+      var neverIndexed = (byte & 0x20) !== 0;       // N-bit
+      var fromStatic   = (byte & 0x10) !== 0;       // T-bit
+      var nameIdx      = decodeVarInt(buf, 4, pos); // prefix-4
       pos = nameIdx.next;
 
-      const valH   = (buf[pos] & 0x80) !== 0;
-      const valLen = decodeVarInt(buf, 7, pos);       // prefix-7
+      var valH   = (buf[pos] & 0x80) !== 0;
+      var valLen = decodeVarInt(buf, 7, pos);       // prefix-7
       pos = valLen.next;
 
-      const valBytes = buf.slice(pos, pos + valLen.value);
+      var valBytes = buf.slice(pos, pos + valLen.value);
       pos += valLen.value;
-      const value = valH ? decodeHuffman(valBytes)
+      var value = valH ? decodeHuffman(valBytes)
                          : new TextDecoder().decode(valBytes);
 
       headers.push({
@@ -666,23 +666,23 @@ function parse_qpack_header_block_old(buf) {
 
     /* C. Literal Field Line + Literal Name – 001xxxxx */
     if ((byte & 0xE0) === 0x20) {
-      const neverIndexed = (byte & 0x10) !== 0;       // N-bit
-      const nameH        = (byte & 0x08) !== 0;       // H-bit (שם) :contentReference[oaicite:0]{index=0}
-      const nameLen      = decodeVarInt(buf, 3, pos); // prefix-3
+      var neverIndexed = (byte & 0x10) !== 0;       // N-bit
+      var nameH        = (byte & 0x08) !== 0;       // H-bit (שם) :contentReference[oaicite:0]{index=0}
+      var nameLen      = decodeVarInt(buf, 3, pos); // prefix-3
       pos = nameLen.next;
 
-      const nameBytes = buf.slice(pos, pos + nameLen.value);
+      var nameBytes = buf.slice(pos, pos + nameLen.value);
       pos += nameLen.value;
-      const name = nameH ? decodeHuffman(nameBytes)
+      var name = nameH ? decodeHuffman(nameBytes)
                          : new TextDecoder().decode(nameBytes);
 
-      const valH   = (buf[pos] & 0x80) !== 0;         // H-bit (ערך)
-      const valLen = decodeVarInt(buf, 7, pos);       // prefix-7
+      var valH   = (buf[pos] & 0x80) !== 0;         // H-bit (ערך)
+      var valLen = decodeVarInt(buf, 7, pos);       // prefix-7
       pos = valLen.next;
 
-      const valBytes = buf.slice(pos, pos + valLen.value);
+      var valBytes = buf.slice(pos, pos + valLen.value);
       pos += valLen.value;
-      const value = valH ? decodeHuffman(valBytes)
+      var value = valH ? decodeHuffman(valBytes)
                          : new TextDecoder().decode(valBytes);
 
       headers.push({
@@ -711,8 +711,90 @@ function parse_qpack_header_block_old(buf) {
 
 
 
+// הנחות:
+// - chunks: Array<Uint8Array>, לפי הסדר (head → tail)
+// - from_offset: offset לוגי (למי שצריך; נעדכן אותו בסוף)
+// - readVarInt(u8, off) => { value, byteLength }
+// - concatUint8Arrays(arr) קיים אצלך
 
 function extract_h3_frames_from_chunks(chunks, from_offset) {
+// אם אין צ'אנקים – אין מה לפרסר
+  if (!chunks || chunks.length === 0) {
+    return { frames: [], new_from_offset: from_offset };
+  }
+
+  // בונים buffers החל מהמיקום הלוגי from_offset בלי לשנות את chunks
+  var buffers = [];
+  var acc = 0;
+  for (var i = 0; i < chunks.length; i++) {
+    var c = chunks[i];
+    var nextAcc = acc + c.length;
+    if (from_offset < nextAcc) {
+      // from_offset נופל לתוך הצ'אנק הזה
+      var start = from_offset - acc;
+      buffers.push(c.slice(start));
+      // כל שאר הצ'אנקים כמות שהם
+      for (var j = i + 1; j < chunks.length; j++) {
+        buffers.push(chunks[j]);
+      }
+      break;
+    }
+    acc = nextAcc;
+  }
+
+  if (buffers.length === 0) {
+    // from_offset מעבר לסוף הנתונים שיש כרגע
+    return { frames: [], new_from_offset: from_offset };
+  }
+
+  var combined = concatUint8Arrays(buffers);
+  var offset = 0;
+  var frames = [];
+
+  // קריאת VarInt בטוחה מתוך 'combined' עם קידום offset מקומי
+  function safeReadVarInt() {
+    if (offset >= combined.length) return null;
+    var firstByte = combined[offset];
+    var lengthBits = firstByte >> 6;          // 0..3 → 1,2,4,8 bytes
+    var neededLength = 1 << lengthBits;
+    if (offset + neededLength > combined.length) return null;
+    var res = readVarInt(combined, offset);
+    if (!res || typeof res.byteLength !== 'number') return null;
+    offset += res.byteLength;
+    return res;
+  }
+
+  while (offset < combined.length) {
+    var startOffset = offset;
+
+    var frameType = safeReadVarInt();
+    if (!frameType) break;
+
+    var lengthInfo = safeReadVarInt();
+    if (!lengthInfo) {
+      // לא הצלחנו אפילו לקרוא את האורך – נחזור לנק' ההתחלה ונחכה לנתונים נוספים
+      offset = startOffset;
+      break;
+    }
+
+    var payloadLength = lengthInfo.value >>> 0; // מניחים אורך עד 2^32-1
+    if (offset + payloadLength > combined.length) {
+      // פריים חלקי – rollback מלא
+      offset = startOffset;
+      break;
+    }
+
+    var payload = combined.slice(offset, offset + payloadLength);
+    frames.push({ frame_type: frameType.value, payload: payload });
+    offset += payloadLength;
+  }
+
+  // לא משנים את chunks; רק מקדמים את from_offset לפי כמה באמת נקרא
+  return { frames: frames, new_from_offset: from_offset + offset };
+}
+
+
+function extract_h3_frames_from_chunks2(chunks, from_offset) {
   var offsets = Object.keys(chunks).map(Number).sort((a, b) => a - b);
   var buffers = [];
   var totalLength = 0;
@@ -867,7 +949,153 @@ function safeDecodeVarInt(buf, posRef, prefixBits) {
 
 /* ---------- פונקציית החילוץ העיקרית ---------- */
 
+// הנחות:
+// - chunks: Array<Uint8Array>, לפי הסדר (head → tail)
+// - from_offset: מספר מצטבר (רק להחזרה/מתן עקיבה)
+// - concatUint8Arrays(arr) קיים אצלך
+// - safeDecodeVarInt(buf, posRef, prefixBits) -> number|null  (posRef.pos מתקדם בפנים)
+// - decodeHuffman(u8) קיים אם אתה תומך בהאףמן; אחרת אפשר להחזיר שגיאה/לקרוא כ-raw
+
 function extract_qpack_encoder_instructions_from_chunks(chunks, from_offset) {
+  // אם אין צ'אנקים – אין מה לפרסר
+  if (!chunks || chunks.length === 0) {
+    return { instructions: [], new_from_offset: from_offset };
+  }
+
+  // מחברים ל-buffer יחיד החל מ-from_offset, בלי לשנות את chunks
+  var buffers = [];
+  var acc = 0;
+  for (var i = 0; i < chunks.length; i++) {
+    var c = chunks[i];
+    var nextAcc = acc + c.length;
+    if (from_offset < nextAcc) {
+      // from_offset בתוך הצ'אנק הזה
+      var start = from_offset - acc;
+      buffers.push(c.slice(start));
+      // כל שאר הצ'אנקים כפי שהם
+      for (var j = i + 1; j < chunks.length; j++) {
+        buffers.push(chunks[j]);
+      }
+      break;
+    }
+    acc = nextAcc;
+  }
+
+  if (buffers.length === 0) {
+    // from_offset מעבר לנתונים שיש כרגע
+    return { instructions: [], new_from_offset: from_offset };
+  }
+
+  var combined = concatUint8Arrays(buffers);
+  var posRef = { pos: 0 };
+  var instructions = [];
+
+  // 2) לולאת פירוש הוראות QPACK-Encoder
+  while (posRef.pos < combined.length) {
+    var startPos = posRef.pos;
+    if (posRef.pos >= combined.length) break;
+    var byte = combined[posRef.pos];
+
+    // --- A. Insert With Name Reference (1xxxxxxx) ---
+    if ((byte & 0x80) === 0x80) {
+      var fromStatic = (byte & 0x40) !== 0;
+      var nameIdx = safeDecodeVarInt(combined, posRef, 6);
+      if (nameIdx === null) break; // חסר נתונים
+
+      // value length (Huffman flag בביט העליון של בייט האורך)
+      if (posRef.pos >= combined.length) { posRef.pos = startPos; break; }
+      var valHuffman = (combined[posRef.pos] & 0x80) !== 0;
+      var valLen = safeDecodeVarInt(combined, posRef, 7);
+      if (valLen === null || posRef.pos + valLen > combined.length) {
+        posRef.pos = startPos; break;
+      }
+
+      var valBytes = combined.slice(posRef.pos, posRef.pos + valLen);
+      posRef.pos += valLen;
+
+      var value = valHuffman ? decodeHuffman(valBytes)
+                             : new TextDecoder().decode(valBytes);
+
+      instructions.push({
+        type: 'insert_with_name_ref',
+        from_static_table: fromStatic,
+        name_index: nameIdx,
+        value: value
+      });
+      continue;
+    }
+
+    // --- B. Insert Without Name Reference (01xxxxxx) ---
+    if ((byte & 0xC0) === 0x40) {
+      // שים לב: בדפוס הזה ה־N-flag (שם בהאףמן) נמצא בביט 0x20 של הבייט הראשון
+      var nameH = (byte & 0x20) !== 0;
+      var nameLen = safeDecodeVarInt(combined, posRef, 5);
+      if (nameLen === null || posRef.pos + nameLen > combined.length) {
+        posRef.pos = startPos; break;
+      }
+      var nameBytes = combined.slice(posRef.pos, posRef.pos + nameLen);
+      posRef.pos += nameLen;
+
+      // value length (Huffman flag בביט העליון של בייט האורך)
+      if (posRef.pos >= combined.length) { posRef.pos = startPos; break; }
+      var valH = (combined[posRef.pos] & 0x80) !== 0;
+      var valLen2 = safeDecodeVarInt(combined, posRef, 7);
+      if (valLen2 === null || posRef.pos + valLen2 > combined.length) {
+        posRef.pos = startPos; break;
+      }
+      var valBytes2 = combined.slice(posRef.pos, posRef.pos + valLen2);
+      posRef.pos += valLen2;
+
+      var nameStr = nameH ? decodeHuffman(nameBytes)
+                          : new TextDecoder().decode(nameBytes);
+      var valueStr = valH ? decodeHuffman(valBytes2)
+                          : new TextDecoder().decode(valBytes2);
+
+      instructions.push({
+        type: 'insert_without_name_ref',
+        name: nameStr,
+        value: valueStr
+      });
+      continue;
+    }
+
+    // --- C. Set Dynamic Table Capacity (001xxxxx) ---
+    if ((byte & 0xE0) === 0x20) {
+      var capacity = safeDecodeVarInt(combined, posRef, 5);
+      if (capacity === null) { posRef.pos = startPos; break; }
+
+      instructions.push({
+        type: 'set_dynamic_table_capacity',
+        capacity: capacity
+      });
+      continue;
+    }
+
+    // --- D. Duplicate (0000xxxx) ---
+    if ((byte & 0xF0) === 0x00) {
+      var dupIndex = safeDecodeVarInt(combined, posRef, 4);
+      if (dupIndex === null) { posRef.pos = startPos; break; }
+
+      instructions.push({
+        type: 'duplicate',
+        index: dupIndex
+      });
+      continue;
+    }
+
+    // אופקוד לא מוכר או לא נתמך – נעצור עד שיגיע עוד מידע / נטפל חיצונית
+    break;
+  }
+
+  // כמה בייטים פרשנו מתוך ה־view המאוחד
+  var consumed = posRef.pos | 0;
+
+  // לא משנים את chunks; רק מקדמים offset לוגי
+  return { instructions: instructions, new_from_offset: from_offset + consumed };
+}
+
+
+function extract_qpack_encoder_instructions_from_chunks2(chunks, from_offset) {
   /* 1) חיבור הצ’אנקים החל מ-from_offset */
   var offsets = Object.keys(chunks).map(Number).sort(function (a, b) { return a - b; });
   var buffers = [];
@@ -1131,9 +1359,9 @@ function build_control_stream_old(settings_named) {
 
 
 function encodeInt(value, prefixBits) {
-  const max = (1 << prefixBits) - 1;
+  var max = (1 << prefixBits) - 1;
   if (value < max) return [value];           // נכנס כולו בפריפיקס
-  const bytes = [max];
+  var bytes = [max];
   value -= max;
   while (value >= 128) {                     // המשך varint (7-bit groups)
     bytes.push((value & 0x7F) | 0x80);
@@ -1144,23 +1372,23 @@ function encodeInt(value, prefixBits) {
 }
 
 function encodeStringLiteral(bytes, hFlag /* 0/1 */) {
-  const lenBytes = encodeInt(bytes.length, 7);         // prefix-7
+  var lenBytes = encodeInt(bytes.length, 7);         // prefix-7
   lenBytes[0] |= (hFlag << 7);                         // מוסיפים H
   return lenBytes.concat(Array.from(bytes));
 }
 
 /* ---------- בניית HEADERS (Literal) ---------- */
 function build_http3_literal_headers_frame(headers) {
-  const out = [];
+  var out = [];
   out.push(0x00, 0x00);                                // QPACK prefix
 
   for (var header_name in headers) {
-    const nameBytes  = new TextEncoder().encode(header_name.toLowerCase());
-    const valueBytes = new TextEncoder().encode(String(headers[header_name]));
+    var nameBytes  = new TextEncoder().encode(header_name.toLowerCase());
+    var valueBytes = new TextEncoder().encode(String(headers[header_name]));
     
     /* בייט ראשון: 001 | N=0 | H=0 | NameLen(3+) */
-    const nameLenEnc = encodeInt(nameBytes.length, 3); // prefix-3
-    const firstByte  = 0x20 | nameLenEnc[0];           // 0b0010_0000
+    var nameLenEnc = encodeInt(nameBytes.length, 3); // prefix-3
+    var firstByte  = 0x20 | nameLenEnc[0];           // 0b0010_0000
     out.push(firstByte, ...nameLenEnc.slice(1), ...nameBytes);
 
     /* value: H=0 + prefix-7 */
@@ -1199,7 +1427,25 @@ function parse_webtransport_datagram(payload) {
   };
 }
 
-module.exports = {
+
+function build_close_webtransport(errorCode, reason) {
+  var reasonBytes = reason ? new TextEncoder().encode(reason) : new Uint8Array();
+  var payload = [
+    ...writeVarInt(errorCode),
+    ...writeVarInt(reasonBytes.length),
+    ...reasonBytes
+  ];
+
+  var frame = [
+    ...writeVarInt(0x2843),          // type
+    ...writeVarInt(payload.length),  // length
+    ...payload
+  ];
+
+  return new Uint8Array(frame);
+}
+
+export {
   build_h3_frames,
   build_settings_frame,
   parse_h3_settings_frame,
@@ -1208,6 +1454,7 @@ module.exports = {
   parse_qpack_header_block,
   build_http3_literal_headers_frame,
   parse_webtransport_datagram,
+  build_close_webtransport,
   build_qpack_block_header_ack,
   build_qpack_known_received_count,
   qpack_static_table_entries

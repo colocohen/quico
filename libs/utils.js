@@ -24,8 +24,8 @@ function writeVarInt(value) {
   }
 
   if (value <= Number.MAX_SAFE_INTEGER) {
-    const hi = Math.floor(value / 2 ** 32);
-    const lo = value >>> 0;
+    var hi = Math.floor(value / 2 ** 32);
+    var lo = value >>> 0;
     return new Uint8Array([
       0xC0 | (hi >> 24),
       (hi >> 16) & 0xff,
@@ -89,8 +89,8 @@ function writeVarInt2(value) {
 function readVarInt(array, offset) {
   if (offset >= array.length) return null;
 
-  const first = array[offset];
-  const prefix = first >> 6;
+  var first = array[offset];
+  var prefix = first >> 6;
 
   if (prefix === 0b00) {
     return {
@@ -101,7 +101,7 @@ function readVarInt(array, offset) {
 
   if (prefix === 0b01) {
     if (offset + 1 >= array.length) return null;
-    const value = ((first & 0x3f) << 8) | array[offset + 1];
+    var value = ((first & 0x3f) << 8) | array[offset + 1];
     return {
       value,
       byteLength: 2
@@ -110,7 +110,7 @@ function readVarInt(array, offset) {
 
   if (prefix === 0b10) {
     if (offset + 3 >= array.length) return null;
-    const value = (
+    var value = (
       ((first & 0x3F) << 24) |
       (array[offset + 1] << 16) |
       (array[offset + 2] << 8) |
@@ -125,21 +125,21 @@ function readVarInt(array, offset) {
   if (prefix === 0b11) {
     if (offset + 7 >= array.length) return null;
 
-    const hi = (
+    var hi = (
       ((first & 0x3F) << 24) |
       (array[offset + 1] << 16) |
       (array[offset + 2] << 8) |
       array[offset + 3]
     ) >>> 0;
 
-    const lo = (
+    var lo = (
       (array[offset + 4] << 24) |
       (array[offset + 5] << 16) |
       (array[offset + 6] << 8) |
       array[offset + 7]
     ) >>> 0;
 
-    const full = BigInt(hi) * 4294967296n + BigInt(lo); // 2^32
+    var full = BigInt(hi) * 4294967296n + BigInt(lo); // 2^32
 
     if (full <= BigInt(Number.MAX_SAFE_INTEGER)) {
       return {
@@ -188,7 +188,7 @@ function arraybufferEqual(buf1, buf2) {
   var view1 = new DataView(buf1);
   var view2 = new DataView(buf2);
 
-  for (let i = 0; i < buf1.byteLength; i++) {
+  for (var i = 0; i < buf1.byteLength; i++) {
     if (view1.getUint8(i) !== view2.getUint8(i)) {
       return false;
     }
@@ -394,7 +394,7 @@ function quic_acked_info_to_ranges(ackFrame) {
 }
 
 
-module.exports = {
+export {
   concatUint8Arrays,
   arraybufferEqual,
   readVarInt,
