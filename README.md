@@ -29,9 +29,11 @@
 4. [Installation](#-installation)
 5. [Node.js API Compatibility](#-nodejs-api-compatibility)
 6. [Testing](#-testing)
-7. [Roadmap](#-roadmap)
-8. [Sponsors](#-sponsors)
-9. [License](#-license)
+7. [Project Structure](#-project-structure)
+8. [Roadmap](#-roadmap)
+9. [Sponsors](#-sponsors)
+10. [Contact](#-contact)
+11. [License](#-license)
 
 
 
@@ -150,6 +152,20 @@ You must explicitly force h3 when testing.
 > `curl --http3 -vvv --trace-time --trace-ascii - https://localhost:4433 --insecure`
 
 
+
+## 📁 Project Structure
+
+Quico follows a layered design:
+
+- `quic_socket.js` – Core QUIC transport layer
+- `h3_socket.js` – h3 built on top of QUIC
+- `h3_server.js` – HTTP/3 and WebTransport Server implementation
+- `examples/` – Practical usage examples and demos
+
+➡️ For a full technical breakdown, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+
+
 ## 🛣 Roadmap
 
 The following roadmap reflects the current and planned status of the QUICO project.  
@@ -191,10 +207,24 @@ _Note: QUICO is a work-in-progress project aiming to provide a full JavaScript i
 
 _Please ⭐ star the repo to follow progress!_
 
+
+
 ## 🙏 Sponsors
 
 QUICO is an evenings-and-weekends project.  
 Support development via **GitHub Sponsors** or simply share the project.
+
+
+
+## 💬 Contact
+
+For feedback, ideas, or contributions,  
+contact directly at:  
+📧 **support@quicojs.dev**
+
+For security-related issues, please see [SECURITY.md](./SECURITY.md).
+
+
 
 ## 📜 License
 
