@@ -172,36 +172,76 @@ The following roadmap reflects the current and planned status of the QUICO proje
 ✅ = Completed 🔄 = In progress ⏳ = Planned ❌ = Not planned
 
 ### ✅ Completed
+
+#### QUIC (Transport)
 | Status | Item |
 |:------:|------|
-| ✅ | QUIC: Initial / Handshake / 1-RTT |
-| ✅ | TLS 1.3 handshake & key schedule |
-| ✅ | HTTP/3: control streams & basic requests |
-| ✅ | QPACK: static & dynamic table |
+| ✅ | Initial / Handshake / 1-RTT encryption |
+| ✅ | TLS 1.3 handshake |
+| ✅ | Frame parsing / serialization core |
+| ✅ | Packet number spaces & ACK ranges |
+| ✅ | Basic loss detection & retransmission logic |
+
+#### H3 Layer (HTTP/3 + WebTransport)
+| Status | Item | Notes |
+|:------:|------|-------|
+| ✅ | Control streams, headers & basic requests |  |
+| ✅ | QPACK: static & dynamic table decoding | Works currently with LITERAL only |
+
+
 
 ### 🔄 In Progress
+
+#### QUIC (Transport)
 | Status | Item | Notes |
 |:------:|------|-------|
-| 🔄 | QPACK: Huffman encoding/decoding | Custom table support partially working |
-| 🔄 | WebTransport: unidirectional & bidirectional streams | Stream interface WIP |
-| 🔄 | HTTP/3: GOAWAY & request cancellation | Partial control flow support |
+| 🔄 | Path validation & migration (PATH_CHALLENGE / RESPONSE) | IP/port migration logic active |
+| 🔄 | Retry & token validation | Anti-amplification phase implemented |
+| 🔄 | Key update handling | Key phase bit, rotation, secrets pipeline |
+| 🔄 | Loss recovery improvements | Timers, RTT tracking, exponential backoff |
+| 🔄 | Frame builder / parser refactor | More efficient binary layouts |
+
+#### H3 Layer (HTTP/3 + WebTransport)
+| Status | Item | Notes |
+|:------:|------|-------|
+| 🔄 | Datagram support | RFC 9298 |
+| 🔄 | GOAWAY, request cancellation, PRIORITY | Control flow & prioritization |
+| 🔄 | QPACK: Huffman encoding/decoding | Custom table updates partially working |
+| 🔄 | Unidirectional & bidirectional streams | Stream interface WIP |
+
+#### Project Infra
+| Status | Item | Notes |
+|:------:|------|-------|
 | 🔄 | Integration with Node.js `https`-style API | Goal: seamless compatibility |
-| 🔄 | Project modularization & internal refactoring | To improve maintainability |
+| 🔄 | Modularization & internal refactoring | Layers: transport / h3 |
+| 🔄 | Logging, tracing & debug hooks | Dev visibility |
+
+
 
 ### ⏳ Planned
+
+#### QUIC (Transport)
 | Status | Item | Notes |
 |:------:|------|-------|
-| ⏳ | QUIC: 0-RTT support | Will follow key update & early data support |
-| ⏳ | WebTransport: datagram support | Based on RFC 9298 |
-| ⏳ | QUIC: proper connection teardown | CLOSE frame, idle timeout |
-| ⏳ | QUIC: keep-alive & PING frames | For long-lived connections |
-| ⏳ | QUIC: flow control & congestion (BBR / CUBIC) | Needs metrics and simulation |
-| ⏳ | QUIC: session resumption & connection migration | For mobile/roaming support |
-| ⏳ | End-to-end test suite against Chromium | Automate using testh3 and Puppeteer |
-| ⏳ | Benchmarks, performance analysis & tuning | Resource usage, latency, throughput |
-| ⏳ | Fuzz testing and protocol robustness checks | To improve security and reliability |
-| ⏳ | Developer documentation & API reference | For better onboarding |
-| ⏳ | TypeScript typings | Type safety for IDE support |
+| ⏳ | 0-RTT & early data support | Requires stable resumption secrets |
+| ⏳ | Proper connection teardown | CONNECTION_CLOSE, draining, idle timeout |
+| ⏳ | Keep-alive, PING & idle detection | For long-lived sessions |
+| ⏳ | Flow control & congestion (BBR / CUBIC) | Needs metric feedback loop |
+| ⏳ | Session resumption & multi-path migration | Mobile/roaming use-cases |
+| ⏳ | Client-side implementation | Establish connections and send requests |
+
+#### H3 Layer (HTTP/3 + WebTransport)
+| Status | Item | Notes |
+|:------:|------|-------|
+| ⏳ | End-to-end tests vs Chromium / ngtcp2 | Automate with testh3 + Puppeteer |
+
+#### Project Infra
+| Status | Item | Notes |
+|:------:|------|-------|
+| ⏳ | Benchmarks, profiling & tuning | CPU, memory, latency |
+| ⏳ | Fuzz testing & robustness checks | Stability & security |
+| ⏳ | Developer documentation & API reference | Public API, diagrams, internals |
+| ⏳ | TypeScript typings | IDE support & static checking |
 
 _Note: QUICO is a work-in-progress project aiming to provide a full JavaScript implementation of QUIC + HTTP/3. Community contributions are welcome!_
 
