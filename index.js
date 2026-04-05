@@ -10,14 +10,37 @@
  *
  * This file is part of the open-source project hosted at:
  *     https://github.com/colocohen/quico
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  */
 
-import { createServer } from './h3_server.js';
+import { createServer } from './src/server.js';
+import { request, get } from './src/client.js';
+import { Agent, globalAgent } from './src/agent.js';
+import { IncomingMessage, ServerResponse, ClientRequest } from './src/streams.js';
+import { createSecureContext } from './src/tls_bridge.js';
+import { WebTransport } from './src/webtransport.js';
 
-export { createServer };
+export {
+  createServer,
+  request,
+  get,
+  Agent,
+  globalAgent,
+  IncomingMessage,
+  ServerResponse,
+  ClientRequest,
+  createSecureContext,
+  WebTransport
+};
 
-export default { createServer };
+export default {
+  createServer,
+  request,
+  get,
+  Agent,
+  globalAgent,
+  IncomingMessage,
+  ServerResponse,
+  ClientRequest,
+  createSecureContext,
+  WebTransport
+};

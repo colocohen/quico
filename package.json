@@ -1,9 +1,28 @@
 {
   "name": "quico",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A pure JavaScript implementation of QUIC, HTTP/3, QPACK, and WebTransport for Node.js",
-  "main": "index.js",
   "type": "module",
+  "main": "index.cjs",
+  "module": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
   "keywords": [
     "quic",
     "http3",
@@ -13,7 +32,9 @@
     "quic-node",
     "http3-node",
     "quic-server",
+    "quic-client",
     "http3-server",
+    "http3-client",
     "h3-node",
     "webtransport",
     "websocket",
@@ -31,13 +52,17 @@
     "http-server",
     "socketio"
   ],
-  "author": "colocohen",
+  "author": {
+    "name": "colocohen",
+    "email": "support@quicojs.dev"
+  },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/colocohen/quico.git"
   },
   "bugs": {
+    "email": "support@quicojs.dev",
     "url": "https://github.com/colocohen/quico/issues"
   },
   "homepage": "https://github.com/colocohen/quico#readme",
@@ -48,13 +73,11 @@
     },
     {
       "type": "opencollective",
-      "url": "https://opencollective.com/quico-node"
+      "url": "https://opencollective.com/quicojs"
     }
   ],
   "dependencies": {
-    "@noble/curves": "^2.0.1",
-    "@noble/hashes": "^2.0.1",
-    "flat-ranges": "^1.0.2",
-    "lemon-tls": "^0.1.1"
+    "flat-ranges": "^2.0.0",
+    "lemon-tls": "^0.2.0"
   }
 }
