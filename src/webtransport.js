@@ -14,11 +14,10 @@
 
 import { Duplex, Readable, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
-import dgram from 'node:dgram';
 import dns from 'node:dns';
-import { QUICConnection } from './quic_connection.js';
 import { H3Connection } from './h3.js';
-import { writeVarInt, readVarInt } from './utils.js';
+import { createQuicClientSocket } from './quic_socket.js';
+import { readVarInt, concatUint8Arrays, wt_stream_header, wt_datagram_payload } from './utils.js';
 
 
 // ============================================================
@@ -101,13 +100,7 @@ class WebTransportBidiStream extends Duplex {
     // First write on this stream: prepend VarInt(0x41) + VarInt(session_id)
     if (!this._prefixSent) {
       this._prefixSent = true;
-      var typePrefix = writeVarInt(0x41);     // WEBTRANSPORT_STREAM bidi type
-      var sessionPrefix = writeVarInt(this._sessionId);
-      var combined = new Uint8Array(typePrefix.length + sessionPrefix.length + chunk.byteLength);
-      combined.set(typePrefix, 0);
-      combined.set(sessionPrefix, typePrefix.length);
-      combined.set(chunk, typePrefix.length + sessionPrefix.length);
-      this._quic.sendStream(this._streamId, combined, false);
+      this._quic.sendStream(this._streamId, wt_stream_header(true, this._sessionId, chunk), false);
     } else {
       this._quic.sendStream(this._streamId, chunk, false);
     }
@@ -118,12 +111,7 @@ class WebTransportBidiStream extends Duplex {
     // Send FIN (with type + session_id prefix if nothing was written yet)
     if (!this._prefixSent) {
       this._prefixSent = true;
-      var typePrefix = writeVarInt(0x41);
-      var sessionPrefix = writeVarInt(this._sessionId);
-      var header = new Uint8Array(typePrefix.length + sessionPrefix.length);
-      header.set(typePrefix, 0);
-      header.set(sessionPrefix, typePrefix.length);
-      this._quic.sendStream(this._streamId, header, true);
+      this._quic.sendStream(this._streamId, wt_stream_header(true, this._sessionId), true);
     } else {
       this._quic.sendStream(this._streamId, new Uint8Array(0), true);
     }
@@ -168,13 +156,7 @@ class WebTransportUniWriteStream extends Writable {
     if (!this._headerSent) {
       this._headerSent = true;
       // Uni stream: VarInt(0x54) (WEBTRANSPORT_STREAM) + VarInt(session_id) + data
-      var typePrefix = writeVarInt(0x54);
-      var sessionPrefix = writeVarInt(this._sessionId);
-      var header = new Uint8Array(typePrefix.length + sessionPrefix.length + chunk.byteLength);
-      header.set(typePrefix, 0);
-      header.set(sessionPrefix, typePrefix.length);
-      header.set(chunk, typePrefix.length + sessionPrefix.length);
-      this._quic.sendStream(this._streamId, header, false);
+      this._quic.sendStream(this._streamId, wt_stream_header(false, this._sessionId, chunk), false);
     } else {
       this._quic.sendStream(this._streamId, chunk, false);
     }
@@ -184,12 +166,7 @@ class WebTransportUniWriteStream extends Writable {
   _final(callback) {
     if (!this._headerSent) {
       this._headerSent = true;
-      var typePrefix = writeVarInt(0x54);
-      var sessionPrefix = writeVarInt(this._sessionId);
-      var header = new Uint8Array(typePrefix.length + sessionPrefix.length);
-      header.set(typePrefix, 0);
-      header.set(sessionPrefix, typePrefix.length);
-      this._quic.sendStream(this._streamId, header, true);
+      this._quic.sendStream(this._streamId, wt_stream_header(false, this._sessionId), true);
     } else {
       this._quic.sendStream(this._streamId, new Uint8Array(0), true);
     }
@@ -350,43 +327,31 @@ class WebTransport extends EventEmitter {
   _startQuic(remoteIp) {
     var self = this;
     var remotePort = this._port;
-    var isIPv6 = remoteIp.indexOf(':') >= 0;
 
-    this._udpSocket = dgram.createSocket(isIPv6 ? 'udp6' : 'udp4');
+    this._udpSocket = createQuicClientSocket({
+      remoteIp: remoteIp,
+      remotePort: remotePort,
+      hostname: this._hostname,
 
-    this._udpSocket.on('message', function (msg, rinfo) {
-      if (self._quic) self._quic.feedDatagram(rinfo.address, rinfo.port, new Uint8Array(msg));
-    });
+      onError: function (err) {
+        if (self._state === 'connecting') self._readyReject(err);
+        self.emit('error', err);
+      },
 
-    this._udpSocket.on('error', function (err) {
-      if (self._state === 'connecting') self._readyReject(err);
-      self.emit('error', err);
-    });
-
-    this._udpSocket.bind(0, function () {
-      self._quic = new QUICConnection({
-        isServer: false,
-        hostname: self._hostname
-      });
-
-      self._quic.on('packet', function (data) {
-        self._udpSocket.send(data, remotePort, remoteIp);
-      });
-
-      self._quic.on('connect', function () {
+      onConnect: function (q, s) {
+        self._quic = q;
+        self._udpSocket = s;
         self._h3 = new H3Connection({ quicConnection: self._quic, isServer: false, enableWebTransport: true });
         self._setupH3Handlers();
         self._sendConnect();
-      });
+      },
 
-      self._quic.on('close', function () {
+      onClose: function () {
         self._state = 'closed';
         self._closedResolve();
         self.emit('close');
-        if (self._udpSocket) { try { self._udpSocket.close(); } catch (e) {} }
-      });
-
-      self._quic.connect();
+        // The helper closes the UDP socket.
+      }
     });
   }
 
@@ -424,7 +389,7 @@ class WebTransport extends EventEmitter {
     });
 
     // Datagrams — QUIC DATAGRAM payload = VarInt(quarter_stream_id) + app data (RFC 9297)
-    this._quic.on('datagram', function (_contextId, rawData) {
+    this._quic.on('datagram', function (rawData) {
       if (!rawData || rawData.byteLength === 0) return;
 
       // Always parse VarInt quarter_stream_id from payload
@@ -484,7 +449,7 @@ class WebTransport extends EventEmitter {
     buf.totalLen += data.byteLength;
 
     // Try to parse prefix
-    var combined = buf.totalLen === data.byteLength ? data : this._combineChunks(buf.chunks, buf.totalLen);
+    var combined = buf.totalLen === data.byteLength ? data : concatUint8Arrays(buf.chunks);
     var isBidi = (streamId & 0x2) === 0;
     var offset = 0;
 
@@ -551,18 +516,6 @@ class WebTransport extends EventEmitter {
       this.emit('unidirectionalStream', stream);
     }
   }
-
-  _combineChunks(chunks, totalLen) {
-    if (chunks.length === 1) return chunks[0];
-    var out = new Uint8Array(totalLen);
-    var off = 0;
-    for (var i = 0; i < chunks.length; i++) {
-      out.set(chunks[i], off);
-      off += chunks[i].byteLength;
-    }
-    return out;
-  }
-
 
   // ---- Send CONNECT ----
 
@@ -660,14 +613,8 @@ class WebTransport extends EventEmitter {
     if (typeof data === 'string') data = Buffer.from(data);
     if (Buffer.isBuffer(data)) data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 
-    // Quarter stream ID as context ID (RFC 9297)
-    var contextId = Math.floor(this._sessionId / 4);
-
-    // Build datagram: VarInt(contextId) + payload
-    var contextPrefix = writeVarInt(contextId);
-    var frame = new Uint8Array(contextPrefix.length + data.byteLength);
-    frame.set(contextPrefix, 0);
-    frame.set(data, contextPrefix.length);
+    // Build datagram: VarInt(quarter_stream_id) + payload (RFC 9297)
+    var frame = wt_datagram_payload(this._sessionId, data);
 
     // Send via QUIC DATAGRAM frame
     if (this._quic && this._quic.sendDatagram) {

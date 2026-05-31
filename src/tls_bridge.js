@@ -14,8 +14,8 @@
 
 import { TLSSession, createSecureContext as _lemonCreateSecureContext } from 'lemon-tls';
 import nodeTls from 'node:tls';
-import { Emitter } from './utils.js';
-import { build_transport_params } from './transport.js';
+import { DEBUG, Emitter } from './utils.js';
+import { build_transport_params, parse_transport_params } from './transport.js';
 import {
   TLS_CIPHER_SUITES
 } from './crypto.js';
@@ -52,6 +52,11 @@ function TLSBridge(options) {
   var originalDcid = options.originalDcid || new Uint8Array(0);
   var localCid = options.localCid || new Uint8Array(0); // client's own SCID
   var hostname = options.hostname || null;
+  // ALPN protocol(s) to advertise. Default ['h3']; normalize string → array.
+  var supportedAlpns = (function () {
+    var a = options.alpn || ['h3'];
+    return Array.isArray(a) ? a : [a];
+  })();
 
   function feedMessage(data) {
     if (!session) {
@@ -71,7 +76,7 @@ function TLSBridge(options) {
 
         session.set_context({
           local_supported_versions: [0x0304],
-          local_supported_alpns: ['h3'],
+          local_supported_alpns: supportedAlpns,
           local_supported_groups: [29, 23, 24],
           local_supported_cipher_suites: [0x1301, 0x1302],
           local_extensions: [{ type: 0x39, data: quicParams }],
@@ -85,10 +90,35 @@ function TLSBridge(options) {
 
   function setupSessionEvents() {
 
+    // Peer's QUIC transport parameters ride in the TLS quic_transport_parameters
+    // extension (type 0x39): client's in the ClientHello, server's in the
+    // EncryptedExtensions. lemon-tls surfaces every received handshake message via
+    // 'handshakeMessage' with the parsed extensions, so we extract the 0x39 data,
+    // parse it, and hand the params to the QUIC layer (which seeds remote_max_data,
+    // max_ack_delay, ack_delay_exponent, etc. — previously hardcoded defaults).
+    var peerParamsEmitted = false;
+    session.on('handshakeMessage', function (type, data, message) {
+      if (peerParamsEmitted || !message || !Array.isArray(message.extensions)) return;
+      for (var i = 0; i < message.extensions.length; i++) {
+        var e = message.extensions[i];
+        if (e && (e.type === 0x39 || e.type === 57) && e.data) {
+          try {
+            var parsed = parse_transport_params(e.data, 0);
+            peerParamsEmitted = true;
+            if (DEBUG) console.log('[tls] peer transport params parsed (' + e.data.length + 'B)');
+            ev.emit('peerTransportParams', parsed);
+          } catch (err) {
+            if (DEBUG) console.log('[tls] peer transport params parse failed: ' + err.message);
+          }
+          break;
+        }
+      }
+    });
+
     session.on('hello', function () {
       if (helloHandled) return; // prevent double-fire
       helloHandled = true;
-      console.log('[tls] hello — configuring TLS');
+      if (DEBUG) console.log('[tls] hello — configuring TLS');
 
       // Transport params — shared defaults + role-specific fields
       var tp = defaultTransportParams();
@@ -107,7 +137,7 @@ function TLSBridge(options) {
 
       var tlsContext = {
         local_supported_versions: [0x0304],
-        local_supported_alpns: ['h3'],
+        local_supported_alpns: supportedAlpns,
         local_supported_groups: [29, 23, 24],
         local_supported_cipher_suites: [0x1301, 0x1302, 0xc02f, 0xc030, 0xcca8],
         local_extensions: [
@@ -125,7 +155,7 @@ function TLSBridge(options) {
       else if (epoch === 1) quicEpoch = 'handshake';
       else quicEpoch = 'app';
 
-      console.log('[tls] outgoing: epoch=' + quicEpoch + ' type=' + type + ' len=' + data.length);
+      if (DEBUG) console.log('[tls] outgoing: epoch=' + quicEpoch + ' type=' + type + ' len=' + data.length);
       ev.emit('send', quicEpoch, data);
     });
 
@@ -135,7 +165,7 @@ function TLSBridge(options) {
       handshakeSecretsEmitted = true;
       var cipher = session.getCipher();
       var hashName = TLS_CIPHER_SUITES[cipher] ? TLS_CIPHER_SUITES[cipher].hash : 'sha256';
-      console.log('[tls] handshake secrets ready');
+      if (DEBUG) console.log('[tls] handshake secrets ready');
       ev.emit('handshakeSecrets', { local: localSecret, remote: remoteSecret, cipher: cipher, hash: hashName });
     });
 
@@ -144,12 +174,12 @@ function TLSBridge(options) {
       appSecretsEmitted = true;
       var cipher = session.getCipher();
       var hashName = TLS_CIPHER_SUITES[cipher] ? TLS_CIPHER_SUITES[cipher].hash : 'sha256';
-      console.log('[tls] app secrets ready');
+      if (DEBUG) console.log('[tls] app secrets ready');
       ev.emit('appSecrets', { local: localSecret, remote: remoteSecret, cipher: cipher, hash: hashName });
     });
 
     session.on('secureConnect', function () {
-      console.log('[tls] secureConnect');
+      if (DEBUG) console.log('[tls] secureConnect');
       ev.emit('secureConnect');
     });
 

@@ -158,7 +158,7 @@ class Agent extends EventEmitter {
     var conn = this._h3Pool[key];
     if (!conn) return null;
     var state = conn.quic ? conn.quic.state : 'closed';
-    if (state === 'closed' || state === 'draining') {
+    if (state === 'closed' || state === 'draining' || state === 'closing') {
       delete this._h3Pool[key];
       return null;
     }
@@ -170,6 +170,14 @@ class Agent extends EventEmitter {
     this._h3Pool[key] = conn;
     if (conn.quic) {
       conn.quic.on('close', () => {
+        if (this._h3Pool[key] === conn) delete this._h3Pool[key];
+      });
+    }
+    // RFC 9114 §5.2: once the peer sends GOAWAY it won't accept new requests, so
+    // stop reusing this connection for new ones. In-flight requests keep running
+    // on it; they just won't be joined by new requests (which open a fresh conn).
+    if (conn.h3 && typeof conn.h3.on === 'function') {
+      conn.h3.on('goaway', () => {
         if (this._h3Pool[key] === conn) delete this._h3Pool[key];
       });
     }

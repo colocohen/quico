@@ -13,6 +13,7 @@
  */
 
 import {
+  DEBUG,
   concatUint8Arrays,
   writeVarInt,
   readVarInt
@@ -142,7 +143,7 @@ function parse_quic_datagram(array) {
       : array.slice(start, end);
 
     if (packets.length > 0) {
-      console.log('[quic] coalesced pkt #' + packets.length + ' type=' + pkt.type + ' offset=' + start + ' len=' + pkt.totalLength + ' firstByte=0x' + array[start].toString(16).padStart(2,'0'));
+      if (DEBUG) console.log('[quic] coalesced pkt #' + packets.length + ' type=' + pkt.type + ' offset=' + start + ' len=' + pkt.totalLength + ' firstByte=0x' + array[start].toString(16).padStart(2,'0'));
     }
 
     packets.push(pkt);
@@ -201,18 +202,25 @@ function encode_quic_frames(frames) {
     } else if (frame.type === 'stream') {
       var typeByte = 0x08;
       var hasOffset = (frame.offset != null && frame.offset > 0);
-      var hasLen = (frame.data && frame.data.length > 0);
       var hasFin = !!frame.fin;
+      var dataLen = (frame.data && frame.data.length) ? frame.data.length : 0;
 
+      // ALWAYS emit the LEN field. A STREAM frame without the LEN bit means
+      // "data runs to the end of the packet"; if anything follows it in the
+      // packet (another frame — e.g. a zero-length FIN-only batched with
+      // others — or padding), the peer reads those trailing bytes as stream
+      // data and the offset overshoots the declared final size
+      // (FINAL_SIZE / PROTOCOL_VIOLATION 0xa). An explicit length is always
+      // safe and self-delimiting.
       if (hasOffset) typeByte |= 0x04;
-      if (hasLen) typeByte |= 0x02;
+      typeByte |= 0x02; // LEN — always present
       if (hasFin) typeByte |= 0x01;
 
       parts.push(concatUint8Arrays([
         new Uint8Array([typeByte]),
         writeVarInt(frame.id),
         hasOffset ? writeVarInt(frame.offset) : new Uint8Array(0),
-        hasLen ? writeVarInt(frame.data.length) : new Uint8Array(0),
+        writeVarInt(dataLen),
         frame.data || new Uint8Array(0)
       ]));
 
@@ -315,18 +323,14 @@ function encode_quic_frames(frames) {
       ]));
 
     } else if (frame.type === 'datagram') {
-      if (frame.contextId != null) {
-        parts.push(concatUint8Arrays([
-          new Uint8Array([0x31]),
-          writeVarInt(frame.contextId),
-          frame.data
-        ]));
-      } else {
-        parts.push(concatUint8Arrays([
-          new Uint8Array([0x30]),
-          frame.data
-        ]));
-      }
+      // Emit the 0x30 form (no Length): the datagram data runs to the end of
+      // the packet. QUICO sends each DATAGRAM as the sole/last frame of its
+      // packet, so the length-prefixed 0x31 form is not needed here. (The
+      // parser above accepts both forms on receive.)
+      parts.push(concatUint8Arrays([
+        new Uint8Array([0x30]),
+        frame.data
+      ]));
     }
   }
 
@@ -498,13 +502,21 @@ function parse_quic_frames(buf) {
       frames.push({ type: 'handshake_done' });
 
     } else if (type === 0x30 || type === 0x31) {
-      var contextId = null;
+      // RFC 9221 DATAGRAM frame. The 0x31 form carries an explicit Length
+      // varint and the datagram data is exactly that many bytes; the 0x30 form
+      // has no Length and the data runs to the end of the packet (so a 0x30
+      // DATAGRAM must be the last frame). The optional field is a Length — not
+      // a "context ID" (that draft-era concept was removed before RFC 9221).
+      var data;
       if (type === 0x31) {
-        var cid = safeReadVarInt(); if (!cid) break;
-        contextId = cid.value;
+        var len = safeReadVarInt(); if (!len) break;
+        var end = offset + len.value;
+        if (end > buf.length) break; // truncated / invalid length
+        data = buf.slice(offset, end); offset = end;
+      } else {
+        data = buf.slice(offset); offset = buf.length;
       }
-      var data = buf.slice(offset); offset = buf.length;
-      frames.push({ type: 'datagram', contextId: contextId, data: data });
+      frames.push({ type: 'datagram', data: data });
 
     } else {
       // Unknown frame — stop
@@ -604,24 +616,28 @@ function parse_transport_params(buf, start) {
 
     var id = idVar.value;
 
+    // Safe inner varint: a malformed param could carry an empty/short value,
+    // in which case readVarInt returns null — never dereference .value blindly.
+    function vi(bytes) { var r = readVarInt(bytes, 0); return r ? r.value : 0; }
+
     switch (id) {
       case 0x00: out.original_destination_connection_id = valueBytes; break;
-      case 0x01: out.max_idle_timeout = readVarInt(valueBytes, 0).value; break;
+      case 0x01: out.max_idle_timeout = vi(valueBytes); break;
       case 0x02: out.stateless_reset_token = valueBytes; break;
-      case 0x03: out.max_udp_payload_size = readVarInt(valueBytes, 0).value; break;
-      case 0x04: out.initial_max_data = readVarInt(valueBytes, 0).value; break;
-      case 0x05: out.initial_max_stream_data_bidi_local = readVarInt(valueBytes, 0).value; break;
-      case 0x06: out.initial_max_stream_data_bidi_remote = readVarInt(valueBytes, 0).value; break;
-      case 0x07: out.initial_max_stream_data_uni = readVarInt(valueBytes, 0).value; break;
-      case 0x08: out.initial_max_streams_bidi = readVarInt(valueBytes, 0).value; break;
-      case 0x09: out.initial_max_streams_uni = readVarInt(valueBytes, 0).value; break;
-      case 0x0a: out.ack_delay_exponent = readVarInt(valueBytes, 0).value; break;
-      case 0x0b: out.max_ack_delay = readVarInt(valueBytes, 0).value; break;
+      case 0x03: out.max_udp_payload_size = vi(valueBytes); break;
+      case 0x04: out.initial_max_data = vi(valueBytes); break;
+      case 0x05: out.initial_max_stream_data_bidi_local = vi(valueBytes); break;
+      case 0x06: out.initial_max_stream_data_bidi_remote = vi(valueBytes); break;
+      case 0x07: out.initial_max_stream_data_uni = vi(valueBytes); break;
+      case 0x08: out.initial_max_streams_bidi = vi(valueBytes); break;
+      case 0x09: out.initial_max_streams_uni = vi(valueBytes); break;
+      case 0x0a: out.ack_delay_exponent = vi(valueBytes); break;
+      case 0x0b: out.max_ack_delay = vi(valueBytes); break;
       case 0x0c: out.disable_active_migration = true; break;
-      case 0x0e: out.active_connection_id_limit = readVarInt(valueBytes, 0).value; break;
+      case 0x0e: out.active_connection_id_limit = vi(valueBytes); break;
       case 0x0f: out.initial_source_connection_id = valueBytes; break;
       case 0x10: out.retry_source_connection_id = valueBytes; break;
-      case 0x20: out.max_datagram_frame_size = readVarInt(valueBytes, 0).value; break;
+      case 0x20: out.max_datagram_frame_size = vi(valueBytes); break;
       default:
         if (!out.unknown) out.unknown = [];
         out.unknown.push({ id: id, bytes: valueBytes });

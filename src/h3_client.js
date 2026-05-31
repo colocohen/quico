@@ -12,10 +12,10 @@
  *     https://github.com/colocohen/quico
  */
 
-import dgram from 'node:dgram';
 import dns from 'node:dns';
-import { QUICConnection } from './quic_connection.js';
+import { DEBUG } from './utils.js';
 import { H3Connection } from './h3.js';
+import { createQuicClientSocket } from './quic_socket.js';
 
 
 // ============================================================
@@ -38,11 +38,16 @@ function request(options, callback) {
   var path = options.path || '/';
   var method = (options.method || 'GET').toUpperCase();
   var headers = options.headers || {};
-  var rejectUnauthorized = options.rejectUnauthorized !== false;
 
   // Connection reuse: pass _connection = { quic, h3, udpSocket, nextStreamId }
   var existingConn = options._connection || null;
-  var autoClose = existingConn ? false : true;
+  // Auto-close the QUIC connection when this request finishes ONLY when we own
+  // it — i.e. a fresh, standalone connection. Reused connections (existingConn)
+  // and connections whose lifecycle is managed by an external pool
+  // (options._managed, set by the unified client/agent) are left open; closing
+  // them here would tear down a connection still pooled for reuse. Managed
+  // connections are reaped by the agent (sweep/destroy) and the QUIC idle timer.
+  var autoClose = !existingConn && !options._managed;
 
   // ---- Client Request object ----
   var reqBody = [];
@@ -104,9 +109,12 @@ function request(options, callback) {
 
   // ---- Resolve hostname and connect (or reuse existing) ----
   if (existingConn) {
-    // Reuse existing connection — allocate stream ID and send when ready
+    // Reuse existing connection — allocate stream ID and send when ready.
+    // The shared dispatch listeners were installed when the connection was
+    // first created; installSharedHandlers() is idempotent.
     streamId = allocateStreamId(existingConn);
-    setupResponseHandlers();
+    installSharedHandlers(existingConn);
+    setupResponseHandlers(existingConn);
     if (reqFinished) sendRequest();
   } else {
     resolveAndConnect(hostname, port);
@@ -132,60 +140,40 @@ function request(options, callback) {
 
 
   function startConnection(remoteIp, remotePort) {
-    // Create UDP socket
-    var isIPv6 = remoteIp.indexOf(':') >= 0;
-    udpSocket = dgram.createSocket(isIPv6 ? 'udp6' : 'udp4');
+    udpSocket = createQuicClientSocket({
+      remoteIp: remoteIp,
+      remotePort: remotePort,
+      hostname: hostname,
 
-    udpSocket.on('message', function (msg, rinfo) {
-      if (quic) quic.feedDatagram(rinfo.address, rinfo.port, new Uint8Array(msg));
-    });
+      onError: function (err) {
+        emit(reqListeners, 'error', err);
+      },
 
-    udpSocket.on('error', function (err) {
-      emit(reqListeners, 'error', err);
-    });
-
-    // Bind to random port
-    udpSocket.bind(0, function () {
-      // Create QUIC connection (client mode)
-      quic = new QUICConnection({
-        isServer: false,
-        SNICallback: null,
-        hostname: hostname
-      });
-
-      // Send packets via UDP
-      quic.on('packet', function (data) {
-        udpSocket.send(data, remotePort, remoteIp, function (err) {
-          if (err) emit(reqListeners, 'error', err);
-        });
-      });
-
-      // QUIC connected → set up H3
-      quic.on('connect', function () {
-        console.log('[client] QUIC connected');
+      onConnect: function (q, s) {
+        quic = q;
+        udpSocket = s;
+        if (DEBUG) console.log('[client] QUIC connected');
 
         h3 = new H3Connection({ quicConnection: quic, isServer: false });
         connected = true;
 
         // Build connection object for reuse
         var conn = { quic: quic, h3: h3, udpSocket: udpSocket, _nextStreamId: 0 };
+
+        // Install the shared per-connection dispatch listeners ONCE, then
+        // register this request in the connection's stream-handler map.
+        installSharedHandlers(conn);
         streamId = allocateStreamId(conn);
 
         // Store on clientReq so caller (unified client) can reuse
         clientReq._connection = conn;
 
-        setupResponseHandlers();
+        setupResponseHandlers(conn);
 
         // Send request if body is ready
         if (reqFinished) sendRequest();
-      });
-
-      quic.on('close', function () {
-        if (udpSocket) { try { udpSocket.close(); } catch (e) {} }
-      });
-
-      // Start QUIC handshake
-      quic.connect();
+      }
+      // onClose: the helper closes the UDP socket; nothing extra needed here.
     });
   }
 
@@ -202,51 +190,78 @@ function request(options, callback) {
 
 
   /**
-   * Set up HTTP/3 response handlers for this request's streamId.
-   * Works for both new and reused connections.
+   * Install the three HTTP/3 event listeners ONCE per connection. They dispatch
+   * each event to the right request via the connection's stream-handler map
+   * (keyed by stream id), so multiplexing many requests over a single
+   * connection does NOT pile up listeners on the H3 emitter (previously every
+   * request added another set of listeners that were never removed).
+   * Idempotent per connection.
    */
-  function setupResponseHandlers() {
-    // HTTP response headers
-    h3.on('http_headers', function (sid, hdrs) {
-      if (sid !== streamId) return;
-      clientRes.headers = hdrs;
-      clientRes.statusCode = parseInt(hdrs[':status']) || 0;
-      clientRes._headersReceived = true;
+  function installSharedHandlers(conn) {
+    if (conn._streamHandlers) return;  // already installed for this connection
+    conn._streamHandlers = {};
+    var h3c = conn.h3;
 
-      // Fire callback with response
-      if (typeof callback === 'function') {
-        callback(clientRes);
-        callback = null; // only once
+    h3c.on('http_headers', function (sid, hdrs) {
+      var h = conn._streamHandlers[sid];
+      if (h) h.onHeaders(hdrs);
+    });
+    h3c.on('http_body', function (sid, data) {
+      var h = conn._streamHandlers[sid];
+      if (h) h.onBody(data);
+    });
+    h3c.on('http_end', function (sid) {
+      var h = conn._streamHandlers[sid];
+      if (!h) return;
+      delete conn._streamHandlers[sid];  // free per-stream state before dispatch
+      h.onEnd();
+    });
+  }
+
+
+  /**
+   * Register this request's response handlers in the connection's stream map,
+   * keyed by its streamId. Replaces per-request h3.on(...) registration —
+   * routing is now by map key, so no per-listener streamId check is needed.
+   */
+  function setupResponseHandlers(conn) {
+    conn._streamHandlers[streamId] = {
+      onHeaders: function (hdrs) {
+        clientRes.headers = hdrs;
+        clientRes.statusCode = parseInt(hdrs[':status']) || 0;
+        clientRes._headersReceived = true;
+
+        // Fire callback with response (once)
+        if (typeof callback === 'function') {
+          callback(clientRes);
+          callback = null;
+        }
+        emit(reqListeners, 'response', clientRes);
+      },
+
+      onBody: function (data) {
+        emit(clientRes, 'data', data);
+      },
+
+      onEnd: function () {
+        emit(clientRes, 'end');
+
+        // Auto-close only if we own the connection (see `autoClose` above).
+        if (autoClose) {
+          setTimeout(function () {
+            if (quic) quic.close(0, 'done');
+            if (udpSocket) { try { udpSocket.close(); } catch (e) {} }
+          }, 100);
+        }
       }
-      emit(reqListeners, 'response', clientRes);
-    });
-
-    // HTTP response body
-    h3.on('http_body', function (sid, data) {
-      if (sid !== streamId) return;
-      emit(clientRes, 'data', data);
-    });
-
-    // HTTP response end
-    h3.on('http_end', function (sid) {
-      if (sid !== streamId) return;
-      emit(clientRes, 'end');
-
-      // Auto-close only if we own the connection (not reusing)
-      if (autoClose) {
-        setTimeout(function () {
-          if (quic) quic.close(0, 'done');
-          if (udpSocket) { try { udpSocket.close(); } catch (e) {} }
-        }, 100);
-      }
-    });
+    };
   }
 
 
   function sendRequest() {
     if (!h3 || !connected) return;
 
-    console.log('[client] sendRequest method=' + method + ' path=' + path + ' stream=' + streamId);
+    if (DEBUG) console.log('[client] sendRequest method=' + method + ' path=' + path + ' stream=' + streamId);
 
     // MUST send control streams (SETTINGS) before any request
     h3.sendControlStreams();

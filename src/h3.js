@@ -13,10 +13,12 @@
  */
 
 import {
+  DEBUG,
   Emitter,
   concatUint8Arrays,
   writeVarInt,
-  readVarInt
+  readVarInt,
+  wt_stream_header
 } from './utils.js';
 
 
@@ -156,26 +158,30 @@ function huffDecode(buf) {
 //  QPACK parse/build helpers
 // ============================================================
 
-function decodeQpackVarInt(buf, prefixBits, pos) {
+// Read a QPACK/HPACK prefixed integer at buf[pos]. Returns { value, next } or
+// null if the buffer ends mid-integer (truncated). Used by both the header
+// block parser and the encoder-instruction parser.
+function readPrefixedInt(buf, prefixBits, pos) {
+  if (pos >= buf.length) return null;
   var max = (1 << prefixBits) - 1;
   var value = buf[pos] & max;
   pos++;
   if (value < max) return { value: value, next: pos };
   var m = 0;
-  while (true) {
+  while (pos < buf.length) {
     var byte = buf[pos++];
     value += (byte & 0x7f) << m;
-    if ((byte & 0x80) === 0) break;
+    if ((byte & 0x80) === 0) return { value: value, next: pos };
     m += 7;
   }
-  return { value: value, next: pos };
+  return null; // truncated mid-integer
 }
 
 function parseQpackHeaderBlock(buf, dynamicTable, baseIndex) {
   var pos = 0;
-  var ric = decodeQpackVarInt(buf, 8, pos); pos = ric.next;
+  var ric = readPrefixedInt(buf, 8, pos); if (!ric) return {}; pos = ric.next;
   var postBase = (buf[pos] & 0x80) !== 0;
-  var db = decodeQpackVarInt(buf, 7, pos); pos = db.next;
+  var db = readPrefixedInt(buf, 7, pos); if (!db) return {}; pos = db.next;
   var bi = postBase ? ric.value + db.value : ric.value - db.value;
 
   var headers = {};
@@ -185,7 +191,7 @@ function parseQpackHeaderBlock(buf, dynamicTable, baseIndex) {
     if ((byte & 0x80) === 0x80) {
       // Indexed
       var fromStatic = (byte & 0x40) !== 0;
-      var idx = decodeQpackVarInt(buf, 6, pos); pos = idx.next;
+      var idx = readPrefixedInt(buf, 6, pos); if (!idx) break; pos = idx.next;
       if (fromStatic && idx.value < QPACK_STATIC.length) {
         headers[QPACK_STATIC[idx.value][0]] = QPACK_STATIC[idx.value][1];
       } else if (!fromStatic && dynamicTable) {
@@ -198,9 +204,9 @@ function parseQpackHeaderBlock(buf, dynamicTable, baseIndex) {
     } else if ((byte & 0xc0) === 0x40) {
       // Literal with name ref
       var fromStatic = (byte & 0x10) !== 0;
-      var nameIdx = decodeQpackVarInt(buf, 4, pos); pos = nameIdx.next;
+      var nameIdx = readPrefixedInt(buf, 4, pos); if (!nameIdx) break; pos = nameIdx.next;
       var valH = (buf[pos] & 0x80) !== 0;
-      var valLen = decodeQpackVarInt(buf, 7, pos); pos = valLen.next;
+      var valLen = readPrefixedInt(buf, 7, pos); if (!valLen) break; pos = valLen.next;
       var valBytes = buf.slice(pos, pos + valLen.value); pos += valLen.value;
       var value = valH ? huffDecode(valBytes) : new TextDecoder().decode(valBytes);
 
@@ -216,11 +222,11 @@ function parseQpackHeaderBlock(buf, dynamicTable, baseIndex) {
     } else if ((byte & 0xe0) === 0x20) {
       // Literal with literal name
       var nameH = (byte & 0x08) !== 0;
-      var nameLen = decodeQpackVarInt(buf, 3, pos); pos = nameLen.next;
+      var nameLen = readPrefixedInt(buf, 3, pos); if (!nameLen) break; pos = nameLen.next;
       var nameBytes = buf.slice(pos, pos + nameLen.value); pos += nameLen.value;
       var name = nameH ? huffDecode(nameBytes) : new TextDecoder().decode(nameBytes);
       var valH = (buf[pos] & 0x80) !== 0;
-      var valLen = decodeQpackVarInt(buf, 7, pos); pos = valLen.next;
+      var valLen = readPrefixedInt(buf, 7, pos); if (!valLen) break; pos = valLen.next;
       var valBytes = buf.slice(pos, pos + valLen.value); pos += valLen.value;
       var value = valH ? huffDecode(valBytes) : new TextDecoder().decode(valBytes);
       headers[name] = value;
@@ -421,22 +427,13 @@ function parseQpackEncoderInstructions(chunks, fromOffset) {
   var pos = 0;
   var instructions = [];
 
+  // Thin wrapper over the shared readPrefixedInt that advances the local `pos`
+  // and returns the value (or null on truncation), preserving call-site usage.
   function safeVarInt(prefixBits) {
-    if (pos >= combined.length) return null;
-    var max = (1 << prefixBits) - 1;
-    var value = combined[pos] & max;
-    var startPos = pos;
-    pos++;
-    if (value < max) return value;
-    var m = 0;
-    while (pos < combined.length) {
-      var b = combined[pos++];
-      value += (b & 0x7f) << m;
-      if ((b & 0x80) === 0) return value;
-      m += 7;
-    }
-    pos = startPos;
-    return null;
+    var r = readPrefixedInt(combined, prefixBits, pos);
+    if (!r) return null;
+    pos = r.next;
+    return r.value;
   }
 
   while (pos < combined.length) {
@@ -624,8 +621,8 @@ function H3Connection(options) {
     var encId   = context.isServer ? 7 : 6;
     var decId   = context.isServer ? 11 : 10;
 
-    console.log('[h3] sendControlStreams ctrl=' + ctrlId + ' enc=' + encId + ' dec=' + decId);
-    console.log('[h3] SETTINGS hex: ' + Array.from(controlFrame).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(' '));
+    if (DEBUG) console.log('[h3] sendControlStreams ctrl=' + ctrlId + ' enc=' + encId + ' dec=' + decId);
+    if (DEBUG) console.log('[h3] SETTINGS hex: ' + Array.from(controlFrame).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(' '));
 
     // Send type byte + SETTINGS together as one chunk (some implementations need this)
     var ctrlData = new Uint8Array(1 + controlFrame.byteLength);
@@ -634,6 +631,17 @@ function H3Connection(options) {
     quic.sendStream(ctrlId, ctrlData, false);
     quic.sendStream(encId, new Uint8Array([0x02]), false);    // QPACK encoder
     quic.sendStream(decId, new Uint8Array([0x03]), false);    // QPACK decoder
+  }
+
+
+  // ---- Graceful shutdown: GOAWAY (RFC 9114 §5.2) ----
+
+  function sendGoaway(id) {
+    sendControlStreams();  // idempotent — ensures the control stream + its type byte exist
+    var ctrlId = context.isServer ? 3 : 2;
+    var frame = buildH3Frames([{ frame_type: 0x07, payload: writeVarInt(id || 0) }]);
+    if (DEBUG) console.log('[h3] → GOAWAY id=' + (id || 0));
+    quic.sendStream(ctrlId, frame, false);
   }
 
 
@@ -655,7 +663,7 @@ function H3Connection(options) {
     }
 
     if (_claimedStreams.has(sid)) return; // owned by WebTransport client
-    console.log('[h3] stream ' + streamId + ' data=' + data.byteLength + ' fin=' + fin);
+    if (DEBUG) console.log('[h3] stream ' + streamId + ' data=' + data.byteLength + ' fin=' + fin);
     if (!(streamId in context.streams)) {
       context.streams[streamId] = { chunks: [], from_offset: 0, type: null, fin_received: false };
     }
@@ -671,7 +679,7 @@ function H3Connection(options) {
       // ---- WT stream detection ----
       if (context.local_webtransport && _wtSessions.size > 0) {
         var allData = concatUint8Arrays(s.chunks);
-        console.log('[h3] WT check: stream=' + sid + ' firstByte=0x' + (allData[0] || 0).toString(16) + ' len=' + allData.byteLength + ' sessions=' + Array.from(_wtSessions));
+        if (DEBUG) console.log('[h3] WT check: stream=' + sid + ' firstByte=0x' + (allData[0] || 0).toString(16) + ' len=' + allData.byteLength + ' sessions=' + Array.from(_wtSessions));
         if (allData.byteLength >= 2 && allData[0] === 0x40) {
           var typeResult = readVarInt(allData, 0);
           if (typeResult) {
@@ -689,7 +697,7 @@ function H3Connection(options) {
                 _wtStreams[sid] = { sessionId: sessionId, isBidi: !isUni };
                 delete context.streams[streamId];
 
-                console.log('[h3] WT stream detected: stream=' + sid + ' session=' + sessionId + ' bidi=' + !isUni + ' dataLen=' + remaining.byteLength);
+                if (DEBUG) console.log('[h3] WT stream detected: stream=' + sid + ' session=' + sessionId + ' bidi=' + !isUni + ' dataLen=' + remaining.byteLength);
                 ev.emit('wt_stream', sessionId, sid, remaining, fin, !isUni);
                 if (fin) delete _wtStreams[sid];
                 return;
@@ -739,7 +747,7 @@ function H3Connection(options) {
 
   function processControlStream(s) {
     var ext = extractH3Frames(s.chunks, s.from_offset);
-    console.log('[h3] control: extracted ' + ext.frames.length + ' H3 frames');
+    if (DEBUG) console.log('[h3] control: extracted ' + ext.frames.length + ' H3 frames');
     if (ext.frames.length === 0) return;
     s.from_offset = ext.new_from_offset;
 
@@ -761,7 +769,12 @@ function H3Connection(options) {
         set_context(updates);
 
       } else if (ext.frames[i].frame_type === 0x07) {
-        // GOAWAY — TODO
+        // GOAWAY (RFC 9114 §5.2): the peer will not process requests/pushes
+        // with an identifier >= this value. Surface it so consumers (e.g. the
+        // agent) can stop sending new requests on this connection.
+        var gp = readVarInt(ext.frames[i].payload, 0);
+        if (DEBUG) console.log('[h3] ← GOAWAY id=' + (gp ? gp.value : '?'));
+        ev.emit('goaway', gp ? gp.value : 0);
       }
     }
   }
@@ -801,7 +814,7 @@ function H3Connection(options) {
 
   function processBidiStream(streamId, s) {
     var ext = extractH3Frames(s.chunks, s.from_offset);
-    console.log('[h3] bidi stream ' + streamId + ': extracted ' + ext.frames.length + ' H3 frames, types=' + ext.frames.map(function(f){ return '0x' + f.frame_type.toString(16); }).join(','));
+    if (DEBUG) console.log('[h3] bidi stream ' + streamId + ': extracted ' + ext.frames.length + ' H3 frames, types=' + ext.frames.map(function(f){ return '0x' + f.frame_type.toString(16); }).join(','));
 
     if (ext.frames.length > 0) {
       s.from_offset = ext.new_from_offset;
@@ -836,12 +849,12 @@ function H3Connection(options) {
   function sendHeaders(streamId, headers, fin) {
     var payload = buildQpackHeaderBlock(headers);
     var frame = buildH3Frames([{ frame_type: 1, payload: payload }]);
-    console.log('[h3] sendHeaders stream=' + streamId + ' len=' + frame.byteLength + ' fin=' + !!fin);
+    if (DEBUG) console.log('[h3] sendHeaders stream=' + streamId + ' len=' + frame.byteLength + ' fin=' + !!fin);
     quic.sendStream(streamId, frame, !!fin);
   }
 
   function sendBody(streamId, data, fin) {
-    console.log('[h3] sendBody stream=' + streamId + ' data=' + (data ? data.byteLength : 'null') + ' fin=' + fin);
+    if (DEBUG) console.log('[h3] sendBody stream=' + streamId + ' data=' + (data ? data.byteLength : 'null') + ' fin=' + fin);
     if (data === null || data === undefined) {
       // Just set FIN on the stream (no additional H3 frame needed for empty body)
       quic.sendStream(streamId, new Uint8Array(0), true);
@@ -864,6 +877,7 @@ function H3Connection(options) {
     sendHeaders: sendHeaders,
     sendBody: sendBody,
     sendControlStreams: sendControlStreams,
+    sendGoaway: sendGoaway,
     claimStream: function (streamId) { _claimedStreams.add(Number(streamId)); },
 
     // WebTransport server-side API
@@ -887,12 +901,7 @@ function H3Connection(options) {
       }
 
       // Send WT prefix: VarInt(type) + VarInt(session_id)
-      var typePrefix = writeVarInt(isBidi ? 0x41 : 0x54);
-      var sessionPrefix = writeVarInt(sessionId);
-      var header = new Uint8Array(typePrefix.length + sessionPrefix.length);
-      header.set(typePrefix, 0);
-      header.set(sessionPrefix, typePrefix.length);
-      quic.sendStream(streamId, header, false);
+      quic.sendStream(streamId, wt_stream_header(isBidi, sessionId), false);
 
       _claimedStreams.add(streamId);
       _wtStreams[streamId] = { sessionId: sessionId, isBidi: isBidi };

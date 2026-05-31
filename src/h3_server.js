@@ -12,13 +12,10 @@
  *     https://github.com/colocohen/quico
  */
 
-import dgram from 'node:dgram';
 import { Duplex, Readable, Writable } from 'node:stream';
-import { Emitter, readVarInt, writeVarInt } from './utils.js';
-import { parse_quic_datagram } from './transport.js';
-import { QUICConnection } from './quic_connection.js';
+import { Emitter, readVarInt, wt_datagram_payload } from './utils.js';
+import { createQuicServer } from './quic_server.js';
 import { H3Connection } from './h3.js';
-import { createSecureContext } from './tls_bridge.js';
 
 
 // ============================================================
@@ -29,23 +26,26 @@ function createServer(options, handler) {
   options = options || {};
 
   var ev = Emitter();
-  var udp4 = null;
-  var udp6 = null;
-  var port = null;
 
-  // Build SNICallback
-  var sniCallback = options.SNICallback || null;
+  // Transport-only QUIC server owns the UDP socket(s), demux, connection
+  // map and lifecycle. h3_server layers HTTP/3 on top by listening for its
+  // 'connection' event (see below) and wrapping each raw QUICConnection in
+  // an H3Connection. ALPN is 'h3'. External-socket (shared-port) mode and
+  // the handlePacket/hasConnection demux hooks are provided by the
+  // transport server and re-exported on this server's API.
+  var qserver = createQuicServer({
+    alpn: 'h3',
+    SNICallback: options.SNICallback || null,
+    key: options.key,
+    cert: options.cert,
+    ca: options.ca,
+    maxConnections: options.maxConnections || 10000,
+    socket: options.socket || null,
+    socket6: options.socket6 || null
+  });
 
-  if (!sniCallback && options.key && options.cert) {
-    var defaultCtx = createSecureContext({ key: options.key, cert: options.cert, ca: options.ca });
-    sniCallback = function (servername, cb) { cb(null, defaultCtx); };
-  }
-
-  // ---- Connection tracking ----
-  var connections = {};     // connId → { quic, h3, http_streams }
-  var addressMap = {};      // "ip:port" → connId
-  var maxConnections = options.maxConnections || 10000;
-  var sweepTimer = null;
+  // Surface transport-level (UDP socket / send) errors on this server.
+  qserver.on('error', function (err) { ev.emit('error', err); });
 
 
   // ============================================================
@@ -105,8 +105,7 @@ function createServer(options, handler) {
   //  Same pattern as old quico h3_server.js
   // ============================================================
 
-  function set_http_stream(connId, streamId, params) {
-    var conn = connections[connId];
+  function set_http_stream(conn, streamId, params) {
     if (!conn) return;
 
     var is_new = false;
@@ -200,12 +199,7 @@ function createServer(options, handler) {
           if (!req._isWebTransport) return;
           if (typeof data === 'string') data = Buffer.from(data);
           if (Buffer.isBuffer(data)) data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-          var quarterSid = Math.floor(Number(streamId) / 4);
-          var prefix = writeVarInt(quarterSid);
-          var frame = new Uint8Array(prefix.length + data.byteLength);
-          frame.set(prefix, 0);
-          frame.set(data, prefix.length);
-          conn.quic.sendDatagram(frame);
+          conn.quic.sendDatagram(wt_datagram_payload(Number(streamId), data));
         },
 
         createBidirectionalStream: function () {
@@ -284,93 +278,41 @@ function createServer(options, handler) {
 
 
   // ============================================================
-  //  UDP → connection routing
+  //  HTTP/3 over each accepted QUIC connection
+  //  The transport server hands us a raw QUICConnection per peer; we wrap
+  //  it in an H3Connection once the handshake completes and bridge HTTP/3 +
+  //  WebTransport events to req/res via set_http_stream. Per-connection
+  //  state lives in this closure — the transport server owns the UDP
+  //  socket, demux and connection lifecycle.
   // ============================================================
 
-  function onUdpMessage(msg, rinfo) {
-    var data = new Uint8Array(msg);
-    var fromIp = rinfo.address;
-    var fromPort = rinfo.port;
-    console.log('[server] UDP from ' + fromIp + ':' + fromPort + ' len=' + data.length);
-
-    var addressKey = fromIp + ':' + fromPort;
-    var packets = parse_quic_datagram(data);
-    if (packets.length === 0) return;
-
-    for (var i = 0; i < packets.length; i++) {
-      var pkt = packets[i];
-      if (!pkt) continue;
-
-      var connId = findConnectionId(pkt, addressKey);
-
-      if (!(connId in connections)) {
-        // Reject new connections when at capacity
-        if (Object.keys(connections).length >= maxConnections) return;
-        createConnection(connId, fromIp, fromPort, addressKey);
-      }
-
-      connections[connId].quic.feedDatagram(fromIp, fromPort, pkt.raw);
-    }
-  }
-
-
-  function findConnectionId(pkt, addressKey) {
-    var dcidStr = null;
-    if (pkt.dcid && pkt.dcid.byteLength > 0) {
-      dcidStr = Array.from(pkt.dcid).join('');
-    }
-
-    if (dcidStr && dcidStr in connections) return dcidStr;
-    if (addressKey in addressMap && addressMap[addressKey] in connections) return addressMap[addressKey];
-
-    var id = dcidStr || String(Math.floor(Math.random() * 9007199254740991));
-    addressMap[addressKey] = id;
-    return id;
-  }
-
-
-  function createConnection(connId, fromIp, fromPort, addressKey) {
-    var quic = new QUICConnection({ SNICallback: sniCallback });
-
-    connections[connId] = {
-      quic: quic,
-      h3: null,
-      http_streams: {}
-    };
-
-    addressMap[addressKey] = connId;
-
-    // Send packets back via UDP
-    quic.on('packet', function (data) {
-      sendUdp(fromIp, fromPort, data);
-    });
+  qserver.on('connection', function (quic, peer) {
+    var conn = { quic: quic, h3: null, http_streams: {} };
 
     // QUIC handshake complete → set up H3
     quic.on('connect', function () {
       var h3 = new H3Connection({ quicConnection: quic, enableWebTransport: true });
-      connections[connId].h3 = h3;
+      conn.h3 = h3;
 
       // HTTP request headers received → set_http_stream (reactive)
       h3.on('http_headers', function (streamId, headers) {
-        set_http_stream(connId, streamId, { request_headers: headers });
+        set_http_stream(conn, streamId, { request_headers: headers });
       });
 
       // HTTP request body chunk → set_http_stream
       h3.on('http_body', function (streamId, data) {
-        set_http_stream(connId, streamId, { request_body_chunk: data });
+        set_http_stream(conn, streamId, { request_body_chunk: data });
       });
 
       // HTTP request complete → fire req.on('end')
       h3.on('http_end', function (streamId) {
-        set_http_stream(connId, streamId, { request_end: true });
+        set_http_stream(conn, streamId, { request_end: true });
       });
 
       // ---- WebTransport stream events ----
 
       // New WT stream (bidi or uni from client)
       h3.on('wt_stream', function (sessionId, wtStreamId, data, fin, isBidi) {
-        var conn = connections[connId];
-        if (!conn) return;
         var session = conn.http_streams[sessionId];
         if (!session || !session.req._isWebTransport) return;
 
@@ -395,8 +337,7 @@ function createServer(options, handler) {
 
       // Subsequent data on WT stream
       h3.on('wt_data', function (sessionId, wtStreamId, data, fin) {
-        var conn = connections[connId];
-        if (!conn || !conn._wtStreamObjects) return;
+        if (!conn._wtStreamObjects) return;
         var wtStream = conn._wtStreamObjects[wtStreamId];
         if (!wtStream) return;
         if (data.byteLength > 0) wtStream._pushData(data);
@@ -404,7 +345,7 @@ function createServer(options, handler) {
       });
 
       // Datagrams
-      quic.on('datagram', function (_contextId, rawData) {
+      quic.on('datagram', function (rawData) {
         if (!rawData || rawData.byteLength === 0) return;
         var result = readVarInt(rawData, 0);
         if (!result) return;
@@ -412,8 +353,6 @@ function createServer(options, handler) {
         var payload = rawData.slice(result.byteLength);
 
         // Find the session: quarter_stream_id = session_stream_id / 4
-        var conn = connections[connId];
-        if (!conn) return;
         for (var sid in conn.http_streams) {
           var session = conn.http_streams[sid];
           if (session.req._isWebTransport && Math.floor(Number(sid) / 4) === quarterSid) {
@@ -423,99 +362,29 @@ function createServer(options, handler) {
         }
       });
     });
-
-    quic.on('close', function () {
-      delete connections[connId];
-      if (addressMap[addressKey] === connId) delete addressMap[addressKey];
-    });
-  }
-
-
-  // ============================================================
-  //  UDP send
-  // ============================================================
-
-  function sendUdp(toIp, toPort, data) {
-    var socket = toIp.indexOf(':') >= 0 ? udp6 : udp4;
-    if (!socket) return;
-    socket.send(data, toPort, toIp, function (err) {
-      if (err) ev.emit('error', err);
-    });
-  }
-
-
-  // ============================================================
-  //  listen / close
-  // ============================================================
-
-  function listen(listenPort, host, callback) {
-    if (typeof host === 'function') { callback = host; host = null; }
-    port = listenPort || 443;
-    host = host || '::';
-
-    udp4 = dgram.createSocket('udp4');
-    udp4.on('message', onUdpMessage);
-    udp4.on('error', function (err) { ev.emit('error', err); });
-    var host4 = host.indexOf('.') !== -1 ? host : '0.0.0.0';
-    udp4.bind(port, host4);
-
-    udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
-    udp6.on('message', onUdpMessage);
-    udp6.on('error', function (err) { ev.emit('error', err); });
-    var host6 = host.indexOf(':') !== -1 ? host : '::';
-    udp6.bind(port, host6, function () {
-      if (typeof callback === 'function') callback();
-    });
-
-    // Periodic sweep for dead connections (safety net)
-    sweepTimer = setInterval(function () {
-      for (var id in connections) {
-        var st = connections[id].quic.state;
-        if (st === 'closed') {
-          delete connections[id];
-          // Clean address map
-          for (var addr in addressMap) {
-            if (addressMap[addr] === id) delete addressMap[addr];
-          }
-        }
-      }
-    }, 30000);
-  }
-
-  function close(callback) {
-    // Stop sweep
-    if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
-
-    // Close all connections
-    for (var id in connections) {
-      try { connections[id].quic.close(0, 'server closing'); } catch (e) { }
-    }
-    connections = {};
-    addressMap = {};
-
-    var closed = 0;
-    var total = (udp4 ? 1 : 0) + (udp6 ? 1 : 0);
-    if (total === 0) { if (callback) callback(); return; }
-
-    function onClose() {
-      closed++;
-      if (closed >= total && typeof callback === 'function') callback();
-    }
-
-    if (udp4) { udp4.close(onClose); udp4 = null; }
-    if (udp6) { udp6.close(onClose); udp6 = null; }
-  }
+  });
 
 
   // ============================================================
   //  Server API
+  //  Transport concerns (UDP sockets, demux, connection lifecycle,
+  //  shared-port handlePacket/hasConnection) are delegated to the QUIC
+  //  server. This layer adds HTTP/3 request events on top.
   // ============================================================
 
   return {
-    listen: listen,
-    close: close,
+    listen: qserver.listen,
+    close: qserver.close,
     on: function (name, fn) { ev.on(name, fn); },
-    setTimeout: function () { /* TODO */ }
+    setTimeout: function () { /* TODO */ },
+
+    /** Feed an incoming UDP packet when running in external-socket mode.
+     *  rinfo must be in Node's dgram format: { address, port, family, size }. */
+    handlePacket: qserver.handlePacket,
+
+    /** Returns true if the 5-tuple matches an active QUIC connection.
+     *  Used by demuxers for routing decisions on shared UDP ports. */
+    hasConnection: qserver.hasConnection
   };
 }
 

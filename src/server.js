@@ -19,23 +19,7 @@ import nodeHttps from 'node:https';
 import nodeTls from 'node:tls';
 
 import { createServer as createH3Server } from './h3_server.js';
-import { createSecureContext as _lemonCreateSecureContext } from './tls_bridge.js';
 import { IncomingMessage, ServerResponse, _makeSocketStub } from './streams.js';
-
-
-/**
- * Wrapped createSecureContext — stores raw key/cert on the context
- * so server.js can reuse them for TCP (node:tls).
- */
-function createSecureContext(opts) {
-  var ctx = _lemonCreateSecureContext(opts);
-  if (opts) {
-    ctx._rawKey = opts.key || null;
-    ctx._rawCert = opts.cert || null;
-    ctx._rawCa = opts.ca || null;
-  }
-  return ctx;
-}
 
 
 // ============================================================
@@ -89,8 +73,15 @@ function createServer(options, handler) {
     cert: tlsCert,
     ca: tlsCa,
     SNICallback: options.SNICallback || null,
-    maxConnections: options.maxConnections || 10000
+    maxConnections: options.maxConnections || 10000,
+    // External UDP sockets (shared UDP port scenario). When provided,
+    // the UDP layer is owned externally — caller feeds packets via
+    // server.handlePacket(msg, rinfo). See RFC 9443.
+    socket:  options.socket  || null,
+    socket6: options.socket6 || null
   };
+
+  var isExternalUdp = !!(options.socket || options.socket6);
 
   var h3srv = createH3Server(h3Options, function (plainReq, plainRes) {
     var socketStub = _makeSocketStub();
@@ -111,10 +102,6 @@ function createServer(options, handler) {
     plainReq.on('data', function (chunk) { req._pushData(chunk); });
     plainReq.on('end', function () { req._endData(); });
 
-    // Store wrapper references for WebTransport event forwarding
-    plainReq._wrapper = req;
-    plainRes._wrapper = res;
-
     // ---- Wrap plain res into ServerResponse (Writable) ----
     // ServerResponse._write → plainRes.write
     // ServerResponse._flushHeaders → plainRes.writeHead
@@ -124,6 +111,12 @@ function createServer(options, handler) {
       socket: socketStub
     });
     res.req = req;
+
+    // Store wrapper references for WebTransport event forwarding.
+    // MUST come after `res` is created (was previously set while res was
+    // still undefined due to var hoisting).
+    plainReq._wrapper = req;
+    plainRes._wrapper = res;
 
     // Override internal methods to delegate to the plain H3 res.
     // Key insight: we buffer one chunk behind so that _final can
@@ -285,7 +278,9 @@ function createServer(options, handler) {
       }
     }
 
-    // H3 (UDP) — always
+    // H3 — always. In external mode h3srv.listen() wires up the external
+    // sockets' message handler and starts the sweep timer, but does not
+    // bind anything new.
     h3srv.listen(port, host, done);
 
     // TCP — if needed
@@ -336,6 +331,19 @@ function createServer(options, handler) {
         tcpServer.setTimeout(msecs, callback);
       }
       return server;
+    },
+
+    /** Feed an incoming UDP packet from a shared/external socket.
+     *  rinfo must be in Node's dgram format: { address, port, family, size }.
+     *  Only relevant when the server was created with options.socket/socket6. */
+    handlePacket: function (msg, rinfo) {
+      return h3srv.handlePacket(msg, rinfo);
+    },
+
+    /** Returns true if the 5-tuple matches an active QUIC connection.
+     *  Used by demuxers for routing decisions on shared UDP ports. */
+    hasConnection: function (rinfo) {
+      return h3srv.hasConnection(rinfo);
     }
   };
 

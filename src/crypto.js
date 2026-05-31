@@ -60,8 +60,16 @@ var INITIAL_SALTS = {
 // ============================================================
 
 /**
- * Derive Initial encryption keys from the client DCID.
- * direction: 'read' = client keys, 'write' = server keys
+ * Derive an Initial-packet secret + keys from the client's original DCID.
+ *
+ * `direction` selects WHICH endpoint's Initial secret to derive — it is NOT
+ * "the keys I read/write with" in the obvious sense:
+ *   'read'  → the client's secret  (TLS label "client in")
+ *   'write' → the server's secret  (TLS label "server in")
+ * Each role then maps these to its own read/write keys: a client WRITES with
+ * the "client in" secret and READS with "server in"; a server is the mirror.
+ * So callers pass 'read' to get the client-side keys and 'write' for the
+ * server-side keys, and assign them to initial_read / initial_write per role.
  */
 function quic_derive_init_secrets(client_dcid, version, direction) {
   var hashName = 'sha256';
@@ -237,8 +245,10 @@ function expandPacketNumber(truncated, pnLen, largestReceived) {
 
 function decode_packet_number(array, offset, pnLength) {
   var value = 0;
+  // Use *256 (not <<8): a 4-byte packet number whose leading byte has the high
+  // bit set would overflow JS's 32-bit signed bitwise math and go negative.
   for (var i = 0; i < pnLength; i++) {
-    value = (value << 8) | array[offset + i];
+    value = value * 256 + array[offset + i];
   }
   return value;
 }
@@ -354,8 +364,13 @@ function encrypt_quic_packet(packetType, encodedFrames, writeKey, writeIv, write
 
 /**
  * Decrypt a QUIC packet (raw bytes → plaintext frames).
+ *
+ * `ownCid` is the connection ID by which the receiver is addressed. It is used
+ * ONLY for short (1-RTT) headers, which carry no DCID-length field — the
+ * receiver must already know its own CID length to locate the packet number.
+ * Long headers encode the DCID length on the wire, so `ownCid` is ignored there.
  */
-function decrypt_quic_packet(array, readKey, readIv, readHp, dcid, largestPn) {
+function decrypt_quic_packet(array, readKey, readIv, readHp, ownCid, largestPn) {
   if (!(array instanceof Uint8Array)) throw new Error('Invalid input');
 
   var firstByte = array[0];
@@ -405,7 +420,7 @@ function decrypt_quic_packet(array, readKey, readIv, readHp, dcid, largestPn) {
 
   } else {
     // Short Header
-    var dcidLen = dcid.length;
+    var dcidLen = ownCid.length;
     pnOffset = 1 + dcidLen;
 
     pnLength = remove_header_protection(array, pnOffset, readHp, true);

@@ -14,6 +14,16 @@
 
 
 // ============================================================
+//  Debug flag — set QUICO_DEBUG=1 to enable verbose logging.
+//  Read once at module load. Call sites guard with `if (DEBUG)`
+//  so the (expensive) log-string construction is skipped entirely
+//  when debugging is off.
+// ============================================================
+
+var DEBUG = !!(typeof process !== 'undefined' && process.env && process.env.QUICO_DEBUG);
+
+
+// ============================================================
 //  Emitter — lightweight event emitter (single shared copy)
 // ============================================================
 
@@ -124,10 +134,12 @@ function readVarInt(array, offset) {
       array[offset + 7]
     ) >>> 0;
     var full = BigInt(hi) * 4294967296n + BigInt(lo);
-    if (full <= BigInt(Number.MAX_SAFE_INTEGER)) {
-      return { value: Number(full), byteLength: 8 };
-    }
-    return { value: full, byteLength: 8 };
+    // Always return a Number. QUIC fields (lengths, offsets, IDs, limits) never
+    // legitimately exceed 2^53, and a malicious 8-byte value that does will be
+    // rejected by the parsers' bounds checks anyway. Returning a BigInt here
+    // would throw "Cannot mix BigInt and other types" the moment the value is
+    // combined with a Number offset during parsing.
+    return { value: Number(full), byteLength: 8 };
   }
 
   return null;
@@ -161,6 +173,46 @@ function uint8Equal(a, b) {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+
+// ============================================================
+//  WebTransport framing helpers (draft-ietf-webtrans-http3 / RFC 9297)
+//
+//  Both client (webtransport.js) and server (h3.js) build the same
+//  byte layouts, so they live here to avoid duplicating the prefix
+//  construction across the stream and datagram send paths.
+// ============================================================
+
+/**
+ * Build a WebTransport stream header: VarInt(streamType) + VarInt(sessionId) [+ data].
+ * streamType is 0x41 for a bidirectional WT stream, 0x54 for a unidirectional one.
+ * The header prefixes the FIRST chunk on a WT stream (or a lone FIN frame); pass
+ * `data` for "header + payload", omit it for a header-only (e.g. FIN) frame.
+ */
+function wt_stream_header(isBidi, sessionId, data) {
+  var typePrefix = writeVarInt(isBidi ? 0x41 : 0x54);
+  var sessionPrefix = writeVarInt(sessionId);
+  var dataLen = (data && data.byteLength) ? data.byteLength : 0;
+  var out = new Uint8Array(typePrefix.length + sessionPrefix.length + dataLen);
+  out.set(typePrefix, 0);
+  out.set(sessionPrefix, typePrefix.length);
+  if (dataLen) out.set(data, typePrefix.length + sessionPrefix.length);
+  return out;
+}
+
+/**
+ * Build a WebTransport datagram payload: VarInt(quarter_stream_id) + data.
+ * The quarter-stream-id is the session's CONNECT stream id divided by 4
+ * (RFC 9297 §2.1). Pass the session stream id; the division is done here.
+ */
+function wt_datagram_payload(sessionStreamId, data) {
+  var prefix = writeVarInt(Math.floor(sessionStreamId / 4));
+  var dataLen = (data && data.byteLength) ? data.byteLength : 0;
+  var out = new Uint8Array(prefix.length + dataLen);
+  out.set(prefix, 0);
+  if (dataLen) out.set(data, prefix.length);
+  return out;
 }
 
 
@@ -280,11 +332,14 @@ function ranges_to_ack_frame(flatRanges, ecnStats, ackDelay) {
 
 
 export {
+  DEBUG,
   Emitter,
   writeVarInt,
   readVarInt,
   concatUint8Arrays,
   uint8Equal,
+  wt_stream_header,
+  wt_datagram_payload,
   ack_frame_to_ranges,
   ranges_to_ack_frame
 };

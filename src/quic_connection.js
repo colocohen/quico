@@ -15,6 +15,7 @@
 import flat_ranges from 'flat-ranges';
 
 import {
+  DEBUG,
   Emitter,
   concatUint8Arrays,
   uint8Equal,
@@ -57,6 +58,10 @@ function QUICConnection(options) {
     handshake_done: false,
     handshake_done_sent: false,
 
+    // Connection close (RFC 9000 §10.2)
+    close_frame: null,         // the CONNECTION_CLOSE frame to (re)send while closing
+    last_close_echo: 0,        // timestamp throttle for closing-state CC echoes
+
     version: 1,
     original_dcid: null,
     my_cids: [],
@@ -85,9 +90,24 @@ function QUICConnection(options) {
     recv_pn_ranges: { initial: [], handshake: [], app: [] },
 
     // CRYPTO
-    crypto_chunks: { initial: {}, handshake: {} },
+    crypto_chunks: { initial: {}, handshake: {} },   // RECEIVE-side reassembly
     crypto_offset: { initial: 0, handshake: 0 },
     crypto_send_offset: { initial: 0, handshake: 0, app: 0 },
+
+    // CRYPTO send-side loss recovery (Initial/Handshake spaces).
+    // The app stream path retransmits "for free" — stream bytes stay in
+    // send_streams and the round-robin re-scans them. CRYPTO is otherwise
+    // fire-and-forget (cryptoWrite discards the bytes after one send), and the
+    // handshake spaces have no expireInFlight. So we mirror the stream model on
+    // a tiny per-space structure (same flat-ranges semantics, no stream id, no
+    // FIN): retain sent bytes, track which PN carried which byte-range, expire
+    // by time, and re-send missing ranges. A CRYPTO frame is just a STREAM frame
+    // of a single id-less, fin-less stream — so the bookkeeping is identical.
+    crypto_sent: {
+      initial:   { buf: [], in_flight: {}, acked: [], backoff: 0 },
+      handshake: { buf: [], in_flight: {}, acked: [], backoff: 0 },
+    },
+    crypto_timer: null,
 
     // ACK
     pending_ack: { initial: [], handshake: [], app: [] },
@@ -100,42 +120,180 @@ function QUICConnection(options) {
 
     // In-flight tracking (Phase 1)
     sending_app_pn_in_flight: new Set(),
-    sending_app_pn_history: [],
+    sending_app_pn_history: [],   // [time_sent, encoded_len, delivered_at_send, delivered_time_at_send]
+    delivered: 0,                 // cumulative app bytes acked — for BBR rate samples
+    delivered_time: Date.now(),   // wall-clock of the last delivered update (BBR delivery clock)
 
-    // Burst scheduler config (Phase 2)
-    max_packets_per_burst: 20,
-    max_packets_per_sec: 5000,
-    max_bytes_per_sec: 10000000,   // 10MB/s
-    max_packet_payload: 1100,
-    max_packets_in_flight: 100,
-    max_bytes_in_flight: 5000000,  // 5MB
+    // ── Burst / congestion-control knobs ───────────────────────────────────
+    // Three layers (+ a floor):
+    //   max_*     HARD CEILING — the programmer sets these; the CC NEVER exceeds
+    //             them, whatever the network measurements say. Safety net against
+    //             a CC bug, a pathological link, or memory blow-up.
+    //   min_*     FLOOR — the CC never shrinks below this. Also prevents the
+    //             deadlock where a cap < one packet rounds down to 0.
+    //   init_*    STARTING point of the current_* values at each new connection.
+    //   current_* RUNTIME values the CC rewrites (≈ every RTT). Always clamped to
+    //             [min_, max_]. The send loop reads min(current_, max_), so the
+    //             moment Phase 4b starts writing current_* it takes effect with no
+    //             further wiring.
+    //
+    // Naming: <when>_limit_<noun>. The qualifiers (when=max/min/init/current, and the
+    // word `limit`) all sit up front; the noun (bytes_in_flight / packets_per_sec /
+    // packet_payload) stays whole at the end. This keeps `current_limit_bytes_in_flight`
+    // (the CC's CEILING) clearly distinct from the live `bytesInFlight` it gates against.
+    //
+    // What each algorithm owns:
+    //   current_limit_*_in_flight   (cwnd)        ← Phase 4b  (BBR-lite: ≈ 2·BtlBw·min_rtt)
+    //   current_limit_*_per_sec     (pacing rate) ← Phase 4b  (BBR-lite: ≈ BtlBw)
+    //   current_limit_packet_payload (MTU)        ← DPLPMTUD  (separate, later)
+    // Until those algorithms run, init_* = max_* so behavior is the static default.
+    // When 4b lands, lower the in-flight init_* toward IW10 (~10 pkts / ~14 KB)
+    // and let the algorithm climb from there.
+
+    max_packets_per_burst: 20,          // fixed cap — not CC-controlled, no current_/init_
+
+    // packet payload (MTU). current_ is the size actually used; max_ is the ceiling
+    // DPLPMTUD must not probe past; init_/floor is QUIC's guaranteed 1200-byte minimum.
+    max_limit_packet_payload:     1452,       // ceiling (IPv6-safe Ethernet: 1500 − 48 hdr)
+    init_limit_packet_payload:    1200,       // QUIC guaranteed floor — where we start
+    current_limit_packet_payload: 1200,       // = init_; DPLPMTUD raises toward max_
+
+    // in-flight window (cwnd) — bytes is the primary signal; packets kept coherent.
+    // init_/current_ start at IW10 (RFC 9002 initial window, ~10 pkts) and BBR-lite
+    // climbs from there toward 2·BDP; max_ is the hard ceiling, min_ the floor.
+    max_limit_packets_in_flight:     256,     // ceiling ≈ 300 KB at 1200 B/pkt
+    min_limit_packets_in_flight:     2,       // floor (RFC 9002 min cwnd)
+    init_limit_packets_in_flight:    10,      // IW10
+    current_limit_packets_in_flight: 10,      // = init_; BBR rewrites at round-end
+    max_limit_bytes_in_flight:       300000,  // ceiling ~300 KB — coherent with packets ↑
+    min_limit_bytes_in_flight:       2400,    // floor ~2 packets
+    init_limit_bytes_in_flight:      12000,   // IW10 (10 × 1200 B)
+    current_limit_bytes_in_flight:   12000,   // = init_; BBR rewrites at round-end
+
+    // pacing rate
+    max_limit_packets_per_sec:       12000,   // ceiling ≈ 14 MB/s
+    min_limit_packets_per_sec:       10,      // floor — avoid 0/deadlock
+    init_limit_packets_per_sec:      12000,
+    current_limit_packets_per_sec:   12000,   // = init_; BBR rewrites at round-end
+    max_limit_bytes_per_sec:         14000000, // ceiling ~14 MB/s — coherent ↑
+    min_limit_bytes_per_sec:         12000,   // floor ~96 kbps — avoid 0/deadlock
+    init_limit_bytes_per_sec:        14000000,
+    current_limit_bytes_per_sec:     14000000, // = init_; BBR rewrites at round-end
+
     burst_timer: null,
+    pacing_tokens: 0,           // token-bucket pacer: accumulated send credit (bytes)
+    pacing_last_refill: Date.now(),
 
     // Pending app packets
     pending_app_packets: [],
 
-    // Flow control — connection level
+    // Flow control — connection level (RFC 9000 §4.1)
     bytes_sent: 0,                    // total STREAM bytes sent
-    bytes_received: 0,                // total STREAM bytes received
+    bytes_received: 0,                // total STREAM bytes *received off the wire* (incl. out-of-order)
     remote_max_data: 1048576,         // peer's limit on what we can send (default 1MB until parsed)
     local_max_data: 1048576,          // our limit on what peer can send (matches transport params)
-    local_max_data_consumed: 0,       // how much of local_max_data has been used
-    local_max_data_threshold: 0.5,    // send MAX_DATA when consumed > threshold × local_max_data
+    // local_max_data_consumed: bytes actually *consumed* by the application
+    // (delivered in-order to the reader), NOT bytes received off the wire.
+    // These differ: data can arrive and sit in the receive buffer unread, or
+    // be buffered out-of-order, without being consumed yet.
+    //
+    // Correct connection flow control (the sliding-window scheme used by
+    // ngtcp2/quiche) advances on *consumption*: keep a fixed window and, once
+    // consumed passes ~half a window since the last update, send
+    // MAX_DATA = local_max_data_consumed + window. That caps how many
+    // UN-consumed bytes the peer can park in our buffer — which is the whole
+    // point of flow control (bounding memory).
+    //
+    // TODO (deferred — "consumption-based flow control"): drive this from
+    // flushStream's `flushed_to` (local_max_data_consumed += delivered bytes),
+    // rebuild checkLocalFlowControl as a bounded sliding window against it,
+    // and enforce the limit on inbound data (FLOW_CONTROL_ERROR on overrun).
+    // Currently checkLocalFlowControl just doubles local_max_data off
+    // bytes_received, which never blocks the peer but also grows unbounded
+    // and ignores the received/consumed distinction.
+    local_max_data_consumed: 0,       // app-consumed bytes; see note above (not yet wired)
+    local_max_data_threshold: 0.5,    // send MAX_DATA when consumed > threshold × window
     remote_max_streams_bidi: 100,
     remote_max_streams_uni: 3,
 
-    // RTT
-    rtt_history: [],
+    // RTT estimate (RFC 9002 §5), updated incrementally on every new sample.
+    // null = no sample yet. Replaces the old raw rtt_history log: the EWMA below
+    // keeps the needed history implicitly, so per-sample storage isn't needed.
+    srtt: null,
+    rttvar: null,
+    min_rtt: null,
+    latest_rtt: null,
+    max_ack_delay: 25, // ms; seeded from the peer's transport params (max_ack_delay) once parsed
+    peer_ack_delay_exponent: 3, // seeded from the peer's transport params; ACK Delay = field × 2^this µs
+
+    // --- Raw network observations (collected for the future congestion
+    // controller; NOT acted on here). Flat on context, like the RTT fields.
+    // Counters are cumulative; rates/extents are derived later over a window. ---
+    max_rtt: null,              // paired with min_rtt — the gap reveals bufferbloat
+    latest_delivery_rate: null, // bytes/sec acked in the most recent ACK sample
+    max_delivery_rate: null,    // peak delivery rate ≈ BtlBw (a CC bandwidth input)
+    lost_count: 0,              // packets declared lost by expireInFlight (≈ loss)
+    reorder_in_count: 0,        // app packets that arrived below the highest PN seen (network reordering, peer→us)
+
+    // --- BBR-lite measurement (Phase 4b, step 1+2 — measure only, no control). ---
+    // BBR models the path from two measured quantities and derives the BDP:
+    //   BDP = BtlBw × RTprop.  BtlBw = windowed-MAX delivery rate (≈ bottleneck
+    //   bandwidth); RTprop = windowed-MIN RTT (≈ propagation, queue-free). Both use
+    //   windows so a stale peak/min decays: a forever-max would never drop when the
+    //   link slows, a forever-min would never rise as the true RTT changes.
+    bbr_round_count: 0,         // round-trip counter; one round ≈ one RTT elapsed
+    bbr_round_start_pn: 0,      // round completes when an ACK's largest >= this
+    bbr_round_start_delivered: 0, // context.delivered at round start (for per-round rate)
+    bbr_round_start_time: Date.now(), // wall-clock at round start (for per-round rate)
+    bbr_btlbw_samples: [],      // [{round, rate}] — per-ACK delivery-rate samples
+    bbr_btlbw: null,            // windowed-max delivery rate over the last N rounds (≈ BtlBw)
+    bbr_min_rtt: null,          // windowed-min RTT over ~10s (≈ RTprop)
+    bbr_min_rtt_stamp: 0,       // when bbr_min_rtt was last (re)set
+    bbr_bdp: null,              // derived BtlBw × min_rtt (bytes) — the in-flight target
+
+    // BBR-lite state machine. Startup ramps exponentially (high gain) to discover
+    // BtlBw; once it plateaus (no ≥25% growth for 3 rounds) the pipe is full, so
+    // Drain removes the queue Startup built, then ProbeBW holds steady at the
+    // bottleneck rate. Without Startup, writing cwnd from an under-saturated
+    // measurement death-spirals to the floor (the link never gets filled).
+    bbr_state: 'startup',       // 'startup' | 'drain' | 'probe_bw'
+    bbr_full_bw: 0,             // highest BtlBw seen — Startup plateau detector
+    bbr_full_bw_count: 0,       // consecutive rounds without ≥25% BtlBw growth
+    bbr_cycle_idx: 0,           // ProbeBW pacing-gain cycle position (0..7)
 
     // Timers
     idle_timeout: options.idleTimeout || 30000,
     handshake_timeout: options.handshakeTimeout || 10000,
     last_activity: Date.now(),
+    // Time of the most recent ACK received from the peer (set only in
+    // processAckFrame). Drives the in-flight-expiry backoff: while the peer
+    // isn't ACKing us, the retransmit timeout widens so we don't flood a dead
+    // path. Distinct from last_activity (which also bumps on send/receive).
+    last_ack_time: Date.now(),
     idle_timer: null,
     handshake_timer: null,
 
+    // Keep-alive: when > 0, send a PING after this many ms of inactivity to
+    // keep the connection from idling out (RFC 9000 §10.1.2). Should be < the
+    // idle timeout. options.keepAlive: true → idle_timeout/2; a number → ms.
+    keep_alive_interval: (function () {
+      var k = options.keepAlive;
+      if (k === true) return Math.max(1000, Math.floor((options.idleTimeout || 30000) / 2));
+      if (typeof k === 'number' && k > 0) return k;
+      return 0;
+    })(),
+    keep_alive_timer: null,
+
     SNICallback: options.SNICallback || null,
     hostname: options.hostname || null,
+
+    // ALPN protocol(s) to advertise in the TLS handshake.
+    // Defaults to ['h3'] (HTTP/3). Other QUIC-based protocols set their own,
+    // e.g. 'doq' for DNS-over-QUIC (RFC 9250). Accepts a string or array.
+    alpn: (function () {
+      var a = options.alpn || ['h3'];
+      return Array.isArray(a) ? a : [a];
+    })(),
   };
 
 
@@ -195,7 +353,7 @@ function QUICConnection(options) {
     }
 
     if (changed.handshake_done && context.handshake_done === true) {
-      console.log('[quic] handshake done — flushing ' + context.pending_app_packets.length + ' pending');
+      if (DEBUG) console.log('[quic] handshake done — flushing ' + context.pending_app_packets.length + ' pending');
       if (context.pending_app_packets.length > 0) {
         var pending = context.pending_app_packets;
         context.pending_app_packets = [];
@@ -204,6 +362,7 @@ function QUICConnection(options) {
         }
       }
       startIdleTimer();
+      startKeepAliveTimer();
     }
 
     if (changed.state && context.state === 'connected') {
@@ -211,10 +370,10 @@ function QUICConnection(options) {
       // Server emits on appSecrets, Client emits on secureConnect
     }
 
-    if (changed.state && context.state === 'draining') {
+    if (changed.state && (context.state === 'draining' || context.state === 'closing')) {
       clearIdleTimer();
       var _drainTimer = setTimeout(function () {
-        if (context.state === 'draining') { context.state = 'closed'; ev.emit('close'); }
+        if (context.state === 'draining' || context.state === 'closing') { context.state = 'closed'; ev.emit('close'); }
       }, Math.min(3000, context.idle_timeout / 3));
       if (_drainTimer.unref) _drainTimer.unref();
     }
@@ -225,7 +384,7 @@ function QUICConnection(options) {
       // We initiated key update — derive new write keys
       if (context.app_write_secret) {
         var next = quic_derive_key_update(context.app_write_secret, context.cipher_hash, context.cipher_suite);
-        console.log('[quic] key update initiated — new write keys');
+        if (DEBUG) console.log('[quic] key update initiated — new write keys');
         context.app_write = { key: next.key, iv: next.iv, hp: context.app_write.hp };
         context.app_write_secret = next.secret;
       }
@@ -244,15 +403,34 @@ function QUICConnection(options) {
     if (context.idle_timeout <= 0) return;
     context.idle_timer = setInterval(function () {
       if (Date.now() - context.last_activity >= context.idle_timeout) {
-        console.log('[quic] idle timeout');
+        if (DEBUG) console.log('[quic] idle timeout');
         close(0, 'idle timeout');
       }
     }, Math.max(1000, Math.floor(context.idle_timeout / 4)));
     if (context.idle_timer.unref) context.idle_timer.unref();
   }
 
+  function startKeepAliveTimer() {
+    if (context.keep_alive_interval <= 0) return;
+    if (context.keep_alive_timer !== null) return; // idempotent
+    context.keep_alive_timer = setInterval(function () {
+      if (context.state !== 'connected') return;
+      // Only ping when the connection has actually been idle for the interval.
+      // Real traffic (sent or received) calls touchActivity(), which resets
+      // last_activity and suppresses unnecessary keep-alive PINGs.
+      if (Date.now() - context.last_activity >= context.keep_alive_interval) {
+        if (DEBUG) console.log('[quic] keep-alive PING');
+        sendFrames('app', [{ type: 'ping' }]);
+      }
+    }, context.keep_alive_interval);
+    if (context.keep_alive_timer.unref) context.keep_alive_timer.unref();
+  }
+
   function clearIdleTimer() {
     if (context.idle_timer !== null) { clearInterval(context.idle_timer); context.idle_timer = null; }
+    // Keep-alive shares the connection's liveness lifecycle: stop it wherever
+    // the idle timer is stopped (handshake (re)start, draining/closing, closed).
+    if (context.keep_alive_timer !== null) { clearInterval(context.keep_alive_timer); context.keep_alive_timer = null; }
   }
 
 
@@ -264,8 +442,8 @@ function QUICConnection(options) {
     // Start handshake timeout — if TLS doesn't complete in time, close
     if (context.handshake_timeout > 0 && !context.handshake_timer) {
       context.handshake_timer = setTimeout(function () {
-        if (context.state !== 'connected' && context.state !== 'closed' && context.state !== 'draining') {
-          console.log('[quic] handshake timeout (' + context.handshake_timeout + 'ms)');
+        if (context.state !== 'connected' && context.state !== 'closed' && context.state !== 'draining' && context.state !== 'closing') {
+          if (DEBUG) console.log('[quic] handshake timeout (' + context.handshake_timeout + 'ms)');
           ev.emit('error', new Error('QUIC handshake timeout'));
           close(0x100, 'handshake timeout');  // 0x100 = CRYPTO_ERROR
         }
@@ -278,10 +456,34 @@ function QUICConnection(options) {
       SNICallback: context.SNICallback,
       originalDcid: context.original_dcid,
       localCid: context.my_cids.length > 0 ? context.my_cids[0] : new Uint8Array(0),
-      hostname: context.hostname
+      hostname: context.hostname,
+      alpn: context.alpn
     });
 
     tls.on('send', function (epoch, data) { cryptoWrite(epoch, data); });
+
+    // Peer's QUIC transport parameters (parsed from the TLS 0x39 extension). These
+    // replace hardcoded defaults: the peer's flow-control limit, ACK-delay scaling,
+    // and max ACK delay. Arrives once, during the handshake, before app data flows.
+    tls.on('peerTransportParams', function (p) {
+      // ack_delay_exponent: clamp to RFC 9000 range [0,20] (guards Math.pow blowup).
+      if (typeof p.ack_delay_exponent === 'number') {
+        context.peer_ack_delay_exponent = Math.max(0, Math.min(20, p.ack_delay_exponent));
+      }
+      // max_ack_delay (ms): the peer's stated max delay before it sends an ACK.
+      if (typeof p.max_ack_delay === 'number' && p.max_ack_delay >= 0) {
+        context.max_ack_delay = Math.min(p.max_ack_delay, 16384); // RFC cap 2^14 ms
+      }
+      // initial_max_data: the AUTHORITATIVE initial flow-control limit. Set directly
+      // (not via the monotonic MAX_DATA path, which only increases) so a peer that
+      // grants less than our 1MB default is honored. MAX_DATA frames raise it later.
+      if (typeof p.initial_max_data === 'number') {
+        context.remote_max_data = p.initial_max_data;
+        plan_quic_burst(); // budget changed
+      }
+      if (DEBUG) console.log('[quic] peer params: ack_delay_exp=' + context.peer_ack_delay_exponent +
+        ' max_ack_delay=' + context.max_ack_delay + ' remote_max_data=' + context.remote_max_data);
+    });
 
     tls.on('handshakeSecrets', function (secrets) {
       set_context({
@@ -310,6 +512,12 @@ function QUICConnection(options) {
         handshake_done: true
       });
 
+      // NOTE: do NOT stop crypto recovery here. Reaching appSecrets means OUR
+      // side finished, but the peer hasn't necessarily received our flight yet
+      // (the server hits this the moment it sends Finished, before the client
+      // confirms). The crypto ticker self-terminates once every CRYPTO byte is
+      // acked (cryptoHasInFlight() === false); close() force-stops it otherwise.
+
       // Server: emit connect now (Finished already sent)
       // Client: wait for secureConnect (after client Finished is generated)
       if (context.isServer) {
@@ -337,11 +545,35 @@ function QUICConnection(options) {
   // ============================================================
 
   function feedDatagram(from_ip, from_port, data) {
-    console.log('[quic] datagram from ' + from_ip + ':' + from_port + ' len=' + data.length);
+    if (DEBUG) console.log('[quic] datagram from ' + from_ip + ':' + from_port + ' len=' + data.length);
+    feedPackets(from_ip, from_port, parse_quic_datagram(data));
+  }
+
+  // Feed already-parsed packets. Used by the server, which parses each UDP
+  // datagram once (to route it to a connection) and then hands the parsed
+  // packets here directly, avoiding a redundant second parse.
+  function feedPackets(from_ip, from_port, packets) {
+    if (context.state === 'closed' || context.state === 'draining') return;
+    if (context.state === 'closing') {
+      // RFC 9000 §10.2.1: while closing, don't process packets normally; instead
+      // re-send CONNECTION_CLOSE in response (rate-limited) so the peer learns
+      // we've closed even if the first CC was lost.
+      if (Date.now() - context.last_close_echo >= 200) sendConnectionClose();
+      return;
+    }
     touchActivity();
-    var packets = parse_quic_datagram(data);
     for (var i = 0; i < packets.length; i++) {
-      if (packets[i] !== null) feedPacket(packets[i]);
+      if (packets[i] !== null) {
+        // Safety net: a single malformed packet must never crash the process or
+        // tear down the connection. The parsers are bounds-checked, but this
+        // also guards decrypt / frame-handler edge cases. Drop the bad packet
+        // (logged under DEBUG) and keep processing the rest of the datagram.
+        try {
+          feedPacket(packets[i]);
+        } catch (e) {
+          if (DEBUG) console.log('[quic] dropped packet — processing error: ' + (e && e.message));
+        }
+      }
     }
   }
 
@@ -368,9 +600,19 @@ function QUICConnection(options) {
                  : space === 'handshake' ? context.handshake_read : context.app_read;
     if (!readKeys) return;
 
+    // Connection ID by which *we* are addressed. Its length is needed to locate
+    // the packet number in short (1-RTT) headers, which carry no DCID-length
+    // field — the receiver must already know its own CID length. For a server
+    // this is the SCID it chose (which it adopts as original_dcid); for a client
+    // it's its own SCID (my_cids[0]). Long headers carry the DCID length on the
+    // wire, so decrypt ignores this value for Initial/Handshake packets.
+    var recvCid = context.isServer
+      ? context.original_dcid
+      : (context.my_cids.length > 0 ? context.my_cids[0] : context.original_dcid);
+
     var decrypted = decrypt_quic_packet(
       pkt.raw, readKeys.key, readKeys.iv, readKeys.hp,
-      context.original_dcid, context.recv_pn_largest[space]
+      recvCid, context.recv_pn_largest[space]
     );
 
     // Key Update: if app decrypt fails, try with derived next keys
@@ -378,12 +620,12 @@ function QUICConnection(options) {
       var next = quic_derive_key_update(context.app_read_secret, context.cipher_hash, context.cipher_suite);
       decrypted = decrypt_quic_packet(
         pkt.raw, next.key, next.iv, readKeys.hp, // HP doesn't change
-        context.original_dcid, context.recv_pn_largest[space]
+        recvCid, context.recv_pn_largest[space]
       );
 
       if (decrypted && decrypted.plaintext && decrypted.plaintext.byteLength > 0) {
         // Key update confirmed — install new read keys
-        console.log('[quic] key update detected — installing new read keys');
+        if (DEBUG) console.log('[quic] key update detected — installing new read keys');
         context.app_prev_read = context.app_read;
         context.app_read = { key: next.key, iv: next.iv, hp: readKeys.hp };
         context.app_read_secret = next.secret;
@@ -395,16 +637,16 @@ function QUICConnection(options) {
     if ((!decrypted || !decrypted.plaintext) && space === 'app' && context.app_prev_read) {
       decrypted = decrypt_quic_packet(
         pkt.raw, context.app_prev_read.key, context.app_prev_read.iv, context.app_prev_read.hp,
-        context.original_dcid, context.recv_pn_largest[space]
+        recvCid, context.recv_pn_largest[space]
       );
     }
 
     if (!decrypted || !decrypted.plaintext || decrypted.plaintext.byteLength === 0) {
-      console.log('[quic] decrypt failed: ' + space + ' raw_len=' + pkt.raw.byteLength + ' first20=' + Array.from(pkt.raw.slice(0, 20)).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(' ') + ' dcid_len=' + (context.original_dcid ? context.original_dcid.byteLength : 'null') + ' has_keys=' + !!readKeys + ' largest_pn=' + context.recv_pn_largest[space]);
+      if (DEBUG) console.log('[quic] decrypt failed: ' + space + ' raw_len=' + pkt.raw.byteLength + ' first20=' + Array.from(pkt.raw.slice(0, 20)).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(' ') + ' recv_cid_len=' + (recvCid ? recvCid.byteLength : 'null') + ' has_keys=' + !!readKeys + ' largest_pn=' + context.recv_pn_largest[space]);
       return;
     }
 
-    console.log('[quic] decrypted ' + space + ' pn=' + decrypted.packet_number + ' len=' + decrypted.plaintext.byteLength);
+    if (DEBUG) console.log('[quic] decrypted ' + space + ' pn=' + decrypted.packet_number + ' len=' + decrypted.plaintext.byteLength);
 
     var pn = decrypted.packet_number;
     var ranges = context.recv_pn_ranges[space];
@@ -414,10 +656,16 @@ function QUICConnection(options) {
     }
     if (isNew) {
       flat_ranges.add(ranges, [pn, pn + 1]);
-      if (pn > context.recv_pn_largest[space]) context.recv_pn_largest[space] = pn;
+      if (pn > context.recv_pn_largest[space]) {
+        context.recv_pn_largest[space] = pn;
+      } else if (space === 'app') {
+        // New packet, but below the highest PN already seen → it arrived out of
+        // order. Pure network reordering (the peer sends PNs strictly increasing).
+        context.reorder_in_count++;
+      }
     }
 
-    console.log('[quic] pn=' + pn + ' isNew=' + isNew);
+    if (DEBUG) console.log('[quic] pn=' + pn + ' isNew=' + isNew);
     if (!isNew) return;
 
     if (space === 'app' && !context.handshake_done) {
@@ -435,7 +683,7 @@ function QUICConnection(options) {
 
   function processDecryptedPacket(space, packetNumber, plaintext) {
     var frames = parse_quic_frames(plaintext);
-    console.log('[quic] frames: ' + space + ' pn=' + packetNumber + ' [' + frames.map(function(f){ return f.type; }).join(',') + ']');
+    if (DEBUG) console.log('[quic] frames: ' + space + ' pn=' + packetNumber + ' [' + frames.map(function(f){ return f.type; }).join(',') + ']');
     var ackEliciting = false;
 
     if (context.isServer && space === 'app' && !context.handshake_done_sent) {
@@ -464,21 +712,21 @@ function QUICConnection(options) {
       } else if (frame.type === 'new_connection_id') {
         ackEliciting = true;
       } else if (frame.type === 'connection_close') {
-        console.log('[quic] CONNECTION_CLOSE error=0x' + (frame.error || 0).toString(16) + ' frame_type=0x' + (frame.frameType || 0).toString(16) + ' reason="' + (frame.reason || '') + '"');
+        if (DEBUG) console.log('[quic] CONNECTION_CLOSE error=0x' + (frame.error || 0).toString(16) + ' frame_type=0x' + (frame.frameType || 0).toString(16) + ' reason="' + (frame.reason || '') + '"');
         set_context({ state: 'draining' });
         return;
       } else if (frame.type === 'stop_sending') {
         // Peer says: stop sending on this stream
         ackEliciting = true;
         if (frame.id in context.send_streams) {
-          console.log('[quic] STOP_SENDING stream=' + frame.id + ' error=' + frame.error);
+          if (DEBUG) console.log('[quic] STOP_SENDING stream=' + frame.id + ' error=' + frame.error);
           delete context.send_streams[frame.id];
         }
       } else if (frame.type === 'reset_stream') {
         // Peer cancelled their stream
         ackEliciting = true;
         if (frame.id in context.recv_streams) {
-          console.log('[quic] RESET_STREAM stream=' + frame.id + ' error=' + frame.error);
+          if (DEBUG) console.log('[quic] RESET_STREAM stream=' + frame.id + ' error=' + frame.error);
           delete context.recv_streams[frame.id];
         }
       } else if (frame.type === 'max_data') {
@@ -493,7 +741,7 @@ function QUICConnection(options) {
       } else if (frame.type === 'max_stream_data') {
         ackEliciting = true;
       } else if (frame.type === 'datagram') {
-        ev.emit('datagram', frame.contextId, frame.data);
+        ev.emit('datagram', frame.data);
       }
     }
 
@@ -514,30 +762,30 @@ function QUICConnection(options) {
 
   function processCryptoFrame(space, offset, data) {
     if (space !== 'initial' && space !== 'handshake') return;
-    console.log('[quic] CRYPTO: space=' + space + ' offset=' + offset + ' len=' + data.length);
+    if (DEBUG) console.log('[quic] CRYPTO: space=' + space + ' offset=' + offset + ' len=' + data.length);
 
     var chunks = context.crypto_chunks[space];
     var fromOffset = context.crypto_offset[space];
     if (!(offset in chunks) || chunks[offset].byteLength < data.byteLength) chunks[offset] = data;
 
     var result = extract_tls_messages_from_chunks(chunks, fromOffset);
-    console.log('[quic] TLS messages: ' + (result ? result.tls_messages.length : 'none'));
+    if (DEBUG) console.log('[quic] TLS messages: ' + (result ? result.tls_messages.length : 'none'));
     if (!result) return;
 
     context.crypto_offset[space] = result.new_from_offset;
-    if (!tls) { console.log('[quic] initializing TLS bridge'); initTLS(); }
+    if (!tls) { if (DEBUG) console.log('[quic] initializing TLS bridge'); initTLS(); }
 
     for (var i = 0; i < result.tls_messages.length; i++) {
       var msg = result.tls_messages[i];
       var msgType = msg[0];
-      console.log('[quic] → TLS msg #' + i + ' type=0x' + msgType.toString(16) + ' len=' + msg.length);
+      if (DEBUG) console.log('[quic] → TLS msg #' + i + ' type=0x' + msgType.toString(16) + ' len=' + msg.length);
 
       // Detect HelloRetryRequest (type 0x02 with special random)
       if (msgType === 0x02 && msg.length >= 38) {
         var hrrRandom = [0xCF,0x21,0xAD,0x74,0xE5,0x9A,0x61,0x11,0xBE,0x1D,0x8C,0x02,0x1E,0x65,0xB8,0x91,0xC2,0xA2,0x11,0x16,0x7A,0xBB,0x8C,0x5E,0x07,0x9E,0x09,0xE2,0xC8,0xA8,0x33,0x9C];
         var isHRR = true;
         for (var j = 0; j < 32; j++) { if (msg[6 + j] !== hrrRandom[j]) { isHRR = false; break; } }
-        if (isHRR) console.log('[quic] ⚠️  HelloRetryRequest detected! LemonTLS needs HRR support.');
+        if (isHRR && DEBUG) console.log('[quic] ⚠️  HelloRetryRequest detected! LemonTLS needs HRR support.');
       }
 
       tls.feedMessage(msg);
@@ -607,48 +855,271 @@ function QUICConnection(options) {
   }
 
 
+  // Update the smoothed RTT estimate from a new sample (RFC 9002 §5.3).
+  // latest_rtt = now − time_sent(largest_acked); ack_delay_ms is the peer's
+  // reported ACK delay. min_rtt uses the raw sample; srtt/rttvar use the
+  // ack_delay-adjusted sample. Recursive EWMA: each sample folds into
+  // srtt/rttvar immediately, so no per-sample history is retained.
+  function updateRtt(latest_rtt, ack_delay_ms) {
+    context.latest_rtt = latest_rtt;
+
+    // min_rtt tracks the raw minimum (before any ack_delay adjustment).
+    context.min_rtt = (context.min_rtt === null)
+      ? latest_rtt
+      : Math.min(context.min_rtt, latest_rtt);
+
+    // max_rtt tracks the raw maximum; max_rtt − min_rtt ≈ queueing/bufferbloat.
+    context.max_rtt = (context.max_rtt === null)
+      ? latest_rtt
+      : Math.max(context.max_rtt, latest_rtt);
+
+    // BBR RTprop: windowed-min RTT over ~10s. Unlike the forever-min above, it
+    // expires so it can rise if the true path RTT changes. It is refreshed by a
+    // lower sample, or replaced when the 10s window lapses (ProbeRTT later forces
+    // a queue-free sample so this stays honest under a persistent standing queue).
+    var BBR_MIN_RTT_WINDOW = 10000; // ms
+    var now_rtt = Date.now();
+    if (context.bbr_min_rtt === null ||
+        latest_rtt <= context.bbr_min_rtt ||
+        now_rtt - context.bbr_min_rtt_stamp > BBR_MIN_RTT_WINDOW) {
+      context.bbr_min_rtt = latest_rtt;
+      context.bbr_min_rtt_stamp = now_rtt;
+    }
+
+    // Subtract ACK delay, but cap it at max_ack_delay and never let it pull the
+    // sample below min_rtt (RFC 9002 §5.3).
+    var ack_delay = Math.min(ack_delay_ms, context.max_ack_delay);
+    var adjusted = latest_rtt;
+    if (latest_rtt >= context.min_rtt + ack_delay) adjusted = latest_rtt - ack_delay;
+
+    if (context.srtt === null) {
+      context.srtt = adjusted;
+      context.rttvar = adjusted / 2;
+    } else {
+      context.rttvar = 0.75 * context.rttvar + 0.25 * Math.abs(context.srtt - adjusted);
+      context.srtt = 0.875 * context.srtt + 0.125 * adjusted;
+    }
+    if (DEBUG) console.log('[quic] rtt: sample=' + latest_rtt + 'ms srtt=' + Math.round(context.srtt) + ' rttvar=' + Math.round(context.rttvar) + ' min=' + context.min_rtt);
+  }
+
+
   // ============================================================
   //  ACK processing (Phase 1)
   // ============================================================
+
+  // Total app stream bytes currently in flight (unacked). Used by BBR's Drain
+  // state to know when the queue built during Startup has been emptied.
+  function appBytesInFlight() {
+    var total = 0;
+    for (var sid in context.send_streams) {
+      var st = context.send_streams[sid];
+      if (!st.in_flight_ranges) continue;
+      for (var pn in st.in_flight_ranges) {
+        if (pn === '_burst') continue;
+        total += st.in_flight_ranges[pn][1] - st.in_flight_ranges[pn][0];
+      }
+    }
+    return total;
+  }
 
   function processAckFrame(space, frame) {
     var ackedRanges = ack_frame_to_ranges(frame);
     if (!ackedRanges || ackedRanges.length === 0) return;
 
+    // The peer acknowledged something → it's responsive in the return
+    // direction. Resets the in-flight-expiry backoff (any space counts).
+    // Capture the previous ACK time first — it's the interval for delivery_rate.
+    var ackNow = Date.now();
+    var prevAckTime = context.last_ack_time;
+    context.last_ack_time = ackNow;
+
+    // Initial/Handshake: an ACK confirms crypto byte-ranges. Move them in_flight
+    // → acked and reset that space's resend backoff (the peer is responding).
+    if (space === 'initial' || space === 'handshake') {
+      var cs = context.crypto_sent[space];
+      for (var cpn in cs.in_flight) {
+        var p = Number(cpn), hit = false;
+        for (var cri = 0; cri < ackedRanges.length; cri += 2) {
+          if (p >= ackedRanges[cri] && p <= ackedRanges[cri + 1]) { hit = true; break; }
+        }
+        if (hit) { flat_ranges.add(cs.acked, cs.in_flight[cpn].range); delete cs.in_flight[cpn]; }
+      }
+      cs.backoff = 0;
+      return;
+    }
+
     if (space === 'app') {
       // RTT measurement
       if ('largest' in frame && 'delay' in frame) {
         var largest_pn = frame.largest;
+        // Only measure from the largest *newly* acked, ack-eliciting packet
+        // (RFC 9002 §5.1). sending_app_pn_in_flight holds data-carrying PNs —
+        // the closest signal until sent_packets tracks ack_eliciting per packet
+        // (so PING-only packets are not yet used as RTT samples).
         if (context.sending_app_pn_in_flight.has(largest_pn)) {
           var now = Date.now();
-          var ack_delay_ms = Math.round((frame.delay * Math.pow(2, 3)) / 1000);
+          // ACK Delay is microseconds scaled by 2^ack_delay_exponent; use the peer's
+          // value (parsed from its transport params; defaults to 3 until then).
+          var ack_delay_ms = Math.round((frame.delay * Math.pow(2, context.peer_ack_delay_exponent)) / 1000);
           var pn_index = largest_pn - (context.send_pn.app - context.sending_app_pn_history.length);
           if (pn_index >= 0 && pn_index < context.sending_app_pn_history.length) {
-            var measured_rtt = now - context.sending_app_pn_history[pn_index][0] - ack_delay_ms;
-            if (measured_rtt > 0) context.rtt_history.push([now, measured_rtt]);
+            var latest_rtt = now - context.sending_app_pn_history[pn_index][0];
+            if (latest_rtt > 0) updateRtt(latest_rtt, ack_delay_ms);
           }
         }
       }
 
-      // Mark in-flight as acked
+      // Mark in-flight as acked. Collect the acked PNs first, then mutate —
+      // deleting from a Set while iterating it with for-of is fragile.
+      var ackedPns = [];
       for (var pn of context.sending_app_pn_in_flight) {
-        var is_acked = false;
         for (var ri = 0; ri < ackedRanges.length; ri += 2) {
-          if (pn >= ackedRanges[ri] && pn <= ackedRanges[ri + 1]) { is_acked = true; break; }
+          if (pn >= ackedRanges[ri] && pn <= ackedRanges[ri + 1]) { ackedPns.push(pn); break; }
         }
-        if (is_acked) {
-          context.sending_app_pn_in_flight.delete(pn);
-          for (var sid in context.send_streams) {
-            var st = context.send_streams[sid];
-            if (st.in_flight_ranges && pn in st.in_flight_ranges) {
-              flat_ranges.add(st.acked_ranges, st.in_flight_ranges[pn]);
-              delete st.in_flight_ranges[pn];
-              if (st.total_size > 0 && st.acked_ranges.length === 2 &&
-                  st.acked_ranges[0] === 0 && st.acked_ranges[1] >= st.total_size) {
-                delete context.send_streams[sid];
-              }
+      }
+      var newlyAckedBytes = 0;   // goodput bytes confirmed by this ACK (for delivery_rate)
+      var oldestAckedPn = null;  // smallest newly-acked PN → longest delivery interval
+      for (var ai = 0; ai < ackedPns.length; ai++) {
+        var apn = ackedPns[ai];
+        if (oldestAckedPn === null || apn < oldestAckedPn) oldestAckedPn = apn;
+        context.sending_app_pn_in_flight.delete(apn);
+        for (var sid in context.send_streams) {
+          var st = context.send_streams[sid];
+          if (st.in_flight_ranges && apn in st.in_flight_ranges) {
+            newlyAckedBytes += st.in_flight_ranges[apn][1] - st.in_flight_ranges[apn][0];
+            flat_ranges.add(st.acked_ranges, st.in_flight_ranges[apn]);
+            delete st.in_flight_ranges[apn];
+            if (st.total_size > 0 && st.acked_ranges.length === 2 &&
+                st.acked_ranges[0] === 0 && st.acked_ranges[1] >= st.total_size) {
+              delete context.send_streams[sid];
             }
           }
+        }
+      }
+
+      // Cumulative delivered advances by this ACK's goodput; the delivery clock
+      // is the wall-time of this update.
+      context.delivered += newlyAckedBytes;
+
+      // latest_delivery_rate / max_delivery_rate: per-ACK observations (kept for
+      // visibility). NOTE: these are NOT fed to the BtlBw filter — per-ACK samples
+      // spike under ACK aggregation and the windowed-max locks onto the spike
+      // (the 20→39 Mbps over-read). BtlBw is sampled once per round instead (below).
+      if (oldestAckedPn !== null && context.sending_app_pn_history.length > 0) {
+        var rs_idx = oldestAckedPn - (context.send_pn.app - context.sending_app_pn_history.length);
+        if (rs_idx >= 0 && rs_idx < context.sending_app_pn_history.length) {
+          var deliveredAtSend     = context.sending_app_pn_history[rs_idx][2];
+          var deliveredTimeAtSend = context.sending_app_pn_history[rs_idx][3];
+          var interval = ackNow - deliveredTimeAtSend;
+          var deltaDelivered = context.delivered - deliveredAtSend;
+          if (interval >= 1 && deltaDelivered > 0) {
+            context.latest_delivery_rate = (deltaDelivered * 1000) / interval;
+            if (context.max_delivery_rate === null ||
+                context.latest_delivery_rate > context.max_delivery_rate) {
+              context.max_delivery_rate = context.latest_delivery_rate;
+            }
+          }
+        }
+      }
+      context.delivered_time = ackNow;
+
+      // BBR round tracking: a round (~1 RTT) completes when this ACK acknowledges
+      // a packet sent at/after the round boundary. We then recompute the windowed
+      // BtlBw (max delivery rate over the last N rounds) and the derived BDP. This
+      // is the per-RTT cadence at which Phase 4b step 3 will write current_limit_*.
+      if ('largest' in frame && frame.largest >= context.bbr_round_start_pn) {
+        // Per-round rate sample: total bytes delivered during the round over the
+        // round's duration (≈ 1 RTT). Averaging across the whole round washes out
+        // ACK-aggregation spikes that corrupt per-ACK samples.
+        var roundDur = ackNow - context.bbr_round_start_time;
+        var roundDelivered = context.delivered - context.bbr_round_start_delivered;
+        if (roundDur >= 1 && roundDelivered > 0) {
+          context.bbr_btlbw_samples.push({ round: context.bbr_round_count, rate: (roundDelivered * 1000) / roundDur });
+        }
+
+        context.bbr_round_count++;
+        context.bbr_round_start_pn = context.send_pn.app; // next PN must be acked for the next round
+        context.bbr_round_start_delivered = context.delivered;
+        context.bbr_round_start_time = ackNow;
+
+        var BBR_BTLBW_WINDOW = 10; // rounds
+        var cutoff = context.bbr_round_count - BBR_BTLBW_WINDOW;
+        var kept = [], maxRate = null;
+        for (var bi = 0; bi < context.bbr_btlbw_samples.length; bi++) {
+          var smp = context.bbr_btlbw_samples[bi];
+          if (smp.round >= cutoff) {
+            kept.push(smp);
+            if (maxRate === null || smp.rate > maxRate) maxRate = smp.rate;
+          }
+        }
+        context.bbr_btlbw_samples = kept;
+        context.bbr_btlbw = maxRate;
+
+        // Derived in-flight target. Uses bbr_min_rtt (RTprop, windowed) in seconds.
+        if (context.bbr_btlbw !== null && context.bbr_min_rtt !== null) {
+          // BDP = BtlBw × RTprop. On near-zero-RTT paths (localhost, LAN) RTprop
+          // collapses toward 0, so BDP → 0 and cwnd would clamp to the min floor
+          // (≈2 packets) — starving throughput on the fastest links. Floor RTprop at
+          // a few ms for this calc: it only affects sub-floor RTTs (where the link is
+          // fast and can absorb the extra window) and never binds on normal links.
+          var BBR_RTPROP_FLOOR_MS = 5;
+          var rttForBdp = Math.max(context.bbr_min_rtt, BBR_RTPROP_FLOOR_MS);
+          context.bbr_bdp = context.bbr_btlbw * (rttForBdp / 1000);
+
+          // ── State machine → (pacing_gain, cwnd_gain) ──────────────────────
+          var STARTUP_GAIN = 2.89;            // ≈ 2/ln2 — exponential ramp
+          var pacing_gain, cwnd_gain;
+          if (context.bbr_state === 'startup') {
+            pacing_gain = STARTUP_GAIN; cwnd_gain = STARTUP_GAIN;
+            // Plateau detector: BtlBw must grow ≥25% per round to stay in Startup.
+            if (context.bbr_btlbw >= context.bbr_full_bw * 1.25) {
+              context.bbr_full_bw = context.bbr_btlbw;
+              context.bbr_full_bw_count = 0;
+            } else if (++context.bbr_full_bw_count >= 3) {
+              context.bbr_state = 'drain';    // pipe is full
+            }
+          } else if (context.bbr_state === 'drain') {
+            pacing_gain = 1 / STARTUP_GAIN; cwnd_gain = STARTUP_GAIN; // drain the queue
+            if (appBytesInFlight() <= context.bbr_bdp) context.bbr_state = 'probe_bw';
+          } else { // probe_bw — cruise at the bottleneck rate while gently probing.
+            // pacing_gain cycles 1.25 (probe for more bw) → 0.75 (drain the queue
+            // that 1.25 just built) → 1.0×6 (cruise). The 0.75 phase is what keeps
+            // the standing queue near-empty: without it, cwnd=2·BDP lets ~1 BDP of
+            // queue sit permanently (≈ the bufferbloat we measured). One phase per round.
+            var PROBE_BW_CYCLE = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+            pacing_gain = PROBE_BW_CYCLE[context.bbr_cycle_idx];
+            // cwnd_gain bounds the standing queue directly: in JS userland the pacer
+            // isn't precise enough to hold in-flight at exactly BDP (kernel BBR uses
+            // cwnd_gain 2), so a tighter ceiling is what actually limits bufferbloat.
+            // 1.25 → at most ~0.25·BDP of queue, while leaving room for the 1.25 probe.
+            cwnd_gain = 1.25;
+            context.bbr_cycle_idx = (context.bbr_cycle_idx + 1) % PROBE_BW_CYCLE.length;
+          }
+
+          // ── Write the controls, clamped to [min,max] (the hard safety net). ──
+          var clamp = function (v, lo, hi) { return Math.max(lo, Math.min(hi, v)); };
+
+          var targetInflight = clamp(cwnd_gain * context.bbr_bdp,
+            context.min_limit_bytes_in_flight, context.max_limit_bytes_in_flight);
+          context.current_limit_bytes_in_flight = targetInflight;
+          context.current_limit_packets_in_flight = clamp(
+            Math.round(targetInflight / context.current_limit_packet_payload),
+            context.min_limit_packets_in_flight, context.max_limit_packets_in_flight);
+
+          var targetRate = clamp(pacing_gain * context.bbr_btlbw,
+            context.min_limit_bytes_per_sec, context.max_limit_bytes_per_sec);
+          context.current_limit_bytes_per_sec = targetRate;
+          context.current_limit_packets_per_sec = clamp(
+            Math.round(targetRate / context.current_limit_packet_payload),
+            1, context.max_limit_packets_per_sec);
+        }
+        if (DEBUG && context.bbr_bdp !== null) {
+          console.log('[bbr] round=' + context.bbr_round_count + ' ' + context.bbr_state +
+            ' BtlBw=' + (context.bbr_btlbw * 8 / 1e6).toFixed(2) + 'Mbps' +
+            ' RTprop=' + context.bbr_min_rtt + 'ms' +
+            ' BDP=' + Math.round(context.bbr_bdp) + 'B' +
+            ' → cwnd=' + Math.round(context.current_limit_bytes_in_flight) + 'B' +
+            ' pace=' + (context.current_limit_bytes_per_sec * 8 / 1e6).toFixed(2) + 'Mbps');
         }
       }
 
@@ -666,15 +1137,118 @@ function QUICConnection(options) {
     var space = epoch === 'initial' ? 'initial' : epoch === 'handshake' ? 'handshake' : 'app';
     var offset = context.crypto_send_offset[space];
     context.crypto_send_offset[space] += data.byteLength;
+    // Retain the bytes so a lost CRYPTO frame can be re-sent (app/1-RTT crypto
+    // never loses — it rides the app stream-recovery path and isn't tracked here).
+    if (space === 'initial' || space === 'handshake') {
+      context.crypto_sent[space].buf.push({ off: offset, data: data });
+    }
     sendFrames(space, [{ type: 'crypto', offset: offset, data: data }]);
+    if (space === 'initial' || space === 'handshake') scheduleCryptoRetx();
+  }
+
+  // Assemble the bytes for crypto byte-range [from,to) of `space` from retained
+  // fragments (contiguous, appended in order by cryptoWrite).
+  function cryptoSlice(space, from, to) {
+    var out = new Uint8Array(to - from);
+    var frags = context.crypto_sent[space].buf;
+    for (var i = 0; i < frags.length; i++) {
+      var fOff = frags[i].off, fEnd = fOff + frags[i].data.byteLength;
+      var lo = Math.max(from, fOff), hi = Math.min(to, fEnd);
+      if (lo < hi) out.set(frags[i].data.subarray(lo - fOff, hi - fOff), lo - from);
+    }
+    return out;
+  }
+
+  // Time-based loss recovery for the Initial/Handshake CRYPTO streams — the
+  // analog of expireInFlight for the app path. No RTT sample exists during the
+  // handshake, so the timeout starts at kInitialRtt (333ms) and backs off ×2 per
+  // unacked round (reset by an ACK in processAckFrame).
+  function cryptoTimeout(space) {
+    var base = (context.srtt === null) ? 333 : context.srtt + Math.max(4 * context.rttvar, 1);
+    var bo = Math.min(context.crypto_sent[space].backoff, 6); // cap ×64
+    return base * Math.pow(2, bo);
+  }
+
+  // Re-send any crypto byte-range that is neither acked nor currently in-flight.
+  // Mirrors get_stream_chunks: missing = invert(acked ∪ in_flight, 0, total).
+  function resendMissingCrypto(space) {
+    var cs = context.crypto_sent[space];
+    var total = context.crypto_send_offset[space];
+    if (total === 0) return false;
+
+    var known = cs.acked.slice();
+    for (var pn in cs.in_flight) flat_ranges.add(known, cs.in_flight[pn].range);
+    var missing = flat_ranges.invert(known, 0, total);
+    if (!missing || missing.length === 0) return false;
+
+    var MAX = Math.max(256, context.current_limit_packet_payload - 64); // leave header room
+    var sentAny = false;
+    for (var i = 0; i < missing.length; i += 2) {
+      var from = missing[i], to = missing[i + 1];
+      while (from < to) {
+        var end = Math.min(from + MAX, to);
+        sendFrames(space, [{ type: 'crypto', offset: from, data: cryptoSlice(space, from, end) }]);
+        sentAny = true;
+        from = end;
+      }
+    }
+    return sentAny;
+  }
+
+  // Expire in-flight crypto whose timeout elapsed (range returns to "missing").
+  function expireCryptoInFlight() {
+    var now = Date.now(), spaces = ['initial', 'handshake'], expired = false;
+    for (var s = 0; s < spaces.length; s++) {
+      var space = spaces[s], cs = context.crypto_sent[space], timeout = cryptoTimeout(space);
+      for (var pn in cs.in_flight) {
+        if (now - cs.in_flight[pn].time_sent >= timeout) { delete cs.in_flight[pn]; expired = true; }
+      }
+    }
+    return expired;
+  }
+
+  function cryptoHasInFlight() {
+    return Object.keys(context.crypto_sent.initial.in_flight).length > 0 ||
+           Object.keys(context.crypto_sent.handshake.in_flight).length > 0;
+  }
+
+  // Self-terminating ticker: keeps firing while any CRYPTO byte is unacked
+  // (the analog of plan_quic_burst's hasInFlight reschedule — needed because the
+  // first flight can be lost with no ACK to trigger anything). It is driven by
+  // acked-state, NOT local handshake_done: the server reaches handshake_done the
+  // moment it sends Finished, but must keep resending until the client acks.
+  function cryptoTick() {
+    context.crypto_timer = null;
+    if (expireCryptoInFlight()) {
+      if (resendMissingCrypto('initial'))   context.crypto_sent.initial.backoff++;
+      if (resendMissingCrypto('handshake')) context.crypto_sent.handshake.backoff++;
+    }
+    if (cryptoHasInFlight()) scheduleCryptoRetx();
+  }
+
+  function scheduleCryptoRetx() {
+    if (context.crypto_timer !== null) return; // idempotent
+    var iv = Math.min(cryptoTimeout('initial'), cryptoTimeout('handshake'));
+    context.crypto_timer = setTimeout(cryptoTick, iv);
+    if (context.crypto_timer.unref) context.crypto_timer.unref();
+  }
+
+  function stopCryptoRetx() {
+    if (context.crypto_timer !== null) { clearTimeout(context.crypto_timer); context.crypto_timer = null; }
+    context.crypto_sent.initial   = { buf: [], in_flight: {}, acked: [], backoff: 0 };
+    context.crypto_sent.handshake = { buf: [], in_flight: {}, acked: [], backoff: 0 };
   }
 
   function sendFrames(space, frameList) {
     var writeKeys = space === 'initial' ? context.initial_write
                   : space === 'handshake' ? context.handshake_write : context.app_write;
-    if (!writeKeys) { console.log('[quic] sendFrames(' + space + ') — no keys'); return; }
+    if (!writeKeys) { if (DEBUG) console.log('[quic] sendFrames(' + space + ') — no keys'); return; }
 
-    var pn = context.send_pn[space]++;
+    // Read the next packet number but DON'T commit it yet — only advance
+    // send_pn once the packet is successfully encrypted and emitted (below).
+    // A failed encryption must not consume a PN: a gap would desync the
+    // pn → sending_app_pn_history index math (and RTT). See LOSS_PTO_PLAN §5.
+    var pn = context.send_pn[space];
     var packetType = space === 'initial' ? 'initial' : space === 'handshake' ? 'handshake' : '1rtt';
 
     var dcid, scid;
@@ -712,12 +1286,16 @@ function QUICConnection(options) {
     );
 
     if (encrypted) {
+      // Commit the packet number now that the packet is real and about to go
+      // out on the wire — atomic with the bookkeeping below, so send_pn and
+      // sending_app_pn_history always advance together (no phantom PN).
+      context.send_pn[space] = pn + 1;
       var fnames = frameList.map(function(f){ return f.type + (f.type === 'ack' ? '(lg=' + f.largest + ')' : ''); }).join(',');
-      console.log('[quic] → ' + packetType + ' pn=' + pn + ' frames=[' + fnames + '] len=' + encrypted.length);
+      if (DEBUG) console.log('[quic] → ' + packetType + ' pn=' + pn + ' frames=[' + fnames + '] len=' + encrypted.length);
       touchActivity();
 
       if (space === 'app') {
-        context.sending_app_pn_history.push([Date.now(), encoded.length]);
+        context.sending_app_pn_history.push([Date.now(), encoded.length, context.delivered, context.delivered_time]);
         var has_data = false;
         for (var i = 0; i < frameList.length; i++) {
           if (frameList[i].type === 'stream' || frameList[i].type === 'crypto') { has_data = true; break; }
@@ -742,6 +1320,18 @@ function QUICConnection(options) {
                 flat_ranges.add(context.send_streams[sid].in_flight_ranges[pn], [from, to]);
               }
             }
+          }
+        }
+      }
+
+      // Initial/Handshake: record which byte-range of the crypto stream this PN
+      // carried, so a lost packet's range can be re-sent (see crypto_sent).
+      if (space === 'initial' || space === 'handshake') {
+        for (var ci = 0; ci < frameList.length; ci++) {
+          if (frameList[ci].type === 'crypto') {
+            var cFrom = frameList[ci].offset;
+            var cTo = cFrom + (frameList[ci].data ? frameList[ci].data.byteLength : 0);
+            if (cTo > cFrom) context.crypto_sent[space].in_flight[pn] = { range: [cFrom, cTo], time_sent: Date.now() };
           }
         }
       }
@@ -775,14 +1365,14 @@ function QUICConnection(options) {
       if (options.add_chunk.data === null || options.add_chunk.data === undefined) {
         if (stream.total_size === 0) {
           stream.total_size = stream.write_offset;
-          console.log('[quic] stream ' + streamId + ' FIN via null data, total_size=' + stream.total_size);
+          if (DEBUG) console.log('[quic] stream ' + streamId + ' FIN via null data, total_size=' + stream.total_size);
         }
       } else {
         var chunk = options.add_chunk.data;
         if (typeof chunk === 'string') chunk = new TextEncoder().encode(chunk);
         var start = stream.write_offset;
         stream.write_offset += chunk.byteLength;
-        console.log('[quic] stream ' + streamId + ' add_chunk len=' + chunk.byteLength + ' write_offset=' + stream.write_offset + ' fin=' + !!options.add_chunk.fin);
+        if (DEBUG) console.log('[quic] stream ' + streamId + ' add_chunk len=' + chunk.byteLength + ' write_offset=' + stream.write_offset + ' fin=' + !!options.add_chunk.fin);
 
         if (stream.pending_data === null) {
           stream.pending_data = chunk;
@@ -799,7 +1389,7 @@ function QUICConnection(options) {
         }
         if (options.add_chunk.fin) {
           stream.total_size = stream.write_offset;
-          console.log('[quic] stream ' + streamId + ' FIN via add_chunk.fin, total_size=' + stream.total_size);
+          if (DEBUG) console.log('[quic] stream ' + streamId + ' FIN via add_chunk.fin, total_size=' + stream.total_size);
         }
       }
     }
@@ -813,9 +1403,28 @@ function QUICConnection(options) {
   }
 
   function sendDatagram(data) {
-    if (context.state !== 'connected') return;
+    if (context.state !== 'connected') return false;
     if (typeof data === 'string') data = new TextEncoder().encode(data);
+    // A DATAGRAM frame must fit within a single packet — datagrams are never
+    // fragmented (RFC 9221 §3). Reject payloads that exceed our per-packet
+    // budget instead of emitting an oversized packet. Overhead is the 1-byte
+    // 0x30 DATAGRAM frame type.
+    if (data.byteLength > context.current_limit_packet_payload - 1) {
+      if (DEBUG) console.log('[quic] sendDatagram: payload too large (' + data.byteLength + ' > ' + (context.current_limit_packet_payload - 1) + ')');
+      return false;
+    }
     sendFrames('app', [{ type: 'datagram', data: data }]);
+    return true;
+  }
+
+  // Largest datagram payload (in bytes) that can be sent right now in a single
+  // packet, or 0 if datagrams can't be sent yet (connection not 'connected').
+  // This is a local single-packet estimate; QUICO does not currently parse the
+  // peer's max_datagram_frame_size transport parameter, so it does not reflect
+  // a negotiated peer limit.
+  function maxDatagramSize() {
+    if (context.state !== 'connected') return 0;
+    return Math.max(0, context.current_limit_packet_payload - 1);
   }
 
 
@@ -823,6 +1432,51 @@ function QUICConnection(options) {
    * plan_quic_burst — calculates how many packets we can send,
    * calls execute_quic_burst, schedules next burst if needed.
    */
+  // Expire packets that have been in flight longer than the RTT-derived timeout
+  // — the round-robin sender's equivalent of loss detection. A timed-out range
+  // is deleted from in_flight_ranges, so the next pass sees it as "missing" and
+  // resends it under a new packet number. Time-based ONLY (reordering must not
+  // trigger a resend). A global backoff keyed off last_ack_time widens the
+  // timeout while the peer isn't ACKing, so a dead path isn't flooded.
+  function expireInFlight() {
+    var now = Date.now();
+    var base = (context.srtt === null) ? 333 : context.srtt + Math.max(4 * context.rttvar, 1);
+
+    // Global backoff: while no ACK has arrived, widen the timeout geometrically.
+    // Resets the instant an ACK updates last_ack_time.
+    var sinceAck = now - context.last_ack_time;
+    var mult = 1;
+    while (sinceAck > base * mult * 2 && mult < 1024) mult *= 2;
+    var timeout = base * mult;
+
+    // PN of history index 0 (the array is a contiguous suffix of recent PNs).
+    var pnBase = context.send_pn.app - context.sending_app_pn_history.length;
+
+    for (var sid in context.send_streams) {
+      var st = context.send_streams[sid];
+      if (!st.in_flight_ranges) continue;
+      for (var pn in st.in_flight_ranges) {
+        if (pn === '_burst') continue;          // temporary within-burst sentinel
+        var pnum = Number(pn);
+        var idx = pnum - pnBase;
+        var expired;
+        if (idx < 0 || idx >= context.sending_app_pn_history.length) {
+          expired = true;                        // no send-time on record → assume expired (fail-safe)
+        } else {
+          expired = (now - context.sending_app_pn_history[idx][0] >= timeout);
+        }
+        if (expired) {
+          delete st.in_flight_ranges[pn];        // → becomes "missing" again, resent next pass
+          // Count the loss once per packet: the Set holds each PN once, so the
+          // first stream to expire it returns true; later same-PN deletes (a
+          // multi-stream packet) return false and don't double-count.
+          if (context.sending_app_pn_in_flight.delete(pnum)) context.lost_count++;
+        }
+      }
+    }
+  }
+
+
   function plan_quic_burst() {
     if (!context.app_write) return;
     if (context.state !== 'connected') return;
@@ -833,6 +1487,10 @@ function QUICConnection(options) {
       clearImmediate(context.burst_timer);
       context.burst_timer = null;
     }
+
+    // Time out anything that's been in flight too long, so it resurfaces as
+    // "missing" below and gets resent. (Runs before inflight/hasData are read.)
+    expireInFlight();
 
     var now = Date.now();
     var oneSecAgo = now - 1000;
@@ -853,25 +1511,69 @@ function QUICConnection(options) {
       context.sending_app_pn_history.shift();
     }
 
+    // Effective limits. For rate: min(current_, max_). For in-flight: clamp
+    // current_ to [min_, max_] — the min_ floor is the min-cwnd that keeps the
+    // connection alive (a cap below one packet would otherwise round to 0 and
+    // deadlock); max_ is the absolute ceiling and wins any min_>max_ misconfig.
+    var effBytesPerSec   = Math.min(context.current_limit_bytes_per_sec,     context.max_limit_bytes_per_sec);
+    var effPacketsPerSec = Math.min(context.current_limit_packets_per_sec,   context.max_limit_packets_per_sec);
+    var effPktsInFlight  = Math.min(context.max_limit_packets_in_flight, Math.max(context.min_limit_packets_in_flight, context.current_limit_packets_in_flight));
+    var effBytesInFlight = Math.min(context.max_limit_bytes_in_flight,   Math.max(context.min_limit_bytes_in_flight,   context.current_limit_bytes_in_flight));
+
     // Rate limits
-    var bytesRemaining = context.max_bytes_per_sec - bytesSentLastSec;
-    var packetsRemaining = context.max_packets_per_sec - packetsSentLastSec;
+    var bytesRemaining = effBytesPerSec - bytesSentLastSec;
+    var packetsRemaining = effPacketsPerSec - packetsSentLastSec;
     if (bytesRemaining < 0) bytesRemaining = 0;
     if (packetsRemaining < 0) packetsRemaining = 0;
 
-    // In-flight limits
+    // In-flight limits (packets)
     var inflightCount = context.sending_app_pn_in_flight.size;
-    var inflightRoom = context.max_packets_in_flight - inflightCount;
+    var inflightRoom = effPktsInFlight - inflightCount;
     if (inflightRoom < 0) inflightRoom = 0;
+
+    // In-flight limits (bytes). Sum the application bytes currently in flight
+    // (the spans still tracked in each stream's in_flight_ranges), then turn the
+    // remaining byte budget into a packet count. Divide by the packet payload
+    // (not the 35-byte min used for the rate limit): this is a HARD ceiling, so
+    // we under-estimate how many packets fit and never overshoot the cap.
+    var bytesInFlight = 0;
+    for (var sidB in context.send_streams) {
+      var stB = context.send_streams[sidB];
+      if (!stB.in_flight_ranges) continue;
+      for (var pnB in stB.in_flight_ranges) {
+        if (pnB === '_burst') continue;
+        bytesInFlight += stB.in_flight_ranges[pnB][1] - stB.in_flight_ranges[pnB][0];
+      }
+    }
+    var bytesInFlightRoom = effBytesInFlight - bytesInFlight;
+    if (bytesInFlightRoom < 0) bytesInFlightRoom = 0;
+    var inflightBytesPackets = Math.floor(bytesInFlightRoom / context.current_limit_packet_payload);
 
     // Calculate burst size
     var burstCount = Math.min(
       context.max_packets_per_burst,
       packetsRemaining,
       inflightRoom,
+      inflightBytesPackets,                          // bytes-in-flight cap
       Math.floor(bytesRemaining / Math.max(1, 35))  // min packet ~35 bytes
     );
     if (burstCount < 0) burstCount = 0;
+
+    // Token-bucket pacer. Credit accrues continuously at the pacing rate; a burst
+    // can spend up to PACE_BURST_MS worth of accrued tokens. This paces the long-run
+    // rate to current_limit_bytes_per_sec while tolerating setTimeout jitter (a late
+    // tick just accrues more tokens to catch up), and the small cap bounds how much
+    // can enter the bottleneck at once = the max standing queue. (A zero-burst gate
+    // starved throughput on JS timers; an unpaced ACK-clock parked ~1 BDP of queue.)
+    var PACE_BURST_MS = 5;
+    var rateBps = context.current_limit_bytes_per_sec;
+    var nowR = Date.now();
+    context.pacing_tokens += (nowR - context.pacing_last_refill) / 1000 * rateBps;
+    context.pacing_last_refill = nowR;
+    var tokenCap = Math.max(2 * context.current_limit_packet_payload, rateBps * (PACE_BURST_MS / 1000));
+    if (context.pacing_tokens > tokenCap) context.pacing_tokens = tokenCap;
+    var tokenPackets = Math.floor(context.pacing_tokens / context.current_limit_packet_payload);
+    if (burstCount > tokenPackets) burstCount = tokenPackets;
 
     // Check if there's anything to send
     var hasData = false;
@@ -891,28 +1593,59 @@ function QUICConnection(options) {
     // Also check pending ACK
     var hasPendingAck = context.pending_ack.app.length > 0;
 
-    if (!hasData && !hasPendingAck) return;
+    // Any unacked data still in flight? Keep the scheduler alive so
+    // expireInFlight can time it out and resend even when nothing is
+    // immediately sendable — otherwise a lost range would stall here forever.
+    var hasInFlight = false;
+    for (var sidF in context.send_streams) {
+      var stF = context.send_streams[sidF];
+      if (!stF.in_flight_ranges) continue;
+      for (var pnF in stF.in_flight_ranges) {
+        if (pnF !== '_burst') { hasInFlight = true; break; }
+      }
+      if (hasInFlight) break;
+    }
+
+    if (!hasData && !hasPendingAck && !hasInFlight) return;
+
+    // Paced out: have data + cwnd room, but not enough tokens yet for a packet.
+    var pacedOut = hasData && burstCount === 0 && tokenPackets < 1 &&
+                   context.sending_app_pn_in_flight.size < effPktsInFlight;
 
     // Execute burst
     var sent = false;
     if (burstCount > 0) {
       sent = execute_quic_burst(burstCount);
+      if (sent) context.pacing_tokens -= burstCount * context.current_limit_packet_payload;
     }
 
     // Schedule next burst if needed
-    if (sent && hasData) {
-      // More data to send — schedule next burst immediately (no timer delay)
-      context.burst_timer = setImmediate(function () {
+    if (hasData && (sent || pacedOut)) {
+      // Wait roughly until one more packet's worth of tokens has accrued.
+      var delayMs = (rateBps > 0) ? (context.current_limit_packet_payload * 1000 / rateBps) : 1;
+      if (delayMs < 1) delayMs = 1;       // setTimeout floor
+      if (delayMs > 100) delayMs = 100;   // don't stall on a pathologically low rate
+      context.burst_timer = setTimeout(function () {
         context.burst_timer = null;
         plan_quic_burst();
-      });
+      }, delayMs);
+      if (context.burst_timer.unref) context.burst_timer.unref();
     } else if (burstCount === 0 && hasData) {
-      // Rate limited — wait for capacity
+      // Blocked by cwnd / rate window (not pacing) — wait for capacity / ACKs.
       var waitMs = (packetsRemaining <= 0 || bytesRemaining < 35) ? 50 : 10;
       context.burst_timer = setTimeout(function () {
         context.burst_timer = null;
         plan_quic_burst();
       }, waitMs);
+      if (context.burst_timer.unref) context.burst_timer.unref();
+    } else if (hasInFlight) {
+      // Nothing to send right now, but data is still in flight and unacked.
+      // Keep a light timer ticking so expireInFlight (top of each pass) can
+      // time it out and resend. Self-terminating once everything is acked.
+      context.burst_timer = setTimeout(function () {
+        context.burst_timer = null;
+        plan_quic_burst();
+      }, 20);
       if (context.burst_timer.unref) context.burst_timer.unref();
     }
   }
@@ -924,7 +1657,7 @@ function QUICConnection(options) {
    * Returns true if at least one packet was sent.
    */
   function execute_quic_burst(packetCount) {
-    var MAX_PAYLOAD = context.max_packet_payload;
+    var MAX_PAYLOAD = context.current_limit_packet_payload;
     var OVERHEAD = 24; // STREAM frame header overhead estimate
     var sentAny = false;
 
@@ -1013,9 +1746,9 @@ function QUICConnection(options) {
           for (var pn in st.in_flight_ranges) flat_ranges.add(known, st.in_flight_ranges[pn]);
         }
         var missing = flat_ranges.invert(known, 0, st.total_size);
-        console.log('[quic] FIN-only check stream=' + sid + ' total_size=' + st.total_size + ' fin_sent=' + st.fin_sent + ' missing=' + missing.length + ' known=' + JSON.stringify(known));
+        if (DEBUG) console.log('[quic] FIN-only check stream=' + sid + ' total_size=' + st.total_size + ' fin_sent=' + st.fin_sent + ' missing=' + missing.length + ' known=' + JSON.stringify(known));
         if (missing.length === 0) {
-          console.log('[quic] → sending FIN-only for stream ' + sid);
+          if (DEBUG) console.log('[quic] → sending FIN-only for stream ' + sid);
           // All data sent — send FIN-only STREAM frame
           frames.push({ type: 'stream', id: Number(sid), offset: st.total_size, fin: true, data: new Uint8Array(0) });
           st.fin_sent = true;
@@ -1166,14 +1899,26 @@ function QUICConnection(options) {
   //  Close
   // ============================================================
 
+  function sendConnectionClose() {
+    if (!context.close_frame) return;
+    sendFrames('app', [context.close_frame]);
+    context.last_close_echo = Date.now();
+  }
+
   function close(errorCode, reason) {
-    if (context.state === 'closed' || context.state === 'draining') return;
+    if (context.state === 'closed' || context.state === 'draining' || context.state === 'closing') return;
     if (context.handshake_timer) { clearTimeout(context.handshake_timer); context.handshake_timer = null; }
-    sendFrames('app', [{
+    stopCryptoRetx();
+    context.close_frame = {
       type: 'connection_close', application: false,
       error: errorCode || 0, frameType: 0, reason: reason || ''
-    }]);
-    set_context({ state: 'draining' });
+    };
+    sendConnectionClose();
+    // RFC 9000 §10.2.1: the endpoint that *sends* CONNECTION_CLOSE enters the
+    // closing state — it re-echoes the CC (rate-limited) in response to incoming
+    // packets, rather than going silent. The peer, which *receives* the CC,
+    // enters draining (handled where connection_close frames are processed).
+    set_context({ state: 'closing' });
   }
 
 
@@ -1204,7 +1949,7 @@ function QUICConnection(options) {
     });
 
     // Initialize TLS (client mode)
-    console.log('[quic] client connecting, dcid=' + Array.from(dcid).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(''));
+    if (DEBUG) console.log('[quic] client connecting, dcid=' + Array.from(dcid).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(''));
     initTLS();
 
     // Trigger ClientHello by feeding empty message
@@ -1221,16 +1966,23 @@ function QUICConnection(options) {
     on: function (name, fn) { ev.on(name, fn); },
     off: function (name, fn) { ev.off(name, fn); },
     feedDatagram: feedDatagram,
+    feedPackets: feedPackets,
     sendStream: sendStream,
     sendDatagram: sendDatagram,
+    maxDatagramSize: maxDatagramSize,
     close: close,
     connect: connect,
     set_context: set_context,
     get state() { return context.state; }
   };
 
+  // Copy api onto `this`. Use descriptors (not `this[k] = api[k]`) so that
+  // accessor properties like `get state()` are preserved as live getters
+  // instead of being frozen to their construction-time value.
   for (var k in api) {
-    if (Object.prototype.hasOwnProperty.call(api, k)) this[k] = api[k];
+    if (Object.prototype.hasOwnProperty.call(api, k)) {
+      Object.defineProperty(this, k, Object.getOwnPropertyDescriptor(api, k));
+    }
   }
   return this;
 }

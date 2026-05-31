@@ -209,8 +209,13 @@ function request(url, options, callback) {
         headers: Object.assign({}, headers)
       };
 
-      // Check Agent for existing QUIC connection (multiplexing)
+      // Check Agent for existing QUIC connection (multiplexing).
+      // With an agent, the connection's lifecycle is owned by the pool
+      // (sweep / idle timer / agent.destroy), so signal h3_client not to
+      // auto-close it when this request finishes — otherwise the first
+      // request would tear down a connection still pooled for reuse.
       if (agent) {
+        h3Opts._managed = true;
         var existing = agent.getH3Connection(hostname, port);
         if (existing) h3Opts._connection = existing;
       }
