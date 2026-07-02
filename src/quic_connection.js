@@ -213,6 +213,9 @@ function QUICConnection(options) {
     // and ignores the received/consumed distinction.
     local_max_data_consumed: 0,       // app-consumed bytes; see note above (not yet wired)
     local_max_data_threshold: 0.5,    // send MAX_DATA when consumed > threshold × window
+    //
+    // Flow control — stream level (RFC 9000 §4.1)
+    local_initial_max_stream_data: 262144, // matches transport params; doubled on MAX_STREAM_DATA updates
     remote_max_streams_bidi: 100,
     remote_max_streams_uni: 3,
 
@@ -800,7 +803,7 @@ function QUICConnection(options) {
   function processStreamFrame(frame) {
     var sid = frame.id;
     if (!(sid in context.recv_streams)) {
-      context.recv_streams[sid] = { chunks: {}, ranges: [], total_size: 0, flushed_to: 0 };
+      context.recv_streams[sid] = { chunks: {}, ranges: [], total_size: 0, flushed_to: 0, local_max_stream_data: context.local_initial_max_stream_data };
     }
     var stream = context.recv_streams[sid];
 
@@ -852,6 +855,13 @@ function QUICConnection(options) {
     var fin = (stream.total_size > 0 && offset >= stream.total_size);
     ev.emit('stream', Number(sid), data, fin);
     if (fin) setTimeout(function () { delete context.recv_streams[sid]; }, 100);
+
+    // Send MAX_STREAM_DATA when consumed over half the per-stream budget
+    if (!fin && stream.flushed_to * 2 > stream.local_max_stream_data) {
+      var newMax = stream.local_max_stream_data * 2;
+      stream.local_max_stream_data = newMax;
+      sendFrames('app', [{ type: 'max_stream_data', id: Number(sid), max: newMax }]);
+    }
   }
 
 
