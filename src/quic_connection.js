@@ -188,36 +188,79 @@ function QUICConnection(options) {
     pending_app_packets: [],
 
     // Flow control — connection level (RFC 9000 §4.1)
-    bytes_sent: 0,                    // total STREAM bytes sent
+    bytes_sent: 0,                    // total STREAM bytes sent (raw stat, incl. retransmits)
+    // max_data_sent: connection-level FC USAGE — the sum of per-stream
+    // high-water marks (highest offset sent on each stream). RFC 9000 §4.1
+    // counts usage by highest offset, NOT bytes on the wire: retransmissions
+    // re-send offsets that were already inside the allowance, so they must not
+    // advance this counter. bytes_sent above (which does include retransmits)
+    // previously doubled as the FC counter — under loss that inflated usage
+    // until sending stalled with budget the peer had actually granted.
+    max_data_sent: 0,
     bytes_received: 0,                // total STREAM bytes *received off the wire* (incl. out-of-order)
     remote_max_data: 1048576,         // peer's limit on what we can send (default 1MB until parsed)
-    local_max_data: 1048576,          // our limit on what peer can send (matches transport params)
-    // local_max_data_consumed: bytes actually *consumed* by the application
-    // (delivered in-order to the reader), NOT bytes received off the wire.
-    // These differ: data can arrive and sit in the receive buffer unread, or
-    // be buffered out-of-order, without being consumed yet.
+
+    // ── Flow control, receive side (RFC 9000 §4.1) — consumption-based
+    // sliding window (the ngtcp2/quiche scheme; replaces the old unbounded
+    // ×2 doubling, which never actually limited the peer and grew forever).
     //
-    // Correct connection flow control (the sliding-window scheme used by
-    // ngtcp2/quiche) advances on *consumption*: keep a fixed window and, once
-    // consumed passes ~half a window since the last update, send
-    // MAX_DATA = local_max_data_consumed + window. That caps how many
-    // UN-consumed bytes the peer can park in our buffer — which is the whole
-    // point of flow control (bounding memory).
+    // Three numbers per level:
+    //   window (W)  — fixed size, = the value in our transport params.
+    //   consumed    — bytes DELIVERED IN-ORDER to the application (advances in
+    //                 flushStream), NOT bytes received off the wire. Data can
+    //                 arrive out of order and park in the buffer unconsumed —
+    //                 exactly what the window must bound (memory).
+    //   advertised  — the limit last sent to the peer (local_max_data below /
+    //                 per-stream local_max_stream_data). Slides forward by
+    //                 `advertised = consumed + W` once consumed passes half a
+    //                 window since the last update (hysteresis).
     //
-    // TODO (deferred — "consumption-based flow control"): drive this from
-    // flushStream's `flushed_to` (local_max_data_consumed += delivered bytes),
-    // rebuild checkLocalFlowControl as a bounded sliding window against it,
-    // and enforce the limit on inbound data (FLOW_CONTROL_ERROR on overrun).
-    // Currently checkLocalFlowControl just doubles local_max_data off
-    // bytes_received, which never blocks the peer but also grows unbounded
-    // and ignores the received/consumed distinction.
-    local_max_data_consumed: 0,       // app-consumed bytes; see note above (not yet wired)
-    local_max_data_threshold: 0.5,    // send MAX_DATA when consumed > threshold × window
+    // USAGE (what the peer is measured against) counts by HIGHEST OFFSET per
+    // stream (fc_recv_usage = Σ max_recv_offset), not bytes-on-the-wire —
+    // retransmissions must not advance it. Exceeding `advertised` on either
+    // level is a protocol violation → CONNECTION_CLOSE FLOW_CONTROL_ERROR
+    // (0x03). A peer stalled because we haven't consumed sends DATA_BLOCKED /
+    // STREAM_DATA_BLOCKED, answered by re-sending the current advertised —
+    // that pairing (see the frame handlers) is what makes a lost window
+    // update recoverable.
+    local_max_data: 1048576,          // ADVERTISED conn limit (starts = window, from transport params)
+    local_max_data_window: 1048576,   // W — fixed; matches initial_max_data we advertise
+    local_max_data_consumed: 0,       // in-order bytes delivered to the app (all streams)
+    fc_recv_usage: 0,                 // Σ per-stream max_recv_offset — the peer's usage
+
     //
     // Flow control — stream level (RFC 9000 §4.1)
     local_initial_max_stream_data: 262144, // matches transport params; doubled on MAX_STREAM_DATA updates
+
     remote_max_streams_bidi: 100,
     remote_max_streams_uni: 3,
+
+    // ── Per-stream send-side flow control (RFC 9000 §4.1) — the peer's limits
+    // on what WE may send per stream. Seeded from the peer's transport params
+    // (initial_max_stream_data_*, mapped by stream direction/initiator in
+    // initialStreamSendLimit), then raised by MAX_STREAM_DATA frames. The RFC
+    // default for an omitted param is 0 — a peer that doesn't grant, grants
+    // nothing (in practice params always arrive during the handshake, before
+    // any app data can flow).
+    peer_initial_max_stream_data_bidi_local: 0,
+    peer_initial_max_stream_data_bidi_remote: 0,
+    peer_initial_max_stream_data_uni: 0,
+    // MAX_STREAM_DATA values keyed by stream id (monotonic). Lives outside the
+    // stream object so a frame that arrives BEFORE the stream is created is
+    // still honored at creation time. Entries are dropped when the stream is
+    // fully acked / stopped.
+    remote_max_stream_data_by_sid: {},
+
+    // FC-blocked signaling (DATA_BLOCKED / STREAM_DATA_BLOCKED, RFC 9000 §4.1).
+    // Set by get_stream_chunks when a window clamp actually binds; consumed by
+    // maybeSendBlockedFrames after each burst pass. This doubles as our loss
+    // recovery for window updates: MAX_DATA / MAX_STREAM_DATA are sent once
+    // and never retransmitted, so a lost update would stall the sender forever
+    // — the repeated (rate-limited) BLOCKED frame prompts the peer to re-send
+    // its current limit.
+    fc_blocked_conn: false,          // conn-level budget bound this pass
+    last_data_blocked_sent: 0,       // rate-limit timestamp (connection)
+    last_stream_blocked_sent: {},    // sid → rate-limit timestamp (per stream)
 
     // RTT estimate (RFC 9002 §5), updated incrementally on every new sample.
     // null = no sample yet. Replaces the old raw rtt_history log: the EWMA below
@@ -375,6 +418,11 @@ function QUICConnection(options) {
 
     if (changed.state && (context.state === 'draining' || context.state === 'closing')) {
       clearIdleTimer();
+      // A draining/closing endpoint must stop retransmitting CRYPTO — the
+      // ticker would otherwise keep resending the handshake flight at a peer
+      // that already told us the connection is dead (seen live: three Initial
+      // retransmits fired after a CONNECTION_CLOSE was processed).
+      stopCryptoRetx();
       var _drainTimer = setTimeout(function () {
         if (context.state === 'draining' || context.state === 'closing') { context.state = 'closed'; ev.emit('close'); }
       }, Math.min(3000, context.idle_timeout / 3));
@@ -482,10 +530,41 @@ function QUICConnection(options) {
       // grants less than our 1MB default is honored. MAX_DATA frames raise it later.
       if (typeof p.initial_max_data === 'number') {
         context.remote_max_data = p.initial_max_data;
-        plan_quic_burst(); // budget changed
       }
+      // Per-stream send limits (RFC 9000 §18.2). The params are named from the
+      // PEER's perspective; initialStreamSendLimit() maps them onto our stream
+      // ids by direction/initiator when a send-stream is created.
+      if (typeof p.initial_max_stream_data_bidi_local === 'number') {
+        context.peer_initial_max_stream_data_bidi_local = p.initial_max_stream_data_bidi_local;
+      }
+      if (typeof p.initial_max_stream_data_bidi_remote === 'number') {
+        context.peer_initial_max_stream_data_bidi_remote = p.initial_max_stream_data_bidi_remote;
+      }
+      if (typeof p.initial_max_stream_data_uni === 'number') {
+        context.peer_initial_max_stream_data_uni = p.initial_max_stream_data_uni;
+      }
+      // Stream-count limits the peer grants us. Enforcement (blocking opens
+      // past the cap) is future work, but seed the real values so the guessed
+      // defaults (100/3) don't masquerade as negotiated ones.
+      if (typeof p.initial_max_streams_bidi === 'number') {
+        context.remote_max_streams_bidi = p.initial_max_streams_bidi;
+      }
+      if (typeof p.initial_max_streams_uni === 'number') {
+        context.remote_max_streams_uni = p.initial_max_streams_uni;
+      }
+      // Defensive: raise the limit of any stream opened before the params
+      // arrived (normally none — params land during the handshake).
+      for (var rsid in context.send_streams) {
+        var rst = context.send_streams[rsid];
+        var seeded = initialStreamSendLimit(Number(rsid));
+        if (seeded > rst.remote_max_stream_data) rst.remote_max_stream_data = seeded;
+      }
+      plan_quic_burst(); // budgets changed
       if (DEBUG) console.log('[quic] peer params: ack_delay_exp=' + context.peer_ack_delay_exponent +
-        ' max_ack_delay=' + context.max_ack_delay + ' remote_max_data=' + context.remote_max_data);
+        ' max_ack_delay=' + context.max_ack_delay + ' remote_max_data=' + context.remote_max_data +
+        ' msd_bidi_local=' + context.peer_initial_max_stream_data_bidi_local +
+        ' msd_bidi_remote=' + context.peer_initial_max_stream_data_bidi_remote +
+        ' msd_uni=' + context.peer_initial_max_stream_data_uni);
     });
 
     tls.on('handshakeSecrets', function (secrets) {
@@ -724,6 +803,8 @@ function QUICConnection(options) {
         if (frame.id in context.send_streams) {
           if (DEBUG) console.log('[quic] STOP_SENDING stream=' + frame.id + ' error=' + frame.error);
           delete context.send_streams[frame.id];
+          delete context.remote_max_stream_data_by_sid[frame.id];
+          delete context.last_stream_blocked_sent[frame.id];
         }
       } else if (frame.type === 'reset_stream') {
         // Peer cancelled their stream
@@ -743,7 +824,39 @@ function QUICConnection(options) {
         set_context({ remote_max_streams_uni: frame.max });
       } else if (frame.type === 'max_stream_data') {
         ackEliciting = true;
+        // The peer raised our send allowance on one stream (previously the
+        // value was dropped on the floor). Track it monotonically in the
+        // sid-keyed map (so a frame arriving before the stream exists is
+        // honored at creation) and on the live stream, then reschedule — this
+        // may have just unblocked a sender stalled on the old limit.
+        var msdPrev = context.remote_max_stream_data_by_sid[frame.id] || 0;
+        if (frame.max > msdPrev) context.remote_max_stream_data_by_sid[frame.id] = frame.max;
+        var msdStream = context.send_streams[frame.id];
+        if (msdStream && frame.max > msdStream.remote_max_stream_data) {
+          msdStream.remote_max_stream_data = frame.max;
+          plan_quic_burst();
+        }
+      } else if (frame.type === 'data_blocked') {
+        // The peer is stalled on our connection window. Our MAX_DATA may have
+        // been lost (window updates are sent once, unrecovered) — re-send the
+        // current limit. Harmless if it wasn't lost: the peer's limit is
+        // monotonic, a duplicate is ignored.
+        ackEliciting = true;
+        sendFrames('app', [{ type: 'max_data', max: context.local_max_data }]);
+      } else if (frame.type === 'stream_data_blocked') {
+        // Same, per stream. If we never received data on this stream (all of
+        // it lost), no recv_stream exists yet — answer with the initial limit
+        // we advertised in our transport params.
+        ackEliciting = true;
+        var sdbStream = context.recv_streams[frame.id];
+        var sdbLimit = sdbStream ? sdbStream.local_max_stream_data
+                                 : context.local_initial_max_stream_data;
+        sendFrames('app', [{ type: 'max_stream_data', id: Number(frame.id), max: sdbLimit }]);
       } else if (frame.type === 'datagram') {
+        // DATAGRAM frames are ack-eliciting (RFC 9221 §5.2). Without this, a
+        // peer sending only datagrams (a classic WebTransport flow) would get
+        // no ACKs from us and read the silence as total loss.
+        ackEliciting = true;
         ev.emit('datagram', frame.data);
       }
     }
@@ -803,9 +916,34 @@ function QUICConnection(options) {
   function processStreamFrame(frame) {
     var sid = frame.id;
     if (!(sid in context.recv_streams)) {
-      context.recv_streams[sid] = { chunks: {}, ranges: [], total_size: 0, flushed_to: 0, local_max_stream_data: context.local_initial_max_stream_data };
+      context.recv_streams[sid] = { chunks: {}, ranges: [], total_size: 0, flushed_to: 0,
+        max_recv_offset: 0,   // highest offset seen — the peer's FC usage on this stream
+        local_max_stream_data: context.local_initial_max_stream_data };
     }
     var stream = context.recv_streams[sid];
+
+    // ── FC usage + enforcement (RFC 9000 §4.1) ──────────────────────────────
+    // Usage advances only when the HIGHEST offset advances — a retransmission
+    // re-delivers offsets already counted and must not be charged (the old
+    // bytes_received counter charged every arriving byte, so under loss we
+    // advertised new windows early). Exceeding what we advertised, on either
+    // level, is the peer's protocol violation → FLOW_CONTROL_ERROR (0x03).
+    var newHigh = frame.offset + frame.data.length;
+    if (newHigh > stream.max_recv_offset) {
+      if (newHigh > stream.local_max_stream_data) {
+        if (DEBUG) console.log('[quic] FC violation: stream ' + sid + ' offset ' + newHigh + ' > advertised ' + stream.local_max_stream_data);
+        close(0x03, 'stream flow control exceeded');
+        return;
+      }
+      var fcDelta = newHigh - stream.max_recv_offset;
+      if (context.fc_recv_usage + fcDelta > context.local_max_data) {
+        if (DEBUG) console.log('[quic] FC violation: connection usage ' + (context.fc_recv_usage + fcDelta) + ' > advertised ' + context.local_max_data);
+        close(0x03, 'connection flow control exceeded');
+        return;
+      }
+      stream.max_recv_offset = newHigh;
+      context.fc_recv_usage += fcDelta;
+    }
 
     var alreadyHave = false;
     for (var ri = 0; ri < stream.ranges.length; ri += 2) {
@@ -818,49 +956,80 @@ function QUICConnection(options) {
       if (!(frame.offset in stream.chunks) || stream.chunks[frame.offset].byteLength < frame.data.byteLength) {
         stream.chunks[frame.offset] = frame.data;
       }
-      // Track connection-level bytes received
+      // Raw stat only — FC usage is max_recv_offset above, not this.
       context.bytes_received += frame.data.byteLength;
-      checkLocalFlowControl();
     }
     if (frame.fin && stream.total_size === 0) stream.total_size = frame.offset + frame.data.length;
     flushStream(sid);
   }
 
-  /**
-   * Check if we need to send MAX_DATA to give the peer more send capacity.
-   * When consumed > threshold × window, double the window and notify peer.
-   */
-  function checkLocalFlowControl() {
-    if (context.bytes_received > context.local_max_data * context.local_max_data_threshold) {
-      var newMax = context.local_max_data * 2;
-      context.local_max_data = newMax;
-      sendFrames('app', [{ type: 'max_data', max: newMax }]);
-    }
-  }
+  // (checkLocalFlowControl — the old unbounded ×2 doubling — was replaced by
+  //  the consumption-based sliding window inside flushStream above.)
 
   function flushStream(sid) {
     var stream = context.recv_streams[sid];
     if (!stream) return;
     var parts = [];
     var offset = stream.flushed_to;
-    while (offset in stream.chunks) {
+    // Walk the in-order prefix. Chunks are keyed by their start offset, but
+    // retransmission re-slices byte ranges with boundaries that need not match
+    // the original transmission's (the per-burst budget differs between
+    // passes). So a chunk can START BEFORE the cursor and extend past it —
+    // an exact-key walk (`offset in chunks`) stalls forever on such a chunk
+    // even though every byte is present (observed live: ranges said
+    // [0,262144] complete while flushed_to sat at 31846, mid-chunk of the
+    // entry keyed 31747). When the exact key misses, scan for a covering
+    // chunk and consume its tail; drop fully-stale chunks (entirely behind
+    // the cursor — overlap leftovers) along the way.
+    while (true) {
       var chunk = stream.chunks[offset];
-      delete stream.chunks[offset];
-      parts.push(chunk);
-      offset += chunk.byteLength;
+      var chunkStart = offset;
+      if (!chunk) {
+        var keys = Object.keys(stream.chunks);
+        for (var ki = 0; ki < keys.length; ki++) {
+          var ks = Number(keys[ki]);
+          var c = stream.chunks[ks];
+          var kEnd = ks + c.byteLength;
+          if (kEnd <= offset) { delete stream.chunks[ks]; continue; }  // stale overlap leftover
+          if (ks < offset && kEnd > offset) { chunk = c; chunkStart = ks; break; }
+        }
+        if (!chunk) break;  // genuine gap — wait for more data
+      }
+      delete stream.chunks[chunkStart];
+      var skip = offset - chunkStart;                    // 0 on the exact-key path
+      parts.push(skip > 0 ? chunk.subarray(skip) : chunk);
+      offset = chunkStart + chunk.byteLength;
     }
     if (parts.length === 0) return;
+    var delivered = offset - stream.flushed_to;   // in-order bytes handed to the app now
     stream.flushed_to = offset;
     var data = parts.length === 1 ? parts[0] : concatUint8Arrays(parts);
     var fin = (stream.total_size > 0 && offset >= stream.total_size);
     ev.emit('stream', Number(sid), data, fin);
     if (fin) setTimeout(function () { delete context.recv_streams[sid]; }, 100);
 
-    // Send MAX_STREAM_DATA when consumed over half the per-stream budget
-    if (!fin && stream.flushed_to * 2 > stream.local_max_stream_data) {
-      var newMax = stream.local_max_stream_data * 2;
-      stream.local_max_stream_data = newMax;
-      sendFrames('app', [{ type: 'max_stream_data', id: Number(sid), max: newMax }]);
+    // ── Sliding window updates (consumption-based; see the context header) ──
+    // Both levels use the same rule: once consumption has advanced at least
+    // half a window past the last advertisement, advertise consumed + W.
+    // Monotonic by construction; a duplicate/lower advert is ignored by the
+    // peer, and re-sends on DATA_BLOCKED reuse these same fields.
+
+    // Connection level: consumed = in-order bytes delivered across all streams.
+    context.local_max_data_consumed += delivered;
+    var W = context.local_max_data_window;
+    if (context.local_max_data_consumed + W - context.local_max_data >= W / 2) {
+      context.local_max_data = context.local_max_data_consumed + W;
+      sendFrames('app', [{ type: 'max_data', max: context.local_max_data }]);
+    }
+
+    // Stream level: consumed = flushed_to. No update after FIN — the stream
+    // is done, its final usage stays counted at the connection level.
+    if (!fin) {
+      var Ws = context.local_initial_max_stream_data;
+      if (stream.flushed_to + Ws - stream.local_max_stream_data >= Ws / 2) {
+        stream.local_max_stream_data = stream.flushed_to + Ws;
+        sendFrames('app', [{ type: 'max_stream_data', id: Number(sid), max: stream.local_max_stream_data }]);
+      }
     }
   }
 
@@ -1002,6 +1171,8 @@ function QUICConnection(options) {
             if (st.total_size > 0 && st.acked_ranges.length === 2 &&
                 st.acked_ranges[0] === 0 && st.acked_ranges[1] >= st.total_size) {
               delete context.send_streams[sid];
+              delete context.remote_max_stream_data_by_sid[sid];
+              delete context.last_stream_blocked_sent[sid];
             }
           }
         }
@@ -1072,6 +1243,7 @@ function QUICConnection(options) {
           // (≈2 packets) — starving throughput on the fastest links. Floor RTprop at
           // a few ms for this calc: it only affects sub-floor RTTs (where the link is
           // fast and can absorb the extra window) and never binds on normal links.
+          // (A tick-adaptive floor was tried and reverted — see the pacer note.)
           var BBR_RTPROP_FLOOR_MS = 5;
           var rttForBdp = Math.max(context.bbr_min_rtt, BBR_RTPROP_FLOOR_MS);
           context.bbr_bdp = context.bbr_btlbw * (rttForBdp / 1000);
@@ -1250,6 +1422,15 @@ function QUICConnection(options) {
   }
 
   function sendFrames(space, frameList) {
+    // RFC 9000 §10.2: a draining endpoint MUST NOT send packets at all; a
+    // closing endpoint may only (re)send its CONNECTION_CLOSE. Belt-and-
+    // suspenders with the timer cleanup — any stray timer (crypto retx, burst,
+    // keep-alive) that fires after the state change dies here instead of
+    // emitting packets at a dead connection.
+    if (context.state === 'draining' || context.state === 'closed') return;
+    if (context.state === 'closing' &&
+        !(frameList.length === 1 && frameList[0].type === 'connection_close')) return;
+
     var writeKeys = space === 'initial' ? context.initial_write
                   : space === 'handshake' ? context.handshake_write : context.app_write;
     if (!writeKeys) { if (DEBUG) console.log('[quic] sendFrames(' + space + ') — no keys'); return; }
@@ -1357,6 +1538,29 @@ function QUICConnection(options) {
   // ============================================================
 
   /**
+   * Initial send-limit for a stream we write to, per the peer's transport
+   * params. Which param applies depends on the stream's direction and who
+   * initiated it — the params are named from the PEER's perspective
+   * (RFC 9000 §18.2):
+   *   uni stream we send on      → initial_max_stream_data_uni
+   *   bidi stream WE initiated   → ..._bidi_remote  ("remote" from the peer's view)
+   *   bidi stream THEY initiated → ..._bidi_local
+   * A MAX_STREAM_DATA that arrived before the stream existed is honored via
+   * remote_max_stream_data_by_sid (monotonic max wins).
+   */
+  function initialStreamSendLimit(sid) {
+    var isUni = (sid & 0x2) === 0x2;                 // bit 1: uni vs bidi
+    var clientInitiated = (sid & 0x1) === 0x0;       // bit 0: initiator
+    var weInitiated = context.isServer ? !clientInitiated : clientInitiated;
+    var base;
+    if (isUni) base = context.peer_initial_max_stream_data_uni;
+    else if (weInitiated) base = context.peer_initial_max_stream_data_bidi_remote;
+    else base = context.peer_initial_max_stream_data_bidi_local;
+    var pending = context.remote_max_stream_data_by_sid[sid] || 0;
+    return Math.max(base, pending);
+  }
+
+  /**
    * Buffer data for a stream. Does NOT send immediately.
    * Calls plan_quic_burst() to schedule sending.
    */
@@ -1365,7 +1569,14 @@ function QUICConnection(options) {
       context.send_streams[streamId] = {
         pending_data: null, pending_offset_start: 0,
         write_offset: 0, send_offset: 0, total_size: 0,
-        fin_sent: false, acked_ranges: [], in_flight_ranges: {}
+        fin_sent: false, acked_ranges: [], in_flight_ranges: {},
+        // Send-side FC (RFC 9000 §4.1): the peer's absolute offset cap for
+        // this stream, and our high-water mark (highest offset ever yielded).
+        // New data = bytes extending max_sent_offset; only those consume the
+        // connection-level budget. See get_stream_chunks.
+        remote_max_stream_data: initialStreamSendLimit(streamId),
+        max_sent_offset: 0,
+        fc_blocked: false
       };
     }
 
@@ -1487,6 +1698,39 @@ function QUICConnection(options) {
   }
 
 
+  // Consume the fc_blocked flags set by get_stream_chunks and, rate-limited,
+  // tell the peer we're stalled on its window (RFC 9000 §4.1 SHOULD). Beyond
+  // being polite, this is the loss-recovery path for window updates: the
+  // receiver answers a BLOCKED frame by re-sending its current MAX_DATA /
+  // MAX_STREAM_DATA, so a single lost update can no longer deadlock the
+  // sender. Returns true if any flag was set this pass (used to keep the
+  // scheduler ticking while blocked with nothing in flight).
+  var FC_BLOCKED_RESEND_MS = 500;
+  function maybeSendBlockedFrames() {
+    var now = Date.now();
+    var wasBlocked = false;
+    if (context.fc_blocked_conn) {
+      context.fc_blocked_conn = false;
+      wasBlocked = true;
+      if (now - context.last_data_blocked_sent >= FC_BLOCKED_RESEND_MS) {
+        context.last_data_blocked_sent = now;
+        sendFrames('app', [{ type: 'data_blocked', limit: context.remote_max_data }]);
+      }
+    }
+    for (var sid in context.send_streams) {
+      var st = context.send_streams[sid];
+      if (!st.fc_blocked) continue;
+      st.fc_blocked = false;
+      wasBlocked = true;
+      if (now - (context.last_stream_blocked_sent[sid] || 0) >= FC_BLOCKED_RESEND_MS) {
+        context.last_stream_blocked_sent[sid] = now;
+        sendFrames('app', [{ type: 'stream_data_blocked', id: Number(sid), limit: st.remote_max_stream_data }]);
+      }
+    }
+    return wasBlocked;
+  }
+
+
   function plan_quic_burst() {
     if (!context.app_write) return;
     if (context.state !== 'connected') return;
@@ -1575,6 +1819,17 @@ function QUICConnection(options) {
     // tick just accrues more tokens to catch up), and the small cap bounds how much
     // can enter the bottleneck at once = the max standing queue. (A zero-burst gate
     // starved throughput on JS timers; an unpaced ACK-clock parked ~1 BDP of queue.)
+    //
+    // KNOWN CEILING (documented, deliberate): on coarse-timer platforms
+    // (Windows setTimeout ≈ 15ms) the 5ms cap discards most of a late tick's
+    // accrual, capping throughput near cap/tick (~6 Mbps observed). Widening
+    // the cap/bursts to cover a measured tick was tried and REVERTED: bigger
+    // bursts overflow the small default UDP socket buffers (esp. same-process
+    // loopback on Windows) → silent local drops → the loss-recovery machinery
+    // turns a lossless link into a crawling one. Raising this ceiling properly
+    // needs socket buffer sizing (setRecvBufferSize/setSendBufferSize at the
+    // dgram layer) validated on a measurable rig — CC-calibration work, not a
+    // constant to guess at. Stability beats throughput until then.
     var PACE_BURST_MS = 5;
     var rateBps = context.current_limit_bytes_per_sec;
     var nowR = Date.now();
@@ -1623,11 +1878,17 @@ function QUICConnection(options) {
                    context.sending_app_pn_in_flight.size < effPktsInFlight;
 
     // Execute burst
-    var sent = false;
+    var sent = 0;
     if (burstCount > 0) {
-      sent = execute_quic_burst(burstCount);
-      if (sent) context.pacing_tokens -= burstCount * context.current_limit_packet_payload;
+      sent = execute_quic_burst(burstCount);   // returns packets ACTUALLY sent
+      // Charge tokens for what went out — not for the burstCount ceiling.
+      // Charging the ceiling overbilled short bursts (e.g. a 2-packet stream
+      // tail billed as 64) and starved the pacer for a full tick afterwards.
+      if (sent > 0) context.pacing_tokens -= sent * context.current_limit_packet_payload;
     }
+
+    // FC-blocked signaling — consume flags set inside the burst just executed.
+    var fcBlocked = maybeSendBlockedFrames();
 
     // Schedule next burst if needed
     if (hasData && (sent || pacedOut)) {
@@ -1657,6 +1918,16 @@ function QUICConnection(options) {
         plan_quic_burst();
       }, 20);
       if (context.burst_timer.unref) context.burst_timer.unref();
+    } else if (fcBlocked && hasData) {
+      // FC-blocked with nothing in flight: without this the scheduler would go
+      // idle here and the (rate-limited) BLOCKED signal above would fire only
+      // once — and a once-sent frame can be lost too. Keep ticking until the
+      // peer's window update arrives and unblocks hasData → sent.
+      context.burst_timer = setTimeout(function () {
+        context.burst_timer = null;
+        plan_quic_burst();
+      }, 250);
+      if (context.burst_timer.unref) context.burst_timer.unref();
     }
   }
 
@@ -1664,12 +1935,13 @@ function QUICConnection(options) {
   /**
    * execute_quic_burst — fill up to packet_count packets.
    * Round-robin across active streams.
-   * Returns true if at least one packet was sent.
+   * Returns the number of packets actually sent (0 if none) — the pacer
+   * charges tokens per REAL packet, not per the packetCount ceiling.
    */
   function execute_quic_burst(packetCount) {
     var MAX_PAYLOAD = context.current_limit_packet_payload;
     var OVERHEAD = 24; // STREAM frame header overhead estimate
-    var sentAny = false;
+    var sentCount = 0;
 
     function getActiveIds() {
       var ids = [];
@@ -1768,7 +2040,7 @@ function QUICConnection(options) {
       // Send packet if it has content beyond just ACK-only
       if (frames.length > 0) {
         sendFrames('app', frames);
-        sentAny = true;
+        sentCount++;
         // Clean up temp _burst in_flight keys (real PN keys now recorded by sendFrames)
         for (var sid in burstYielded) {
           var st = context.send_streams[sid];
@@ -1785,7 +2057,7 @@ function QUICConnection(options) {
       if (activeIds.length === 0) break;
     }
 
-    return sentAny;
+    return sentCount;
   }
 
 
@@ -1803,10 +2075,28 @@ function QUICConnection(options) {
     var stream = context.send_streams[streamId];
     if (!stream || !stream.pending_data || stream.pending_data.byteLength === 0) return [];
 
-    // Flow control: cap by remaining remote_max_data budget
-    var fcBudget = context.remote_max_data - context.bytes_sent;
-    if (fcBudget <= 0) return []; // blocked by flow control
-    maxBytes = Math.min(maxBytes, fcBudget);
+    // ── Flow control, send side (RFC 9000 §4.1) — two levels, one rule ──────
+    // Both limits cap the HIGHEST OFFSET we may send, so they bind only NEW
+    // data (bytes extending max_sent_offset). Retransmissions re-send offsets
+    // that were already inside the allowance when first sent — they consume no
+    // budget and MUST NOT be blocked. (The previous connection-only check
+    // gated ALL bytes on remote_max_data − bytes_sent: under loss at the edge
+    // of an exhausted window, the lost range itself was FC-blocked from being
+    // repaired — a deadlock the peer can't always resolve, since the data it
+    // would raise the window for is exactly the data that never arrived.)
+    //   streamLimit   — absolute offset cap for THIS stream (seeded from the
+    //                   peer's initial_max_stream_data_*, raised by
+    //                   MAX_STREAM_DATA). Monotonic, so it never binds on a
+    //                   retransmit of previously-allowed offsets.
+    //   connRemaining — connection-level budget for new bytes: the peer's
+    //                   max_data minus the sum of all streams' high-water
+    //                   marks (context.max_data_sent). Decremented locally as
+    //                   this call yields new bytes; committed via
+    //                   max_data_sent at yield time (charging a chunk that a
+    //                   later encrypt-failure drops only wastes budget —
+    //                   conservative — never overspends it).
+    var streamLimit = stream.remote_max_stream_data;
+    var connRemaining = context.remote_max_data - context.max_data_sent;
 
     var data = stream.pending_data;
     var baseOffset = stream.pending_offset_start;
@@ -1850,8 +2140,34 @@ function QUICConnection(options) {
       if (relEnd > data.byteLength) { relEnd = data.byteLength; len = relEnd - relStart; }
       if (len <= 0) continue;
 
+      // FC clamp 1: never extend past the peer's per-stream offset cap.
+      if (from + len > streamLimit) {
+        stream.fc_blocked = true;   // the cap bound — signal STREAM_DATA_BLOCKED
+        if (from >= streamLimit) continue;
+        len = streamLimit - from; relEnd = relStart + len;
+      }
+
+      // FC clamp 2: charge the connection budget for NEW bytes only (the part
+      // of this chunk above the stream's high-water mark).
+      var newStart = Math.max(from, stream.max_sent_offset);
+      var newBytes = Math.max(0, (from + len) - newStart);
+      if (newBytes > connRemaining) {
+        context.fc_blocked_conn = true;  // the budget bound — signal DATA_BLOCKED
+        len -= (newBytes - connRemaining);
+        relEnd = relStart + len;
+        newBytes = connRemaining;
+      }
+      if (len <= 0) continue;
+
       chunks.push({ offset: from, data: data.slice(relStart, relEnd) });
       used += len;
+
+      // Commit FC usage at yield time (see header note).
+      if (newBytes > 0) {
+        stream.max_sent_offset = from + len;
+        context.max_data_sent += newBytes;
+        connRemaining -= newBytes;
+      }
 
       // Advance send_offset
       if (from + len > stream.send_offset) {
@@ -1886,8 +2202,30 @@ function QUICConnection(options) {
         if (relEnd > data.byteLength) { relEnd = data.byteLength; len = relEnd - relStart; }
         if (len <= 0) continue;
 
+        // FC fail-safe: retransmits sit below the high-water mark, which was
+        // itself capped when first sent, and limits are monotonic — so these
+        // clamps should never bind here. Applied anyway so the invariant
+        // "nothing ever leaves above streamLimit / beyond the conn budget"
+        // holds unconditionally, whatever the scheduler does around us.
+        if (mFrom >= streamLimit) continue;
+        if (mFrom + len > streamLimit) { len = streamLimit - mFrom; relEnd = relStart + len; }
+        var newStart2 = Math.max(mFrom, stream.max_sent_offset);
+        var newBytes2 = Math.max(0, (mFrom + len) - newStart2);
+        if (newBytes2 > connRemaining) {
+          len -= (newBytes2 - connRemaining);
+          relEnd = relStart + len;
+          newBytes2 = connRemaining;
+        }
+        if (len <= 0) continue;
+
         chunks.push({ offset: mFrom, data: data.slice(relStart, relEnd) });
         used += len;
+
+        if (newBytes2 > 0) {
+          stream.max_sent_offset = mFrom + len;
+          context.max_data_sent += newBytes2;
+          connRemaining -= newBytes2;
+        }
       }
     }
 

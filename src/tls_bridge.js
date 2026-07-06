@@ -80,7 +80,23 @@ function TLSBridge(options) {
           local_supported_groups: [29, 23, 24],
           local_supported_cipher_suites: [0x1301, 0x1302],
           local_extensions: [{ type: 0x39, data: quicParams }],
-          local_supported_signature_algorithms: [0x0401, 0x0501, 0x0601],
+          // Signature schemes offered to the peer (client: in the ClientHello;
+          // server: in CertificateRequest). Full modern list, ordered PSS/ECDSA/
+          // EdDSA first, legacy pkcs1 last (TLS 1.2 compat only — TLS 1.3 never
+          // signs pkcs1). Two bugs lived in the old pkcs1-only list:
+          //   1. Cloudflare zones with ECDSA-only certs reject the ClientHello
+          //      outright (alert 40 handshake_failure — seen live against
+          //      speed.cloudflare.com; claude.ai worked only because that zone
+          //      also carries an RSA cert).
+          //   2. lemon-tls hardcodes THIS full list in the HRR CH2, and RFC 8446
+          //      §4.1.2 requires CH2 to match CH1 exactly — offering a different
+          //      list in CH1 made every HRR flow non-compliant.
+          local_supported_signature_algorithms: [
+            0x0804, 0x0805, 0x0806,          // rsa_pss_rsae_sha256/384/512
+            0x0403, 0x0503, 0x0603,          // ecdsa_secp256r1/384r1/521r1
+            0x0807, 0x0808,                  // ed25519, ed448
+            0x0401, 0x0501, 0x0601           // rsa_pkcs1 (TLS 1.2 legacy)
+          ],
         });
         helloHandled = true; // ClientHello will be generated from this set_context
       }
@@ -143,7 +159,23 @@ function TLSBridge(options) {
         local_extensions: [
           { type: 0x39, data: quicParams }
         ],
-        local_supported_signature_algorithms: [0x0401, 0x0501, 0x0601],
+        // Signature schemes offered to the peer (client: in the ClientHello;
+        // server: in CertificateRequest). Full modern list, ordered PSS/ECDSA/
+        // EdDSA first, legacy pkcs1 last (TLS 1.2 compat only — TLS 1.3 never
+        // signs pkcs1). Two bugs lived in the old pkcs1-only list:
+        //   1. Cloudflare zones with ECDSA-only certs reject the ClientHello
+        //      outright (alert 40 handshake_failure — seen live against
+        //      speed.cloudflare.com; claude.ai worked only because that zone
+        //      also carries an RSA cert).
+        //   2. lemon-tls hardcodes THIS full list in the HRR CH2, and RFC 8446
+        //      §4.1.2 requires CH2 to match CH1 exactly — offering a different
+        //      list in CH1 made every HRR flow non-compliant.
+        local_supported_signature_algorithms: [
+          0x0804, 0x0805, 0x0806,          // rsa_pss_rsae_sha256/384/512
+          0x0403, 0x0503, 0x0603,          // ecdsa_secp256r1/384r1/521r1
+          0x0807, 0x0808,                  // ed25519, ed448
+          0x0401, 0x0501, 0x0601           // rsa_pkcs1 (TLS 1.2 legacy)
+        ],
       };
 
       session.set_context(tlsContext);
