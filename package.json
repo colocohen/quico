@@ -1,6 +1,6 @@
 {
   "name": "quico",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A pure JavaScript implementation of QUIC, HTTP/3, QPACK, and WebTransport for Node.js",
   "type": "module",
   "main": "index.cjs",
@@ -78,6 +78,6 @@
   ],
   "dependencies": {
     "flat-ranges": "^2.0.0",
-    "lemon-tls": "^0.2.0"
+    "lemon-tls": "^0.4.1"
   }
 }
