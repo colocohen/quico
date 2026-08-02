@@ -206,7 +206,13 @@ function request(url, options, callback) {
         port: port,
         path: path,
         method: method,
-        headers: Object.assign({}, headers)
+        headers: Object.assign({}, headers),
+        // The H2 and HTTPS fallbacks below honour this; dropping it here made
+        // H3 — alone of the three — unable to talk to self-signed or
+        // private-CA servers, and every such request silently fell back to
+        // TCP (or hung when the server was QUIC-only).
+        rejectUnauthorized: options.rejectUnauthorized,
+        ca: options.ca
       };
 
       // Check Agent for existing QUIC connection (multiplexing).
@@ -217,15 +223,36 @@ function request(url, options, callback) {
       if (agent) {
         h3Opts._managed = true;
         var existing = agent.getH3Connection(hostname, port);
-        if (existing) h3Opts._connection = existing;
+        if (existing) {
+          h3Opts._connection = existing;
+        } else if (agent.joinH3Pending &&
+                   agent.joinH3Pending(hostname, port, function () {
+                     // The lead settled. Retry from the top: on success the
+                     // pool lookup now hits and we multiplex on the lead's
+                     // connection; on failure we become the next lead — a
+                     // serial retry, never a thundering herd.
+                     tryH3(onFail);
+                   })) {
+          return; // parked as a follower until the lead settles
+        }
+        // else: we are the LEAD for this origin. _settleH3Pending below MUST
+        // run on every exit path, or followers park forever.
+      }
+
+      var _pendingLead = !!(agent && !h3Opts._connection);
+      function _settleH3Pending(conn) {
+        if (!_pendingLead) return;
+        _pendingLead = false;
+        if (agent.resolveH3Pending) agent.resolveH3Pending(hostname, port, conn);
+        else if (conn) agent.setH3Connection(hostname, port, conn);
       }
 
       var h3Req = h3Request(h3Opts, function (h3Res) {
         if (responded) return;
 
-        // Store connection for future reuse
-        if (agent && h3Req._connection && !h3Opts._connection) {
-          agent.setH3Connection(hostname, port, h3Req._connection);
+        // Register the connection and wake coalesced followers.
+        if (h3Req._connection && !h3Opts._connection) {
+          _settleH3Pending(h3Req._connection);
         }
 
         var res = new IncomingMessage({
@@ -246,6 +273,7 @@ function request(url, options, callback) {
       });
 
       h3Req.on('error', function (err) {
+        _settleH3Pending(null);   // release followers before failing over
         onFail(err);
       });
 
@@ -254,6 +282,7 @@ function request(url, options, callback) {
       h3Req.end();
 
     } catch (err) {
+      if (typeof _settleH3Pending === 'function') _settleH3Pending(null);
       onFail(err);
     }
   }

@@ -52,6 +52,14 @@ function TLSBridge(options) {
   var originalDcid = options.originalDcid || new Uint8Array(0);
   var localCid = options.localCid || new Uint8Array(0); // client's own SCID
   var hostname = options.hostname || null;
+  // Peer certificate verification. Defaults to true, matching node:tls — but
+  // until now the option was never plumbed through at all, so quico could not
+  // talk to a server whose certificate wasn't signed by a publicly trusted CA:
+  // no local development against self-signed certs, no internal PKI, and no
+  // interop (the QUIC interop runner mints its own CA and addresses hosts as
+  // server4 / server6, so every implementation disables verification there).
+  var rejectUnauthorized = options.rejectUnauthorized !== false;
+  var ca = options.ca || null;
   // ALPN protocol(s) to advertise. Default ['h3']; normalize string → array.
   var supportedAlpns = (function () {
     var a = options.alpn || ['h3'];
@@ -60,7 +68,12 @@ function TLSBridge(options) {
 
   function feedMessage(data) {
     if (!session) {
-      var sessionOpts = { isServer: isServer, SNICallback: options.SNICallback };
+      var sessionOpts = {
+        isServer: isServer,
+        SNICallback: options.SNICallback,
+        rejectUnauthorized: rejectUnauthorized
+      };
+      if (ca) sessionOpts.ca = ca;
       if (!isServer) {
         sessionOpts.sessionId = new Uint8Array(0); // QUIC: no compatibility mode
         if (hostname) sessionOpts.servername = hostname;
@@ -101,7 +114,18 @@ function TLSBridge(options) {
         helloHandled = true; // ClientHello will be generated from this set_context
       }
     }
-    session.message(data);
+    // Only feed real handshake bytes. QUICConnection.connect() calls
+    // feedMessage(new Uint8Array(0)) as a "trigger" to start the handshake,
+    // but the ClientHello is actually built by lemon-tls from set_context()
+    // above, on its own timer — the empty feed was always a no-op in intent.
+    //
+    // It stopped being harmless once lemon-tls hardened parse failures into
+    // fatalAlert(): an empty buffer fails as "truncated u8 at 0", which sets
+    // the session state to 'error' permanently, so the ClientHello timer then
+    // early-returns and NO handshake is ever sent. Guard here rather than
+    // making lemon-tls lenient — rejecting malformed handshake input is the
+    // correct behavior for a TLS stack facing a hostile peer.
+    if (data && data.length > 0) session.message(data);
   }
 
   function setupSessionEvents() {
@@ -217,6 +241,22 @@ function TLSBridge(options) {
 
     session.on('keyUpdate', function (info) {
       ev.emit('keyUpdate', info.direction, info.secret);
+    });
+
+    // NSS SSLKEYLOGFILE lines, forwarded to whoever owns the connection.
+    //
+    // lemon-tls already formats these correctly for TLS 1.3 — including
+    // picking client_random from the right side based on role — and QUIC uses
+    // the identical label set (CLIENT_HANDSHAKE_TRAFFIC_SECRET,
+    // SERVER_TRAFFIC_SECRET_0, ...), so no translation is needed here.
+    //
+    // Note that subscribing has a cost: lemon-tls skips building these strings
+    // entirely while listenerCount('keylog') is 0. We accept that, matching
+    // node:tls, which also always emits 'keylog'. Two short buffers per
+    // handshake is not a measurable expense, and having key logs available
+    // without a rebuild is worth far more when debugging a live capture.
+    session.on('keylog', function (line) {
+      ev.emit('keylog', line);
     });
   }
 

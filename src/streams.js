@@ -291,7 +291,21 @@ class ServerResponse extends Writable {
 class ClientRequest extends Writable {
 
   constructor(options) {
-    super({ highWaterMark: (options && options.highWaterMark) || 64 * 1024 });
+    super({
+      highWaterMark: (options && options.highWaterMark) || 64 * 1024,
+      // Node's Writable default (autoDestroy: true) marks the stream
+      // destroyed the moment the request BODY finishes — i.e. milliseconds
+      // after end(), on every GET. But a ClientRequest outlives its body: the
+      // transport keeps working on it until the response completes, and
+      // node:http's ClientRequest behaves exactly that way. With the default,
+      // `destroyed` stops meaning "aborted" and starts meaning "body written",
+      // and every liveness guard built on it silently kills healthy requests:
+      // the H3→H2/H1 fallback after the 3s timeout hit such a guard and died
+      // for every GET, and coalesced requests parked on a shared connection
+      // being established were dropped at wake-up the same way. abort() still
+      // calls destroy() explicitly, so real cancellations are unaffected.
+      autoDestroy: false
+    });
 
     options = options || {};
 

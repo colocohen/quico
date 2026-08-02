@@ -56,6 +56,17 @@ class Agent extends EventEmitter {
     // Allows multiplexing multiple requests over one QUIC connection
     this._h3Pool = {};
 
+    // Connections still being ESTABLISHED: "host:port" → [waiter callbacks].
+    // Without this third state the pool only knows "have one" / "don't", so N
+    // requests issued in the same tick each see an empty pool and open N
+    // separate QUIC connections to the same origin — N handshakes, N
+    // congestion controllers, zero multiplexing (the QUIC interop runner's
+    // http3 test flags exactly this: "Expected exactly 1 handshake. Got: 3").
+    // The first request to miss the pool becomes the lead and creates the
+    // entry; requests arriving before it finishes park a callback here and
+    // are replayed once the lead settles.
+    this._h3Pending = {};
+
     // Active HTTP/2 sessions: "host:port" → http2.ClientHttp2Session
     this._h2Pool = {};
 
@@ -165,6 +176,42 @@ class Agent extends EventEmitter {
     return conn;
   }
 
+  /**
+   * Coalesce concurrent connection attempts to one origin.
+   *
+   * Returns false if the caller is the LEAD: no connection exists and nobody
+   * else is establishing one. The lead MUST eventually call
+   * resolveH3Pending(host, port, connOrNull) — on success, failure, or
+   * abandonment — or every later request to this origin parks forever.
+   *
+   * Returns true if the caller was parked as a follower; `cb` fires (with no
+   * arguments) once the lead settles, and the caller should simply retry its
+   * pool lookup: on success the connection is already registered, and on
+   * failure the retry becomes the next lead — serial retry, no thundering
+   * herd.
+   */
+  joinH3Pending(host, port, cb) {
+    var key = host + ':' + (port || 443);
+    if (this._h3Pending[key]) {
+      this._h3Pending[key].push(cb);
+      return true;
+    }
+    this._h3Pending[key] = [];
+    return false;
+  }
+
+  /** Lead's settlement. Registers the connection (if any) BEFORE waking the
+   *  waiters, so their retried pool lookups succeed synchronously. */
+  resolveH3Pending(host, port, conn) {
+    var key = host + ':' + (port || 443);
+    var waiters = this._h3Pending[key] || [];
+    delete this._h3Pending[key];
+    if (conn) this.setH3Connection(host, port, conn);
+    for (var i = 0; i < waiters.length; i++) {
+      try { waiters[i](); } catch (e) { /* a waiter's failure is its own */ }
+    }
+  }
+
   setH3Connection(host, port, conn) {
     var key = host + ':' + (port || 443);
     this._h3Pool[key] = conn;
@@ -261,6 +308,17 @@ class Agent extends EventEmitter {
 
   destroy() {
     if (this._sweepTimer) { clearInterval(this._sweepTimer); this._sweepTimer = null; }
+
+    // Wake anyone parked on an in-flight connection attempt; their retried
+    // pool lookup will find nothing and proceed (or fail) on its own.
+    for (var key in this._h3Pending) {
+      var waiters = this._h3Pending[key];
+      delete this._h3Pending[key];
+      for (var i = 0; i < waiters.length; i++) {
+        try { waiters[i](); } catch (e) {}
+      }
+    }
+    this._h3Pending = {};
 
     for (var key in this._h3Pool) {
       try { this._h3Pool[key].quic.close(0, 'agent destroy'); } catch (e) {}

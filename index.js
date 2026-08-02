@@ -18,6 +18,8 @@ import { Agent, globalAgent } from './src/agent.js';
 import { IncomingMessage, ServerResponse, ClientRequest } from './src/streams.js';
 import { createSecureContext } from './src/tls_bridge.js';
 import { WebTransport } from './src/webtransport.js';
+import { createQuicServer } from './src/quic_server.js';
+import { createQuicClientSocket } from './src/quic_socket.js';
 
 export {
   createServer,
@@ -29,7 +31,9 @@ export {
   ServerResponse,
   ClientRequest,
   createSecureContext,
-  WebTransport
+  WebTransport,
+  createQuicServer,
+  createQuicClientSocket
 };
 
 export default {
@@ -42,5 +46,7 @@ export default {
   ServerResponse,
   ClientRequest,
   createSecureContext,
-  WebTransport
+  WebTransport,
+  createQuicServer,
+  createQuicClientSocket
 };

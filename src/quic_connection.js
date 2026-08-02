@@ -40,6 +40,14 @@ import {
 
 import { TLSBridge } from './tls_bridge.js';
 
+// Congestion-control tracing on its own switch. QUICO_DEBUG enables per-packet
+// logging, whose synchronous console.log volume is heavy enough to become the
+// bottleneck it is trying to observe (a 2 MB transfer measured 33s with it on,
+// 3s with it off). The [bbr] round line fires only once per RTT — cheap — so
+// it gets a separate flag that leaves the per-packet spam off.
+var DEBUG_BBR = DEBUG ||
+  (typeof process !== 'undefined' && process.env && !!process.env.QUICO_DEBUG_BBR);
+
 
 function QUICConnection(options) {
   if (!(this instanceof QUICConnection)) return new QUICConnection(options);
@@ -279,6 +287,21 @@ function QUICConnection(options) {
     latest_delivery_rate: null, // bytes/sec acked in the most recent ACK sample
     max_delivery_rate: null,    // peak delivery rate ≈ BtlBw (a CC bandwidth input)
     lost_count: 0,              // packets declared lost by expireInFlight (≈ loss)
+
+    // Expired-but-unacknowledged packets ("limbo"). When expireInFlight times a
+    // packet out, its stream spans are parked here instead of being forgotten.
+    // If the ACK then arrives late — which on a queued path it regularly does,
+    // since the expiry timer races the ACK's arrival — the spans are credited
+    // to `delivered` and marked acked, cancelling any not-yet-sent retransmit.
+    //
+    // Without this, a spuriously-expired packet's bytes vanish from delivery
+    // accounting forever: the ACK finds nothing to credit, BtlBw (computed
+    // from `delivered`) reads a collapsing rate, the pacer follows it down,
+    // and the sender relaxes the queue until ACKs beat the timer again — a
+    // relaxation oscillator, measured against quic-go through the interop
+    // simulator as a 114/4-packets-per-second sawtooth and ~21× duplication.
+    //   pn → { t: expiry wall-time, spans: [[sid, from, to], ...] }
+    expired_unacked: {},
     reorder_in_count: 0,        // app packets that arrived below the highest PN seen (network reordering, peer→us)
 
     // --- BBR-lite measurement (Phase 4b, step 1+2 — measure only, no control). ---
@@ -332,6 +355,10 @@ function QUICConnection(options) {
 
     SNICallback: options.SNICallback || null,
     hostname: options.hostname || null,
+    // Client-side peer certificate verification. Defaults to true (node:tls
+    // semantics); set false for self-signed certs, private CAs, or interop.
+    rejectUnauthorized: options.rejectUnauthorized !== false,
+    ca: options.ca || null,
 
     // ALPN protocol(s) to advertise in the TLS handshake.
     // Defaults to ['h3'] (HTTP/3). Other QUIC-based protocols set their own,
@@ -508,10 +535,18 @@ function QUICConnection(options) {
       originalDcid: context.original_dcid,
       localCid: context.my_cids.length > 0 ? context.my_cids[0] : new Uint8Array(0),
       hostname: context.hostname,
-      alpn: context.alpn
+      alpn: context.alpn,
+      rejectUnauthorized: context.rejectUnauthorized,
+      ca: context.ca
     });
 
     tls.on('send', function (epoch, data) { cryptoWrite(epoch, data); });
+
+    // NSS key log lines (Wireshark / SSLKEYLOGFILE). Surfaced on the
+    // connection so an application can persist them without reaching into the
+    // TLS layer. Without this a QUIC capture is undecryptable, which makes
+    // every wire-level bug an order of magnitude harder to diagnose.
+    tls.on('keylog', function (line) { ev.emit('keylog', line); });
 
     // Peer's QUIC transport parameters (parsed from the TLS 0x39 extension). These
     // replace hardcoded defaults: the peer's flow-control limit, ACK-delay scaling,
@@ -712,6 +747,20 @@ function QUICConnection(options) {
         context.app_read = { key: next.key, iv: next.iv, hp: readKeys.hp };
         context.app_read_secret = next.secret;
         context.read_key_phase = !context.read_key_phase;
+
+        // RFC 9001 §6.2: a key update is BIDIRECTIONAL. Having accepted the
+        // peer's new phase for reading, we MUST move our send keys to the same
+        // phase before acknowledging anything received under it. Updating only
+        // the read side means our very next ACK — which covers the peer's
+        // new-phase packets — goes out under the OLD keys, and a conforming
+        // peer treats that as KEY_UPDATE_ERROR and kills the connection.
+        // (Measured against quic-go: connection closed ~3s after its routine
+        // post-handshake key update, exactly when our stale-phase ACK landed.)
+        // set_context({key_phase}) drives the existing machinery: it derives
+        // next-generation write keys from app_write_secret and flips the KP
+        // bit used by the encrypt path, so every packet from here on — the
+        // ACK included — is protected under the new phase.
+        set_context({ key_phase: !context.key_phase });
       }
     }
 
@@ -863,6 +912,25 @@ function QUICConnection(options) {
 
     if (ackEliciting) {
       flat_ranges.add(context.pending_ack[space], [packetNumber, packetNumber + 1]);
+
+      // Cap the acknowledged ranges (RFC 9000 §13.2.4 explicitly allows
+      // acking a subset). Under loss, packet-number gaps never close — a lost
+      // PN is gone forever; its DATA returns under a new PN — so every loss
+      // event mints one more range that would otherwise live here for the
+      // rest of the connection. Unpruned, the ACK frame grows with the loss
+      // count until it crosses the MTU and the ACK cannot be sent AT ALL, at
+      // which point the peer (correctly) stalls and idle-times-out. Measured
+      // against a quiche server through the interop simulator: 485 losses in
+      // 7s of line-rate transfer inflated our ACK packets 325B→1017B second
+      // by second, ACKs died at t≈8s, and quiche collected the connection.
+      // Dropping the LOWEST ranges is safe: those packets were received and
+      // have been acknowledged in every ACK frame sent since; anything the
+      // peer still considers unacked it will retransmit as new data under a
+      // fresh, high PN that the surviving ranges cover.
+      var pa = context.pending_ack[space];
+      var MAX_ACK_RANGES = 32;
+      if (pa.length > MAX_ACK_RANGES * 2) pa.splice(0, pa.length - MAX_ACK_RANGES * 2);
+
       var ackFrame = ranges_to_ack_frame(context.pending_ack[space], null, 0);
       if (ackFrame) {
         sendFrames(space, [ackFrame]);
@@ -917,6 +985,7 @@ function QUICConnection(options) {
     var sid = frame.id;
     if (!(sid in context.recv_streams)) {
       context.recv_streams[sid] = { chunks: {}, ranges: [], total_size: 0, flushed_to: 0,
+        fin_emitted: false,   // end-of-stream delivered to the app exactly once
         max_recv_offset: 0,   // highest offset seen — the peer's FC usage on this stream
         local_max_stream_data: context.local_initial_max_stream_data };
     }
@@ -1000,11 +1069,30 @@ function QUICConnection(options) {
       parts.push(skip > 0 ? chunk.subarray(skip) : chunk);
       offset = chunkStart + chunk.byteLength;
     }
-    if (parts.length === 0) return;
+    if (parts.length === 0) {
+      // No bytes to deliver — but the stream may just have COMPLETED. A peer
+      // whose final write ends exactly on a packet boundary closes the stream
+      // with a zero-length FIN-only frame (quic-go does this for any body
+      // that is a multiple of its write-buffer size — a 64 KiB file, say).
+      // That frame stores total_size above and lands here with an empty chunk
+      // map; returning without emitting means the FIN evaporates: no more
+      // frames will ever arrive to re-trigger this flush (retransmits of the
+      // empty frame take this same path), the H3 layer never sees http_end,
+      // and the request above it waits forever. Emit the end-of-stream event
+      // with an empty payload instead — every consumer (h3, hq-interop,
+      // tls_bridge) already guards zero-length data.
+      if (stream.total_size > 0 && offset >= stream.total_size && !stream.fin_emitted) {
+        stream.fin_emitted = true;
+        ev.emit('stream', Number(sid), new Uint8Array(0), true);
+        setTimeout(function () { delete context.recv_streams[sid]; }, 100);
+      }
+      return;
+    }
     var delivered = offset - stream.flushed_to;   // in-order bytes handed to the app now
     stream.flushed_to = offset;
     var data = parts.length === 1 ? parts[0] : concatUint8Arrays(parts);
     var fin = (stream.total_size > 0 && offset >= stream.total_size);
+    if (fin) stream.fin_emitted = true;   // a late FIN-only retransmit must not fire a second end
     ev.emit('stream', Number(sid), data, fin);
     if (fin) setTimeout(function () { delete context.recv_streams[sid]; }, 100);
 
@@ -1135,7 +1223,19 @@ function QUICConnection(options) {
         // (RFC 9002 §5.1). sending_app_pn_in_flight holds data-carrying PNs —
         // the closest signal until sent_packets tracks ack_eliciting per packet
         // (so PING-only packets are not yet used as RTT samples).
-        if (context.sending_app_pn_in_flight.has(largest_pn)) {
+        //
+        // Expired-but-limboed packets ALSO qualify. QUIC packet numbers are
+        // never reused, so a late ACK is unambiguous (no TCP retransmission
+        // ambiguity), and limbo membership proves the packet carried data.
+        // Excluding them creates a self-sealing failure: an expiry timer that
+        // is too short kills packets before their ACKs arrive → the ACKs are
+        // then barred from producing RTT samples → srtt/rttvar keep reflecting
+        // the pre-queue path → the timer never widens → every packet keeps
+        // expiring. The queue-inflated samples these late ACKs carry are
+        // exactly the evidence the timer needs in order to grow past the real
+        // arrival time; one such sample spikes rttvar and ends the spiral.
+        if (context.sending_app_pn_in_flight.has(largest_pn) ||
+            (largest_pn in context.expired_unacked)) {
           var now = Date.now();
           // ACK Delay is microseconds scaled by 2^ack_delay_exponent; use the peer's
           // value (parsed from its transport params; defaults to 3 until then).
@@ -1156,6 +1256,35 @@ function QUICConnection(options) {
           if (pn >= ackedRanges[ri] && pn <= ackedRanges[ri + 1]) { ackedPns.push(pn); break; }
         }
       }
+      // Bytes of [from,to) already recorded as acked — the portion NOT to
+      // credit again. Guards against double-counting when both the original
+      // transmission and a retransmission of the same range end up ACKed
+      // (routine once late ACKs for expired packets are honoured).
+      function ackedOverlap(flat, from, to) {
+        var ov = 0;
+        for (var oi = 0; oi < flat.length; oi += 2) {
+          if (flat[oi] >= to) break;
+          var a = Math.max(from, flat[oi]), b = Math.min(to, flat[oi + 1]);
+          if (b > a) ov += b - a;
+        }
+        return ov;
+      }
+
+      function creditSpan(st, from, to) {
+        var fresh = (to - from) - ackedOverlap(st.acked_ranges, from, to);
+        flat_ranges.add(st.acked_ranges, [from, to]);
+        return fresh > 0 ? fresh : 0;
+      }
+
+      function retireStreamIfComplete(sid, st) {
+        if (st.total_size > 0 && st.acked_ranges.length === 2 &&
+            st.acked_ranges[0] === 0 && st.acked_ranges[1] >= st.total_size) {
+          delete context.send_streams[sid];
+          delete context.remote_max_stream_data_by_sid[sid];
+          delete context.last_stream_blocked_sent[sid];
+        }
+      }
+
       var newlyAckedBytes = 0;   // goodput bytes confirmed by this ACK (for delivery_rate)
       var oldestAckedPn = null;  // smallest newly-acked PN → longest delivery interval
       for (var ai = 0; ai < ackedPns.length; ai++) {
@@ -1165,17 +1294,34 @@ function QUICConnection(options) {
         for (var sid in context.send_streams) {
           var st = context.send_streams[sid];
           if (st.in_flight_ranges && apn in st.in_flight_ranges) {
-            newlyAckedBytes += st.in_flight_ranges[apn][1] - st.in_flight_ranges[apn][0];
-            flat_ranges.add(st.acked_ranges, st.in_flight_ranges[apn]);
+            newlyAckedBytes += creditSpan(st, st.in_flight_ranges[apn][0], st.in_flight_ranges[apn][1]);
             delete st.in_flight_ranges[apn];
-            if (st.total_size > 0 && st.acked_ranges.length === 2 &&
-                st.acked_ranges[0] === 0 && st.acked_ranges[1] >= st.total_size) {
-              delete context.send_streams[sid];
-              delete context.remote_max_stream_data_by_sid[sid];
-              delete context.last_stream_blocked_sent[sid];
-            }
+            retireStreamIfComplete(sid, st);
           }
         }
+      }
+
+      // Late ACKs for packets the expiry timer already gave up on. The data
+      // DID arrive — the timer was simply wrong — so: credit the goodput
+      // (repairing the BtlBw signal), mark the spans acked (cancelling any
+      // retransmit that hasn't left yet), and take back the loss we counted.
+      for (var lpn in context.expired_unacked) {
+        var lnum = Number(lpn);
+        var hit = false;
+        for (var ri2 = 0; ri2 < ackedRanges.length; ri2 += 2) {
+          if (lnum >= ackedRanges[ri2] && lnum <= ackedRanges[ri2 + 1]) { hit = true; break; }
+        }
+        if (!hit) continue;
+        var rec = context.expired_unacked[lpn];
+        for (var si2 = 0; si2 < rec.spans.length; si2++) {
+          var sidL = rec.spans[si2][0];
+          var stL = context.send_streams[sidL];
+          if (!stL) continue;   // stream already fully acked via a retransmit
+          newlyAckedBytes += creditSpan(stL, rec.spans[si2][1], rec.spans[si2][2]);
+          retireStreamIfComplete(sidL, stL);
+        }
+        delete context.expired_unacked[lpn];
+        if (context.lost_count > 0) context.lost_count--;   // it wasn't a loss after all
       }
 
       // Cumulative delivered advances by this ACK's goodput; the delivery clock
@@ -1295,7 +1441,7 @@ function QUICConnection(options) {
             Math.round(targetRate / context.current_limit_packet_payload),
             1, context.max_limit_packets_per_sec);
         }
-        if (DEBUG && context.bbr_bdp !== null) {
+        if (DEBUG_BBR && context.bbr_bdp !== null) {
           console.log('[bbr] round=' + context.bbr_round_count + ' ' + context.bbr_state +
             ' BtlBw=' + (context.bbr_btlbw * 8 / 1e6).toFixed(2) + 'Mbps' +
             ' RTprop=' + context.bbr_min_rtt + 'ms' +
@@ -1661,7 +1807,21 @@ function QUICConnection(options) {
   // timeout while the peer isn't ACKing, so a dead path isn't flooded.
   function expireInFlight() {
     var now = Date.now();
-    var base = (context.srtt === null) ? 333 : context.srtt + Math.max(4 * context.rttvar, 1);
+    // RFC 9002 §6.2.1: PTO = srtt + max(4·rttvar, granularity) + max_ack_delay.
+    //
+    // The max_ack_delay term is NOT optional. The peer is allowed to sit on an
+    // ACK for up to that long (quic-go uses its full 25ms), so on a stable
+    // 30ms-RTT path the ACK legitimately arrives up to ~55ms after the send —
+    // while srtt + 4·rttvar alone converges to ~31ms as rttvar shrinks. Every
+    // packet then "expires" moments before its ACK lands: the ACK finds the PN
+    // already forgotten, the delivered counter never advances, BtlBw (computed
+    // from delivered) collapses, the pacer follows it down, and the data is
+    // resent anyway. Measured against quic-go through the interop simulator:
+    // each byte crossed the wire ~21×, goodput 54 KB/s on a 10 Mbps link.
+    // With the term restored the same path runs at line rate.
+    var base = (context.srtt === null)
+      ? 333
+      : context.srtt + Math.max(4 * context.rttvar, 1) + context.max_ack_delay;
 
     // Global backoff: while no ACK has arrived, widen the timeout geometrically.
     // Resets the instant an ACK updates last_ack_time.
@@ -1687,6 +1847,13 @@ function QUICConnection(options) {
           expired = (now - context.sending_app_pn_history[idx][0] >= timeout);
         }
         if (expired) {
+          // Park the span before forgetting it, so a late ACK can still be
+          // honoured (see expired_unacked above). Keyed per-PN; a packet that
+          // carried several streams accumulates one span per stream.
+          var limbo = context.expired_unacked[pnum];
+          if (!limbo) limbo = context.expired_unacked[pnum] = { t: now, spans: [] };
+          limbo.spans.push([sid, st.in_flight_ranges[pn][0], st.in_flight_ranges[pn][1]]);
+
           delete st.in_flight_ranges[pn];        // → becomes "missing" again, resent next pass
           // Count the loss once per packet: the Set holds each PN once, so the
           // first stream to expire it returns true; later same-PN deletes (a
@@ -1694,6 +1861,13 @@ function QUICConnection(options) {
           if (context.sending_app_pn_in_flight.delete(pnum)) context.lost_count++;
         }
       }
+    }
+
+    // Bound the limbo table: entries older than ~8 timeouts (min 10s) will
+    // never see their ACK — the peer retires ACK ranges long before that.
+    var limboCutoff = now - Math.max(10000, timeout * 8);
+    for (var lpn in context.expired_unacked) {
+      if (context.expired_unacked[lpn].t < limboCutoff) delete context.expired_unacked[lpn];
     }
   }
 

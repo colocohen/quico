@@ -373,6 +373,23 @@ function encrypt_quic_packet(packetType, encodedFrames, writeKey, writeIv, write
 function decrypt_quic_packet(array, readKey, readIv, readHp, ownCid, largestPn) {
   if (!(array instanceof Uint8Array)) throw new Error('Invalid input');
 
+  // Work on a private copy — this function must not mutate its input.
+  //
+  // remove_header_protection XORs the first byte and the packet-number bytes
+  // IN PLACE. That is fine for exactly one decryption attempt, but the key
+  // update path retries this function on the same packet with derived keys
+  // (RFC 9001 §6): the second call re-applies the (unchanged) HP mask to a
+  // header that is already unprotected, re-scrambling it — and reads pnLength
+  // from the scrambled byte, so it may even XOR the wrong number of bytes.
+  // The retry then fails even with the correct keys, every phase-flipped
+  // packet is dropped, and the connection goes permanently deaf in that
+  // direction. Measured against quic-go (which key-updates shortly after
+  // handshake confirmation): ACK processing died at t≈2s, BBR froze mid-
+  // startup, and the sender spent 58s retransmitting one 8 KB band 29 times.
+  //
+  // One ≤1500 B copy per decryption attempt is noise next to the AEAD itself.
+  array = array.slice();
+
   var firstByte = array[0];
   var isShort = (firstByte & 0x80) === 0;
 

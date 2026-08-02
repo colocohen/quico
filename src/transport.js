@@ -155,6 +155,94 @@ function parse_quic_datagram(array) {
 
 
 // ============================================================
+//  Version Negotiation (RFC 9000 §6, §17.2.1)
+// ============================================================
+
+/** QUIC versions this implementation can actually speak. */
+var SUPPORTED_VERSIONS = [0x00000001];
+
+/**
+ * Is this a version we can handle?
+ * Version 0 identifies a Version Negotiation packet, not a real version.
+ */
+function is_supported_version(version) {
+  return SUPPORTED_VERSIONS.indexOf(version >>> 0) !== -1;
+}
+
+/**
+ * Build a Version Negotiation packet (RFC 9000 §17.2.1).
+ *
+ * A server MUST send one when it receives a long-header packet carrying a
+ * version it does not support — it is how a client discovers what the server
+ * speaks, and how any QUIC prober checks whether a server is alive without
+ * completing a handshake. The interop runner's simulator does exactly that
+ * before starting a test, so without this the server looks dead.
+ *
+ * The packet is unusual: no encryption, no packet number, no frames, and no
+ * connection state. It is valid only as an immediate response.
+ *
+ * IMPORTANT: the connection IDs are swapped. The DCID we send is the SCID we
+ * received, and vice versa — the client matches the reply against its own
+ * Source CID, so getting this backwards makes the packet be ignored.
+ *
+ *   byte 0    1 (long header) + 7 unpredictable bits
+ *   1..4      version 0x00000000
+ *   5         DCID length, then DCID
+ *   ...       SCID length, then SCID
+ *   ...       list of supported versions, 4 bytes each
+ *
+ * @param {Uint8Array} recvDcid  DCID from the client's packet (becomes our SCID)
+ * @param {Uint8Array} recvScid  SCID from the client's packet (becomes our DCID)
+ */
+function build_version_negotiation(recvDcid, recvScid) {
+  var dcid = recvScid || new Uint8Array(0);
+  var scid = recvDcid || new Uint8Array(0);
+
+  // RFC 9000 §17.2.1: the low 7 bits are unused and SHOULD be random, so that
+  // clients don't come to depend on a fixed value.
+  var first = 0x80 | (Math.floor(Math.random() * 128) & 0x7f);
+
+  var versions = SUPPORTED_VERSIONS.slice();
+
+  // A reserved ("greased") version, per RFC 9000 §6.3. Its pattern is
+  // 0x?a?a?a?a, and no endpoint will ever support it. Including one keeps
+  // clients honest: any client that assumes it understands every version in
+  // the list will break here rather than in the field.
+  var grease = ((Math.floor(Math.random() * 16) << 28) |
+                (0x0a << 24) |
+                (Math.floor(Math.random() * 16) << 20) |
+                (0x0a << 16) |
+                (Math.floor(Math.random() * 16) << 12) |
+                (0x0a << 8) |
+                (Math.floor(Math.random() * 16) << 4) |
+                0x0a) >>> 0;
+  versions.push(grease);
+
+  var out = new Uint8Array(1 + 4 + 1 + dcid.length + 1 + scid.length + versions.length * 4);
+  var o = 0;
+
+  out[o++] = first;
+  out[o++] = 0; out[o++] = 0; out[o++] = 0; out[o++] = 0;   // version 0
+
+  out[o++] = dcid.length;
+  out.set(dcid, o); o += dcid.length;
+
+  out[o++] = scid.length;
+  out.set(scid, o); o += scid.length;
+
+  for (var i = 0; i < versions.length; i++) {
+    var v = versions[i] >>> 0;
+    out[o++] = (v >>> 24) & 0xff;
+    out[o++] = (v >>> 16) & 0xff;
+    out[o++] = (v >>> 8) & 0xff;
+    out[o++] = v & 0xff;
+  }
+
+  return out;
+}
+
+
+// ============================================================
 //  QUIC Frame encoding (RFC 9000 §12.4)
 // ============================================================
 
@@ -656,6 +744,11 @@ export {
   // Datagram/packet parsing
   parse_quic_datagram,
   parse_quic_packet,
+
+  // Version negotiation
+  SUPPORTED_VERSIONS,
+  is_supported_version,
+  build_version_negotiation,
 
   // Frame encode/decode
   encode_quic_frames,

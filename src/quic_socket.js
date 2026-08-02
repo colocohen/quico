@@ -27,6 +27,16 @@ import { QUICConnection } from './quic_connection.js';
  * opts:
  *   remoteIp, remotePort   — where to send packets
  *   hostname               — SNI / :authority for the QUIC/TLS handshake
+ *   alpn                   — ALPN protocol(s) to offer. String or array.
+ *                            Defaults to ['h3']. Non-HTTP/3 consumers pass
+ *                            their own (e.g. ['hq-interop'] for HTTP/0.9,
+ *                            ['doq'] for DNS-over-QUIC).
+ *   rejectUnauthorized      — verify the server certificate (default true)
+ *   ca                      — CA certificate(s) for verification
+ *   onSocket(quic, socket)  — called as soon as the QUICConnection exists,
+ *                            BEFORE the handshake starts. Use this to attach
+ *                            listeners that must observe the handshake, such
+ *                            as 'keylog'. onConnect is too late for those.
  *   onConnect(quic, socket) — called once the QUIC handshake completes
  *   onClose()              — called when the connection closes (the socket is
  *                            already closed by the time this runs)
@@ -49,7 +59,48 @@ function createQuicClientSocket(opts) {
   });
 
   udpSocket.bind(0, function () {
-    quic = new QUICConnection({ isServer: false, hostname: opts.hostname });
+    // Grow the kernel socket buffers before any traffic flows.
+    //
+    // Node's defaults are small (and notably small on Windows). When the send
+    // buffer overflows, the datagram is dropped locally with no error — it
+    // looks exactly like network loss, so the loss-recovery machinery kicks in
+    // and the connection crawls. This was the failure that killed the third
+    // pacer-calibration attempt (see LOSS_PTO_PLAN 7.4): larger bursts spilled
+    // over the buffer and turned a lossless link into a slow one.
+    //
+    // Wrapped in try/catch because the call can throw on platforms that cap
+    // the size; failing to enlarge the buffer is not a reason to fail the
+    // connection.
+    try { udpSocket.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
+    try { udpSocket.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
+
+    quic = new QUICConnection({
+      isServer: false,
+      hostname: opts.hostname,
+      // Without this the client always offered 'h3' regardless of what the
+      // caller wanted, because TLSBridge falls back to ['h3'] when alpn is
+      // undefined. Normalize a bare string into an array here so callers can
+      // pass either form.
+      alpn: (function () {
+        var a = opts.alpn || ['h3'];
+        return Array.isArray(a) ? a : [a];
+      })(),
+      // Defaults to true. Pass false for self-signed certificates, or supply
+      // `ca` for a private CA.
+      rejectUnauthorized: opts.rejectUnauthorized !== false,
+      ca: opts.ca || null
+    });
+
+    // Hand the connection to the caller BEFORE connect() runs.
+    //
+    // onConnect fires after the handshake, which is too late for anything that
+    // has to observe the handshake itself. Key logging is the concrete case:
+    // lemon-tls skips building NSS lines while nothing is listening, and the
+    // handshake secrets are emitted during connect() — so a listener attached
+    // in onConnect receives nothing at all, and the client half of a capture
+    // is undecryptable. onSocket gives callers a hook at the only moment that
+    // works.
+    if (opts.onSocket) opts.onSocket(quic, udpSocket);
 
     quic.on('packet', function (data) {
       udpSocket.send(data, opts.remotePort, opts.remoteIp, function (err) {

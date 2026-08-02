@@ -34,6 +34,13 @@ function request(options, callback) {
   }
 
   var hostname = options.hostname || options.host || 'localhost';
+  // Certificate verification options, forwarded to the QUIC/TLS layer.
+  // Defaults to verifying (node:tls semantics); without this passthrough the
+  // option dies here and H3 connections can never opt out — which makes the
+  // one transport this library exists for the only one that can't reach a
+  // self-signed or private-CA server (H2/H1.1 fallbacks honour the option).
+  var rejectUnauthorized = options.rejectUnauthorized !== false;
+  var ca = options.ca || null;
   var port = options.port || 443;
   var path = options.path || '/';
   var method = (options.method || 'GET').toUpperCase();
@@ -144,6 +151,8 @@ function request(options, callback) {
       remoteIp: remoteIp,
       remotePort: remotePort,
       hostname: hostname,
+      rejectUnauthorized: rejectUnauthorized,
+      ca: ca,
 
       onError: function (err) {
         emit(reqListeners, 'error', err);

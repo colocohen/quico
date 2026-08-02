@@ -14,7 +14,11 @@
 
 import dgram from 'node:dgram';
 import { DEBUG, Emitter } from './utils.js';
-import { parse_quic_datagram } from './transport.js';
+import {
+  parse_quic_datagram,
+  is_supported_version,
+  build_version_negotiation
+} from './transport.js';
 import { QUICConnection } from './quic_connection.js';
 import { createSecureContext } from './tls_bridge.js';
 
@@ -116,7 +120,40 @@ function createQuicServer(options) {
     // routing decision covers them all — and the datagram is parsed only once
     // here, handing the parsed packets straight to the connection (previously
     // each packet's raw bytes were re-parsed inside feedDatagram).
-    var connId = findConnectionId(packets[0], addressKey);
+    // ── Version Negotiation (RFC 9000 §6) ──
+    // Must happen before any connection is created. A long-header packet
+    // carrying a version we don't speak gets a Version Negotiation packet in
+    // reply — that is how a client discovers what we support, and how a prober
+    // checks we are alive without completing a handshake.
+    //
+    // Getting this wrong is silent and confusing: without it, findConnectionId
+    // below happily creates a connection for the unknown-version Initial, maps
+    // the address to it, and every subsequent probe is routed into a
+    // connection that cannot do anything with it. The peer sees no reply at
+    // all and concludes the server is down.
+    var firstPkt = packets[0];
+    if (firstPkt.form === 'long' &&
+        firstPkt.type !== 'version_negotiation' &&
+        !is_supported_version(firstPkt.version)) {
+
+      // Anti-amplification (RFC 9000 §14.1): only answer datagrams that are
+      // at least 1200 bytes, so we can't be used to reflect traffic at a
+      // spoofed source. A genuine Initial is always padded to that size.
+      if (data.length < 1200) {
+        if (DEBUG) console.log('[qserver] unsupported version 0x' +
+          firstPkt.version.toString(16) + ' in a short datagram (' +
+          data.length + 'B) — dropping without VN');
+        return;
+      }
+
+      var vn = build_version_negotiation(firstPkt.dcid, firstPkt.scid);
+      if (DEBUG) console.log('[qserver] version 0x' +
+        firstPkt.version.toString(16) + ' unsupported — sending Version Negotiation');
+      sendUdp(fromIp, fromPort, vn);
+      return;
+    }
+
+    var connId = findConnectionId(firstPkt, addressKey);
     if (connId === null) return;  // stray/unmatched non-Initial packet — drop
 
     if (!(connId in connections)) {
@@ -205,28 +242,49 @@ function createQuicServer(options) {
     if (isExternal) {
       // External sockets already bound — wire up incoming messages.
       // Starting the sweep timer is safe here (idempotent check below).
+      // Externally-owned sockets are already bound, so enlarge them here.
+      // The owner may not have done it, and the cost of asking twice is nil.
       if (externalSocket4) {
         externalSocket4.on('message', onUdpMessage);
+        try { externalSocket4.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
+        try { externalSocket4.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
       }
       if (externalSocket6) {
         externalSocket6.on('message', onUdpMessage);
+        try { externalSocket6.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
+        try { externalSocket6.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
       }
       startSweepTimer();
       if (typeof callback === 'function') setImmediate(callback);
       return;
     }
 
+    // Grow the kernel socket buffers once the socket is bound.
+    //
+    // Node's defaults are small. A full send buffer drops the datagram
+    // locally and silently — indistinguishable from network loss, so loss
+    // recovery engages and throughput collapses. See LOSS_PTO_PLAN 7.4: this
+    // is what defeated the third pacer-calibration attempt.
+    //
+    // try/catch because some platforms cap the value and throw; not being
+    // able to enlarge the buffer must not stop the server from listening.
+    function growBuffers(sock) {
+      try { sock.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
+      try { sock.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
+    }
+
     udp4 = dgram.createSocket('udp4');
     udp4.on('message', onUdpMessage);
     udp4.on('error', function (err) { ev.emit('error', err); });
     var host4 = host.indexOf('.') !== -1 ? host : '0.0.0.0';
-    udp4.bind(port, host4);
+    udp4.bind(port, host4, function () { growBuffers(udp4); });
 
     udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
     udp6.on('message', onUdpMessage);
     udp6.on('error', function (err) { ev.emit('error', err); });
     var host6 = host.indexOf(':') !== -1 ? host : '::';
     udp6.bind(port, host6, function () {
+      growBuffers(udp6);
       if (typeof callback === 'function') callback();
     });
 
