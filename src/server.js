@@ -14,11 +14,12 @@
 
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
-import http2 from 'node:http2';
-import nodeHttps from 'node:https';
-import nodeTls from 'node:tls';
+import lemonTls from 'lemon-tls';
 
 import { createServer as createH3Server } from './h3_server.js';
+import { createServer as createH2Server } from './h2_server.js';
+import { createServer as createH1Server } from './h1_server.js';
+import { createTcpListener } from './tcp_listener.js';
 import { IncomingMessage, ServerResponse, _makeSocketStub } from './streams.js';
 
 
@@ -169,92 +170,91 @@ function createServer(options, handler) {
   });
 
 
+
+  // RFC 9220: WebSocket over HTTP/3 arrives as extended CONNECT on a QUIC
+  // stream and surfaces on the same 'upgrade' event as HTTP/1.1 and HTTP/2.
+  // Three transports, one event, one WebSocketServer.
+  h3srv.on('upgrade', function (req, stream, head) { ev.emit('upgrade', req, stream, head); });
+
   // ============================================================
-  //  TCP — HTTP/2 and/or HTTP/1.1
+  //  TCP — HTTP/2 and HTTP/1.1, both ours.
+  //
+  //  Previously node:http2 and node:https. They are gone: h2_server and
+  //  h1_server implement the same two protocols, and tcp_listener owns the
+  //  socket and the ALPN choice between them — one port, one certificate, one
+  //  preference order, decided in one place.
+  //
+  //  The three request paths now converge completely. h3_server, h2_server and
+  //  h1_server each hand the application the same IncomingMessage /
+  //  ServerResponse pair from streams.js, so `handler` cannot tell which
+  //  protocol produced a request except by reading req.httpVersion — which is
+  //  exactly the property that lets Express and Fastify run unchanged over all
+  //  three.
   // ============================================================
 
   var tcpServer = null;
 
   function startTcpServer(listenPort, host, callback) {
     var hasTlsCredentials = (tlsKey && tlsCert) || options.SNICallback;
-    if (!needsTcp || !hasTlsCredentials) {
-      if (callback) callback();
-      return;
-    }
+    if (!needsTcp) { if (callback) callback(); return; }
 
-    // Bridge SNICallback: detect context type and route accordingly.
-    //   quico context (_nodeContext) → use pre-built node:tls context
-    //   quico context (_rawKey)      → build node:tls context from stored creds
-    //   node:tls context             → use directly (someone used tls.createSecureContext)
-    var tcpSniCallback = null;
-    if (options.SNICallback) {
-      tcpSniCallback = function (servername, cb) {
-        options.SNICallback(servername, function (err, ctx) {
-          if (err) return cb(err);
-          if (!ctx) return cb(new Error('SNICallback returned null'));
-
-          // 1. Pre-built node:tls context (fastest path)
-          if (ctx._nodeContext) {
-            return cb(null, ctx._nodeContext);
-          }
-          // 2. Raw key/cert stored — build node:tls context
-          if (ctx._rawKey && ctx._rawCert) {
-            var nodeOpts = { key: ctx._rawKey, cert: ctx._rawCert };
-            if (ctx._rawCa) nodeOpts.ca = ctx._rawCa;
-            try { return cb(null, nodeTls.createSecureContext(nodeOpts)); }
-            catch (e) { return cb(e); }
-          }
-          // 3. Assume it's already a node:tls context (tls.createSecureContext)
-          cb(null, ctx);
-        });
-      };
-    }
-
+    // Alt-Svc advertises HTTP/3 on the same authority (RFC 9114 §3.3), which
+    // is how a browser that arrived over TCP learns to try QUIC next time.
     var altSvcHeader = 'h3=":' + listenPort + '"; ma=86400';
 
+    var shared = {
+      altSvc: altSvcHeader,
+      maxHeaderListSize: options.maxHeaderListSize,
+      headersTimeout: options.headersTimeout,
+      keepAliveTimeout: options.keepAliveTimeout
+    };
+
+    function onRequest(req, res) {
+      if (typeof handler === 'function') handler(req, res);
+      ev.emit('request', req, res);
+    }
+
+    tcpServer = createTcpListener({
+      // Cleartext when there are no credentials: a dev server, or a service
+      // behind a terminating proxy. Without TLS there is no ALPN, so
+      // tcp_listener tells h2c from HTTP/1.1 by looking for the connection
+      // preface instead.
+      tls: hasTlsCredentials ? lemonTls : null,
+      key: tlsKey,
+      cert: tlsCert,
+      ca: tlsCa,
+      SNICallback: options.SNICallback
+    });
+
+    // Registration order is the server's ALPN preference: h2 if the client can,
+    // HTTP/1.1 if it must.
     if (enableH2) {
-      // ---- HTTP/2 (+ optional HTTP/1.1) via node:http2 ----
-      var tcpOpts = {
-        allowHTTP1: enableH1,
-        settings: { enablePush: false }
-      };
-      if (tlsKey) tcpOpts.key = tlsKey;
-      if (tlsCert) tcpOpts.cert = tlsCert;
-      if (tlsCa) tcpOpts.ca = tlsCa;
-      if (tcpSniCallback) tcpOpts.SNICallback = tcpSniCallback;
-
-      tcpServer = http2.createSecureServer(tcpOpts);
-
-      tcpServer.on('request', function (req, res) {
-        res.setHeader('alt-svc', altSvcHeader);
-        if (typeof handler === 'function') handler(req, res);
-        ev.emit('request', req, res);
-      });
-
-    } else if (enableH1) {
-      // ---- HTTP/1.1 only via node:https ----
-      var tcpOpts = {};
-      if (tlsKey) tcpOpts.key = tlsKey;
-      if (tlsCert) tcpOpts.cert = tlsCert;
-      if (tlsCa) tcpOpts.ca = tlsCa;
-      if (tcpSniCallback) tcpOpts.SNICallback = tcpSniCallback;
-
-      tcpServer = nodeHttps.createServer(tcpOpts);
-
-      tcpServer.on('request', function (req, res) {
-        res.setHeader('alt-svc', altSvcHeader);
-        if (typeof handler === 'function') handler(req, res);
-        ev.emit('request', req, res);
-      });
+      var h2srv = createH2Server(shared, onRequest);
+      h2srv.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
+      // Extended CONNECT (RFC 8441) arrives on the same 'upgrade' event as an
+      // HTTP/1.1 Upgrade, so a WebSocketServer attached to this server serves
+      // both without knowing which carried the connection.
+      h2srv.on('upgrade', function (req, stream, head) { ev.emit('upgrade', req, stream, head); });
+      tcpServer.register('h2', h2srv.handleConnection);
+    }
+    if (enableH1) {
+      var h1srv = createH1Server(shared, onRequest);
+      h1srv.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
+      // 'upgrade' is how WebSocket (and anything else that switches protocols)
+      // gets the raw socket. Same signature as node:http, so the `ws` package
+      // works over this server unchanged.
+      h1srv.on('upgrade', function (req, socket, head) { ev.emit('upgrade', req, socket, head); });
+      tcpServer.register('http/1.1', h1srv.handleConnection);
     }
 
-    if (tcpServer) {
-      tcpServer.on('error', function (err) { ev.emit('error', err); });
-      var tcpHost = host || '0.0.0.0';
-      tcpServer.listen(listenPort, tcpHost, callback);
-    } else {
-      if (callback) callback();
-    }
+    tcpServer.on('error', function (err) { ev.emit('error', err); });
+    tcpServer.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
+    // Fires before the TLS handshake — see tcp_listener. Same name and same
+    // argument as node:net, so an IP screen written for node:http works here.
+    tcpServer.on('connection', function (sock) { ev.emit('connection', sock); });
+
+    var tcpHost = host || '0.0.0.0';
+    tcpServer.listen(listenPort, tcpHost, callback);
   }
 
 
@@ -264,7 +264,13 @@ function createServer(options, handler) {
 
   function listen(listenPort, host, callback) {
     if (typeof host === 'function') { callback = host; host = null; }
-    port = listenPort || 443;
+
+    // `|| 443` turned port 0 into 443. Port 0 is not "no port": it is the
+    // documented way to ask the OS for a free one, which every test harness
+    // and every process that binds more than one server relies on. The old
+    // form silently bound 443 instead — and on a machine where that needs
+    // privileges, failed with EACCES for a caller that never mentioned 443.
+    port = (listenPort === undefined || listenPort === null) ? 443 : listenPort;
 
     var remaining = needsTcp ? 2 : 1;
     var called = false;
@@ -305,6 +311,8 @@ function createServer(options, handler) {
   }
 
   function address() {
+    // The TCP listener knows the port the OS actually assigned, which is the
+    // only useful answer after listen(0).
     if (tcpServer && typeof tcpServer.address === 'function') {
       var addr = tcpServer.address();
       if (addr) return addr;
@@ -327,9 +335,10 @@ function createServer(options, handler) {
     removeListener: function (name, fn) { ev.removeListener(name, fn); return server; },
     emit: function () { ev.emit.apply(ev, arguments); return server; },
     setTimeout: function (msecs, callback) {
-      if (tcpServer && typeof tcpServer.setTimeout === 'function') {
-        tcpServer.setTimeout(msecs, callback);
-      }
+      // node:http exposes this; ours is configured per protocol layer at
+      // construction (headersTimeout / keepAliveTimeout), so there is nothing
+      // to forward once listening. Kept for API compatibility.
+      if (callback) ev.once('timeout', callback);
       return server;
     },
 

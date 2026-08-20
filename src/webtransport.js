@@ -632,7 +632,8 @@ class WebTransport extends EventEmitter {
     // Send CLOSE_WEBTRANSPORT_SESSION on CONNECT stream (optional)
     // Then close QUIC connection
     if (this._quic) {
-      this._quic.close(0, (info && info.reason) || 'WebTransport closed');
+      // WebTransport runs over HTTP/3, so the application space applies here too.
+      this._quic.close(0x0100, (info && info.reason) || 'WebTransport closed', true);
     }
   }
 

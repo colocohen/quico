@@ -12,8 +12,10 @@
  *     https://github.com/colocohen/quico
  */
 
-import { TLSSession, createSecureContext as _lemonCreateSecureContext } from 'lemon-tls';
-import nodeTls from 'node:tls';
+import {
+  TLSSession,
+  createSecureContext as _lemonCreateSecureContext
+} from 'lemon-tls';
 import { DEBUG, Emitter } from './utils.js';
 import { build_transport_params, parse_transport_params } from './transport.js';
 import {
@@ -288,8 +290,17 @@ function TLSBridge(options) {
 
 /**
  * Drop-in replacement for tls.createSecureContext.
- * Builds both a lemon-tls context (for H3/QUIC) and a node:tls
- * context (for HTTP/2 + HTTP/1.1 over TCP) from the same credentials.
+ *
+ * One context now serves every protocol. It used to build a second, node:tls
+ * context alongside the lemon-tls one, because HTTP/2 and HTTP/1.1 ran on
+ * node:http2 and node:https and those need node's own context object. Both are
+ * gone — h2_server and h1_server run on lemon-tls through tcp_listener — so
+ * the duplicate context, and the three-way bridge in server.js that had to
+ * work out which kind it was holding, go with them.
+ *
+ * The raw credentials are still kept on the context: an SNICallback may hand
+ * one to a layer that needs to rebuild it, and throwing away the inputs would
+ * make that impossible.
  */
 function createSecureContext(options) {
   var ctx = _lemonCreateSecureContext(options);
@@ -297,15 +308,6 @@ function createSecureContext(options) {
     ctx._rawKey = options.key || null;
     ctx._rawCert = options.cert || null;
     ctx._rawCa = options.ca || null;
-    try {
-      var nodeOpts = {};
-      if (options.key) nodeOpts.key = options.key;
-      if (options.cert) nodeOpts.cert = options.cert;
-      if (options.ca) nodeOpts.ca = options.ca;
-      ctx._nodeContext = nodeTls.createSecureContext(nodeOpts);
-    } catch (e) {
-      ctx._nodeContext = null;
-    }
   }
   return ctx;
 }

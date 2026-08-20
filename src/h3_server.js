@@ -291,8 +291,22 @@ function createServer(options, handler) {
 
     // QUIC handshake complete → set up H3
     quic.on('connect', function () {
-      var h3 = new H3Connection({ quicConnection: quic, enableWebTransport: true });
+      var h3 = new H3Connection({
+        quicConnection: quic,
+        enableWebTransport: true,
+        // Report-only mode for the checks added with the error layer. See the
+        // note in h3.js: these turn conditions that were previously ignored
+        // into connection errors, so a bug they expose looks like a regression.
+        qpackLenient: options.qpackLenient === true
+      });
       conn.h3 = h3;
+
+      // Surface HTTP/3-level failures on the server. Without this the error
+      // raised by connectionError() is emitted into a connection object nobody
+      // listens to, and the peer's ERR_QUIC_PROTOCOL_ERROR is the only sign
+      // anything happened — invisible on this side, which is the exact failure
+      // mode the error layer exists to remove.
+      h3.on('error', function (err) { ev.emit('error', err); });
 
       // HTTP request headers received → set_http_stream (reactive)
       h3.on('http_headers', function (streamId, headers) {

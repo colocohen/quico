@@ -12,11 +12,12 @@
  *     https://github.com/colocohen/quico
  */
 
-import nodeHttps from 'node:https';
-import nodeHttp2 from 'node:http2';
 import { URL } from 'node:url';
+import lemonTls from 'lemon-tls';
 
 import { request as h3Request } from './h3_client.js';
+import { request as h2Request, H2Pool } from './h2_client.js';
+import { request as h1Request, H1Pool } from './h1_client.js';
 import { ClientRequest, IncomingMessage } from './streams.js';
 import { globalAgent } from './agent.js';
 
@@ -31,6 +32,31 @@ import { globalAgent } from './agent.js';
 //    options.http2 (default: agent.http2 or true)
 //    options.http1 (default: agent.http1 or true)
 // ============================================================
+
+/**
+ * The agent's H2 and H1 pools, created on first use.
+ *
+ * They are deliberately different objects with different shapes — see the note
+ * at the top of h2_client.js. H2 maps an origin to ONE session and gets
+ * concurrency from streams; H1 maps an origin to a LIST of sockets and gets
+ * concurrency from more sockets. agent.js already kept _h2Pool and _h3Pool
+ * separate for the same reason.
+ */
+function agentH2Pool(agent) {
+  if (!agent._h2ClientPool) agent._h2ClientPool = new H2Pool({});
+  return agent._h2ClientPool;
+}
+
+function agentH1Pool(agent) {
+  if (!agent._h1ClientPool) {
+    agent._h1ClientPool = new H1Pool({
+      maxSockets: agent.maxSockets,
+      idleTimeout: agent.keepAliveMsecs
+    });
+  }
+  return agent._h1ClientPool;
+}
+
 
 function request(url, options, callback) {
 
@@ -289,73 +315,44 @@ function request(url, options, callback) {
 
 
   // ============================================================
-  //  H2 transport (node:http2)
+  //  H2 transport (ours)
+  //
+  //  Was node:http2. h2_client speaks the same shape — an emitter that emits
+  //  'response' with an IncomingMessage — so the fallback chain around it is
+  //  unchanged. Sessions are pooled and coalesced per origin by the agent, the
+  //  same way H3 connections are.
   // ============================================================
 
   function tryH2(onFail) {
     if (responded || clientReq.destroyed || clientReq.aborted) return;
 
     try {
-      var session = agent ? agent.getH2Session(hostname, port) : null;
-
-      if (!session) {
-        var authority = 'https://' + hostname + ':' + port;
-        session = nodeHttp2.connect(authority, {
-          rejectUnauthorized: options.rejectUnauthorized !== false
-        });
-
-        session.on('error', function (err) {
-          onFail(err);
-        });
-
-        if (agent) agent.setH2Session(hostname, port, session);
-      }
-
-      var h2Headers = {
-        ':method': method,
-        ':path': path,
-        ':authority': hostname,
-        ':scheme': 'https'
-      };
-      for (var name in headers) {
-        if (name[0] !== ':') h2Headers[name.toLowerCase()] = headers[name];
-      }
-
-      var h2Req = session.request(h2Headers);
-
-      h2Req.on('response', function (responseHeaders) {
+      var h2Req = h2Request({
+        hostname: hostname,
+        port: port,
+        path: path,
+        method: method,
+        headers: Object.assign({}, headers),
+        tls: lemonTls,
+        ca: options.ca,
+        rejectUnauthorized: options.rejectUnauthorized,
+        // One session per origin, shared with every other request through this
+        // agent — that is what multiplexing means and why the H1 pool cannot
+        // be reused here.
+        pool: agent ? agentH2Pool(agent) : undefined
+      }, function (res) {
         if (responded) return;
 
-        var statusCode = responseHeaders[':status'] || 200;
-        var flatHeaders = {};
-        for (var k in responseHeaders) {
-          if (k[0] !== ':') flatHeaders[k] = responseHeaders[k];
+        if (agent && res.headers['alt-svc']) {
+          agent.parseAltSvc(hostname, port, res.headers['alt-svc']);
         }
-
-        // Alt-Svc discovery
-        if (agent && flatHeaders['alt-svc']) {
-          agent.parseAltSvc(hostname, port, flatHeaders['alt-svc']);
-        }
-
-        var res = new IncomingMessage({
-          httpVersion: '2.0',
-          statusCode: statusCode,
-          headers: flatHeaders
-        });
 
         clientReq.protocol = 'h2';
         if (agent) agent.setProtocol(hostname, port, 'h2');
-
-        h2Req.on('data', function (chunk) { res._pushData(chunk); });
-        h2Req.on('end', function () { res._endData(); });
-        h2Req.on('error', function (err) { res._abort(err); });
-
         deliverResponse(res);
       });
 
-      h2Req.on('error', function (err) {
-        onFail(err);
-      });
+      h2Req.on('error', function (err) { onFail(err); });
 
       var body = clientReq._getBody();
       if (body) h2Req.write(Buffer.from(body));
@@ -368,49 +365,36 @@ function request(url, options, callback) {
 
 
   // ============================================================
-  //  HTTPS transport (node:https — HTTP/1.1)
+  //  HTTPS transport (ours — HTTP/1.1 over lemon-tls)
   // ============================================================
 
   function tryHttps(onFail) {
     if (responded || clientReq.destroyed || clientReq.aborted) return;
 
     try {
-      var httpsOpts = {
+      var httpsReq = h1Request({
         hostname: hostname,
         port: port,
         path: path,
         method: method,
         headers: Object.assign({}, headers),
-        rejectUnauthorized: options.rejectUnauthorized !== false
-      };
-
-      var httpsReq = nodeHttps.request(httpsOpts, function (httpsRes) {
+        tls: lemonTls,
+        ca: options.ca,
+        rejectUnauthorized: options.rejectUnauthorized,
+        pool: agent ? agentH1Pool(agent) : undefined
+      }, function (res) {
         if (responded) return;
 
-        if (agent && httpsRes.headers['alt-svc']) {
-          agent.parseAltSvc(hostname, port, httpsRes.headers['alt-svc']);
+        if (agent && res.headers['alt-svc']) {
+          agent.parseAltSvc(hostname, port, res.headers['alt-svc']);
         }
-
-        var res = new IncomingMessage({
-          httpVersion: httpsRes.httpVersion || '1.1',
-          statusCode: httpsRes.statusCode,
-          statusMessage: httpsRes.statusMessage || '',
-          headers: httpsRes.headers || {}
-        });
 
         clientReq.protocol = 'https';
         if (agent) agent.setProtocol(hostname, port, 'https');
-
-        httpsRes.on('data', function (chunk) { res._pushData(chunk); });
-        httpsRes.on('end', function () { res._endData(); });
-        httpsRes.on('error', function (err) { res._abort(err); });
-
         deliverResponse(res);
       });
 
-      httpsReq.on('error', function (err) {
-        onFail(err);
-      });
+      httpsReq.on('error', function (err) { onFail(err); });
 
       var body = clientReq._getBody();
       if (body) httpsReq.write(Buffer.from(body));

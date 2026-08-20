@@ -2427,12 +2427,31 @@ function QUICConnection(options) {
     context.last_close_echo = Date.now();
   }
 
-  function close(errorCode, reason) {
+  /**
+   * Close the connection.
+   *
+   * `application` selects which CONNECTION_CLOSE frame is sent:
+   *   false (default) — 0x1c, the TRANSPORT error space (RFC 9000 §20.1)
+   *   true            — 0x1d, the APPLICATION error space (RFC 9000 §20.2)
+   *
+   * The distinction is not cosmetic: the two spaces are disjoint registries.
+   * HTTP/3 and QPACK error codes (RFC 9114 §8.1, RFC 9204 §6 — H3_FRAME_ERROR
+   * 0x0106, QPACK_DECOMPRESSION_FAILED 0x0200, ...) live in the application
+   * space, and RFC 9114 §8.1 requires them to be sent in a 0x1d frame. Sending
+   * one in a 0x1c frame tells the peer something entirely different: 0x0106 is
+   * not a defined transport code, and 0x0200 lands nowhere at all. The peer
+   * logs a transport violation it did not commit and has no way to learn what
+   * actually went wrong.
+   *
+   * The transport builder has always handled both (transport.js picks 0x1c/0x1d
+   * off `frame.application`); only this entry point was hardcoded.
+   */
+  function close(errorCode, reason, application) {
     if (context.state === 'closed' || context.state === 'draining' || context.state === 'closing') return;
     if (context.handshake_timer) { clearTimeout(context.handshake_timer); context.handshake_timer = null; }
     stopCryptoRetx();
     context.close_frame = {
-      type: 'connection_close', application: false,
+      type: 'connection_close', application: !!application,
       error: errorCode || 0, frameType: 0, reason: reason || ''
     };
     sendConnectionClose();

@@ -273,20 +273,56 @@ function createQuicServer(options) {
       try { sock.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
     }
 
+    // Both sockets are attempted, and listening succeeds if EITHER binds.
+    //
+    // The callback used to hang off udp6.bind alone. On a host without IPv6 —
+    // a container, a CI runner, plenty of cloud instances — that bind fails
+    // with EAFNOSUPPORT and the callback is never called: listen() returns, the
+    // v4 socket is up and working, and the caller waits forever for a
+    // 'listening' that cannot arrive. Nothing logs, because the error goes to
+    // the 'error' event that a caller waiting on the callback has not reached
+    // yet.
+    //
+    // A failure on one family is also not fatal on its own. Only if BOTH fail
+    // is there nothing to listen on, and that is reported as an error.
+    var pending = 2;
+    var bound = 0;
+    var lastErr = null;
+
+    function settle(err) {
+      if (err) lastErr = err;
+      else bound++;
+      if (--pending > 0) return;
+      if (bound === 0) {
+        ev.emit('error', lastErr || new Error('failed to bind UDP on port ' + port));
+        return;
+      }
+      if (typeof callback === 'function') callback();
+    }
+
     udp4 = dgram.createSocket('udp4');
     udp4.on('message', onUdpMessage);
-    udp4.on('error', function (err) { ev.emit('error', err); });
+    udp4.once('error', function (err) {
+      // A bind failure arrives before we are listening; anything later is a
+      // runtime socket error and belongs to the consumer.
+      udp4 = null;
+      settle(err);
+      ev.emit('error', err);
+    });
     var host4 = host.indexOf('.') !== -1 ? host : '0.0.0.0';
-    udp4.bind(port, host4, function () { growBuffers(udp4); });
+    udp4.bind(port, host4, function () { growBuffers(udp4); settle(null); });
 
     udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
     udp6.on('message', onUdpMessage);
-    udp6.on('error', function (err) { ev.emit('error', err); });
-    var host6 = host.indexOf(':') !== -1 ? host : '::';
-    udp6.bind(port, host6, function () {
-      growBuffers(udp6);
-      if (typeof callback === 'function') callback();
+    udp6.once('error', function (err) {
+      udp6 = null;
+      // No IPv6 on this host is ordinary, not an error the application needs
+      // to see — the v4 socket is serving. Only a total failure is emitted,
+      // from settle() above.
+      settle(err);
     });
+    var host6 = host.indexOf(':') !== -1 ? host : '::';
+    udp6.bind(port, host6, function () { growBuffers(udp6); settle(null); });
 
     startSweepTimer();
   }
@@ -316,6 +352,11 @@ function createQuicServer(options) {
 
     // Close all connections
     for (var id in connections) {
+      // Transport NO_ERROR (0x1c, code 0) — deliberately NOT an HTTP/3 code.
+      // This server is application-agnostic: `alpn` is an option, and a DoQ or
+      // custom-protocol server built on it has no business emitting
+      // H3_NO_ERROR. An application layer that wants its own code closes the
+      // connection itself (h3_client / agent / webtransport all do).
       try { connections[id].quic.close(0, 'server closing'); } catch (e) { }
     }
     connections = {};

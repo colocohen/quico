@@ -20,162 +20,55 @@ import {
   readVarInt,
   wt_stream_header
 } from './utils.js';
+import {
+  QPACK_STATIC,
+  buildStaticLookup,
+  readPrefixedInt,
+  encodePrefixedInt,
+  decodeStringLiteral,
+  encodeStringLiteral
+} from './hpack_primitives.js';
 
 
 // ============================================================
-//  QPACK Static Table (RFC 9204 Appendix A)
+//  QPACK header blocks (RFC 9204)
+//
+//  The wire primitives — Huffman, prefixed integers, string literals — now live
+//  in hpack_primitives.js, because RFC 9204 defines them by reference to
+//  RFC 7541 and HTTP/2's HPACK needs byte-identical code. What stays here is
+//  what is genuinely QPACK: the RIC/base-index prefix, the encoder-stream
+//  instructions, and the static table's own contents.
+//
+//  Names and values are turned into text with TextDecoder (UTF-8), which is
+//  what this file has always done. hpack_primitives exports bytesToLatin1 as a
+//  lossless alternative; switching to it is a deliberate behaviour change and
+//  deliberately NOT part of this move.
 // ============================================================
 
-var QPACK_STATIC = [
-  [':authority',''], [':path','/'], ['age','0'], ['content-disposition',''],
-  ['content-length','0'], ['cookie',''], ['date',''], ['etag',''],
-  ['if-modified-since',''], ['if-none-match',''], ['last-modified',''],
-  ['link',''], ['location',''], ['referer',''], ['set-cookie',''],
-  [':method','CONNECT'], [':method','DELETE'], [':method','GET'],
-  [':method','HEAD'], [':method','OPTIONS'], [':method','POST'],
-  [':method','PUT'], [':scheme','http'], [':scheme','https'],
-  [':status','103'], [':status','200'], [':status','304'],
-  [':status','404'], [':status','503'], ['accept','*/*'],
-  ['accept','application/dns-message'], ['accept-encoding','gzip, deflate, br'],
-  ['accept-ranges','bytes'], ['access-control-allow-headers','cache-control'],
-  ['access-control-allow-headers','content-type'],
-  ['access-control-allow-origin','*'], ['cache-control','max-age=0'],
-  ['cache-control','max-age=2592000'], ['cache-control','max-age=604800'],
-  ['cache-control','no-cache'], ['cache-control','no-store'],
-  ['cache-control','public, max-age=31536000'], ['content-encoding','br'],
-  ['content-encoding','gzip'], ['content-type','application/dns-message'],
-  ['content-type','application/javascript'], ['content-type','application/json'],
-  ['content-type','application/x-www-form-urlencoded'],
-  ['content-type','image/gif'], ['content-type','image/jpeg'],
-  ['content-type','image/png'], ['content-type','text/css'],
-  ['content-type','text/html; charset=utf-8'], ['content-type','text/plain'],
-  ['content-type','text/plain;charset=utf-8'], ['range','bytes=0-'],
-  ['strict-transport-security','max-age=31536000'],
-  ['strict-transport-security','max-age=31536000; includesubdomains'],
-  ['strict-transport-security','max-age=31536000; includesubdomains; preload'],
-  ['vary','accept-encoding'], ['vary','origin'],
-  ['x-content-type-options','nosniff'], ['x-xss-protection','1; mode=block'],
-  [':status','100'], [':status','204'], [':status','206'], [':status','302'],
-  [':status','400'], [':status','403'], [':status','421'], [':status','425'],
-  [':status','500'], ['accept-language',''],
-  ['access-control-allow-credentials','FALSE'],
-  ['access-control-allow-credentials','TRUE'],
-  ['access-control-allow-headers','*'],
-  ['access-control-allow-methods','get'],
-  ['access-control-allow-methods','get, post, options'],
-  ['access-control-allow-methods','options'],
-  ['access-control-expose-headers','content-length'],
-  ['access-control-request-headers','content-type'],
-  ['access-control-request-method','get'],
-  ['access-control-request-method','post'], ['alt-svc','clear'],
-  ['authorization',''],
-  ['content-security-policy',"script-src 'none'; object-src 'none'; base-uri 'none'"],
-  ['early-data','1'], ['expect-ct',''], ['forwarded',''], ['if-range',''],
-  ['origin',''], ['purpose','prefetch'], ['server',''],
-  ['timing-allow-origin','*'], ['upgrade-insecure-requests','1'],
-  ['user-agent',''], ['x-forwarded-for',''],
-  ['x-frame-options','deny'], ['x-frame-options','sameorigin']
-];
-
-
-// ============================================================
-//  Huffman (RFC 7541 Appendix B)
-// ============================================================
-
-var HUFF_CODES = new Uint32Array([
-  0x1ff8,0x7fffd8,0xfffffe2,0xfffffe3,0xfffffe4,0xfffffe5,0xfffffe6,0xfffffe7,
-  0xfffffe8,0xffffea,0x3ffffffc,0xfffffe9,0xfffffea,0x3ffffffd,0xfffffeb,0xfffffec,
-  0xfffffed,0xfffffee,0xfffffef,0xffffff0,0xffffff1,0xffffff2,0x3ffffffe,0xffffff3,
-  0xffffff4,0xffffff5,0xffffff6,0xffffff7,0xffffff8,0xffffff9,0xffffffa,0xffffffb,
-  0x14,0x3f8,0x3f9,0xffa,0x1ff9,0x15,0xf8,0x7fa,0x3fa,0x3fb,0xf9,0x7fb,0xfa,
-  0x16,0x17,0x18,0x0,0x1,0x2,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x5c,0xfb,
-  0x7ffc,0x20,0xffb,0x3fc,0x1ffa,0x21,0x5d,0x5e,0x5f,0x60,0x61,0x62,0x63,0x64,
-  0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,0x70,0x71,0x72,0xfc,
-  0x73,0xfd,0x1ffb,0x7fff0,0x1ffc,0x3ffc,0x22,0x7ffd,0x3,0x23,0x4,0x24,0x5,0x25,
-  0x26,0x27,0x6,0x74,0x75,0x28,0x29,0x2a,0x7,0x2b,0x76,0x2c,0x8,0x9,0x2d,0x77,
-  0x78,0x79,0x7a,0x7b,0x7ffe,0x7fc,0x3ffd,0x1ffd,0xffffffc,0xfffe6,0x3fffd2,
-  0xfffe7,0xfffe8,0x3fffd3,0x3fffd4,0x3fffd5,0x7fffd9,0x3fffd6,0x7fffda,0x7fffdb,
-  0x7fffdc,0x7fffdd,0x7fffde,0xffffeb,0x7fffdf,0xffffec,0xffffed,0x3fffd7,0x7fffe0,
-  0xffffee,0x7fffe1,0x7fffe2,0x7fffe3,0x7fffe4,0x1fffdc,0x3fffd8,0x7fffe5,0x3fffd9,
-  0x7fffe6,0x7fffe7,0xffffef,0x3fffda,0x1fffdd,0xfffe9,0x3fffdb,0x3fffdc,0x7fffe8,
-  0x7fffe9,0x1fffde,0x7fffea,0x3fffdd,0x3fffde,0xfffff0,0x1fffdf,0x3fffdf,0x7fffeb,
-  0x7fffec,0x1fffe0,0x1fffe1,0x3fffe0,0x1fffe2,0x7fffed,0x3fffe1,0x7fffee,0x7fffef,
-  0xfffea,0x3fffe2,0x3fffe3,0x3fffe4,0x7ffff0,0x3fffe5,0x3fffe6,0x7ffff1,0x3ffffe0,
-  0x3ffffe1,0xfffeb,0x7fff1,0x3fffe7,0x7ffff2,0x3fffe8,0x1ffffec,0x3ffffe2,0x3ffffe3,
-  0x3ffffe4,0x7ffffde,0x7ffffdf,0x3ffffe5,0xfffff1,0x1ffffed,0x7fff2,0x1fffe3,
-  0x3ffffe6,0x7ffffe0,0x7ffffe1,0x3ffffe7,0x7ffffe2,0xfffff2,0x1fffe4,0x1fffe5,
-  0x3ffffe8,0x3ffffe9,0xffffffd,0x7ffffe3,0x7ffffe4,0x7ffffe5,0xfffec,0xfffff3,
-  0xfffed,0x1fffe6,0x3fffe9,0x1fffe7,0x1fffe8,0x7ffff3,0x3fffea,0x3fffeb,0x1ffffee,
-  0x1ffffef,0xfffff4,0xfffff5,0x3ffffea,0x7ffff4,0x3ffffeb,0x7ffffe6,0x3ffffec,
-  0x3ffffed,0x7ffffe7,0x7ffffe8,0x7ffffe9,0x7ffffea,0x7ffffeb,0xffffffe,0x7ffffec,
-  0x7ffffed,0x7ffffee,0x7ffffef,0x7fffff0,0x3ffffee,0x3fffffff
-]);
-
-var HUFF_BITS = new Uint8Array([
-  13,23,28,28,28,28,28,28,28,24,30,28,28,30,28,28,28,28,28,28,28,28,30,28,28,
-  28,28,28,28,28,28,28,6,10,10,12,13,6,8,11,10,10,8,11,8,6,6,6,5,5,5,6,6,6,6,
-  6,6,6,7,8,15,6,12,10,13,6,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,8,7,
-  8,13,19,13,14,6,15,5,6,5,6,5,6,6,6,5,7,7,6,6,6,5,6,7,6,5,5,6,7,7,7,7,7,15,
-  11,14,13,28,20,22,20,20,22,22,22,23,22,23,23,23,23,23,24,23,24,24,22,23,24,
-  23,23,23,23,21,22,23,22,23,23,24,22,21,20,22,22,23,23,21,23,22,22,24,21,22,
-  23,23,21,21,22,21,23,22,23,23,20,22,22,22,23,22,22,23,26,26,20,19,22,23,22,
-  25,26,26,26,27,27,26,24,25,19,21,26,27,27,26,27,24,21,21,26,26,28,27,27,27,
-  20,24,20,21,22,21,21,23,22,22,25,25,24,24,26,23,26,27,26,26,27,27,27,27,27,
-  28,27,27,27,27,27,26,30
-]);
-
-var _huffRoot = (function () {
-  var root = {};
-  for (var i = 0; i < HUFF_CODES.length; i++) {
-    var code = HUFF_CODES[i], bits = HUFF_BITS[i], node = root;
-    for (var j = bits - 1; j >= 0; j--) {
-      var bit = (code >> j) & 1;
-      if (!node[bit]) node[bit] = {};
-      node = node[bit];
-    }
-    node.sym = i;
-  }
-  return root;
-})();
-
-function huffDecode(buf) {
-  var out = [], node = _huffRoot, nbits = 0, current = 0;
-  for (var i = 0; i < buf.length; i++) {
-    current = (current << 8) | buf[i];
-    nbits += 8;
-    while (nbits > 0) {
-      node = node[(current >> (nbits - 1)) & 1];
-      if (!node) throw new Error('Invalid Huffman');
-      nbits--;
-      if (node.sym !== undefined) { out.push(node.sym); node = _huffRoot; }
-    }
-  }
-  return new TextDecoder().decode(Uint8Array.from(out));
+function _text(bytes) {
+  return new TextDecoder().decode(bytes);
 }
 
+// Every decodeStringLiteral() call below passes strict = true, enabling the
+// padding checks of RFC 7541 §5.2: padding over 7 bits, padding that is not the
+// EOS prefix, and a literal EOS symbol are all rejected. Without it an all-ones
+// run decodes to symbol 256, which then silently truncates to a zero byte and
+// lands in a header value — a malformed block quietly becomes a valid-looking
+// request. Every peer that matters (nghttp2, quiche, msquic, Chrome) pads
+// correctly, and the QPACK interop tests check that a decoder rejects the ones
+// that do not.
+//
+// Note what strict does NOT cover: a literal cut short by the end of the
+// available bytes still returns null and the parser waits for more, because on
+// a QUIC stream that is ordinary partial delivery, not corruption. Telling the
+// two apart needs the stream's FIN — a block still incomplete at FIN is a real
+// error, and that check belongs with the per-stream state, not here.
 
-// ============================================================
-//  QPACK parse/build helpers
-// ============================================================
+// Static-table lookup maps for the encoder, built once. QPACK indexes from 0.
+var _qpackLookup = buildStaticLookup(QPACK_STATIC, 0);
+var _qpackFullMatch = _qpackLookup.full;   // "name\0value" → index
+var _qpackNameMatch = _qpackLookup.name;   // "name" → first index
 
-// Read a QPACK/HPACK prefixed integer at buf[pos]. Returns { value, next } or
-// null if the buffer ends mid-integer (truncated). Used by both the header
-// block parser and the encoder-instruction parser.
-function readPrefixedInt(buf, prefixBits, pos) {
-  if (pos >= buf.length) return null;
-  var max = (1 << prefixBits) - 1;
-  var value = buf[pos] & max;
-  pos++;
-  if (value < max) return { value: value, next: pos };
-  var m = 0;
-  while (pos < buf.length) {
-    var byte = buf[pos++];
-    value += (byte & 0x7f) << m;
-    if ((byte & 0x80) === 0) return { value: value, next: pos };
-    m += 7;
-  }
-  return null; // truncated mid-integer
-}
 
 function parseQpackHeaderBlock(buf, dynamicTable, baseIndex) {
   var pos = 0;
@@ -192,121 +85,123 @@ function parseQpackHeaderBlock(buf, dynamicTable, baseIndex) {
       // Indexed
       var fromStatic = (byte & 0x40) !== 0;
       var idx = readPrefixedInt(buf, 6, pos); if (!idx) break; pos = idx.next;
-      if (fromStatic && idx.value < QPACK_STATIC.length) {
-        headers[QPACK_STATIC[idx.value][0]] = QPACK_STATIC[idx.value][1];
-      } else if (!fromStatic && dynamicTable) {
-        var di = bi - 1 - idx.value;
-        if (di >= 0 && di < dynamicTable.length) {
-          headers[dynamicTable[di][0]] = dynamicTable[di][1];
+      if (fromStatic) {
+        if (idx.value >= QPACK_STATIC.length) {
+          throw new Error('QPACK: static index ' + idx.value + ' out of range');
         }
+        headers[QPACK_STATIC[idx.value][0]] = QPACK_STATIC[idx.value][1];
+      } else {
+        // An index the dynamic table cannot satisfy means our copy of the
+        // peer's table has diverged from theirs — RFC 9204 §2.2.3 calls that
+        // QPACK_DECOMPRESSION_FAILED. Skipping the field instead (what this did
+        // before) hands the application a request with a header silently
+        // missing, which is worse than refusing it: the peer believes it sent
+        // an Authorization or a Host that never arrived.
+        var di = bi - 1 - idx.value;
+        if (!dynamicTable || di < 0 || di >= dynamicTable.length) {
+          throw new Error('QPACK: dynamic index ' + idx.value + ' unresolvable');
+        }
+        headers[dynamicTable[di][0]] = dynamicTable[di][1];
       }
 
     } else if ((byte & 0xc0) === 0x40) {
       // Literal with name ref
       var fromStatic = (byte & 0x10) !== 0;
       var nameIdx = readPrefixedInt(buf, 4, pos); if (!nameIdx) break; pos = nameIdx.next;
-      var valH = (buf[pos] & 0x80) !== 0;
-      var valLen = readPrefixedInt(buf, 7, pos); if (!valLen) break; pos = valLen.next;
-      var valBytes = buf.slice(pos, pos + valLen.value); pos += valLen.value;
-      var value = valH ? huffDecode(valBytes) : new TextDecoder().decode(valBytes);
+      var val = decodeStringLiteral(buf, 7, pos, true); if (!val) break; pos = val.next;
 
-      var name = null;
-      if (fromStatic && nameIdx.value < QPACK_STATIC.length) {
+      var name;
+      if (fromStatic) {
+        if (nameIdx.value >= QPACK_STATIC.length) {
+          throw new Error('QPACK: static name index ' + nameIdx.value + ' out of range');
+        }
         name = QPACK_STATIC[nameIdx.value][0];
-      } else if (!fromStatic && dynamicTable) {
+      } else {
         var di = bi - 1 - nameIdx.value;
-        if (di >= 0 && di < dynamicTable.length) name = dynamicTable[di][0];
+        if (!dynamicTable || di < 0 || di >= dynamicTable.length) {
+          throw new Error('QPACK: dynamic name index ' + nameIdx.value + ' unresolvable');
+        }
+        name = dynamicTable[di][0];
       }
-      if (name) headers[name] = value;
+      headers[name] = _text(val.bytes);
 
     } else if ((byte & 0xe0) === 0x20) {
       // Literal with literal name
-      var nameH = (byte & 0x08) !== 0;
-      var nameLen = readPrefixedInt(buf, 3, pos); if (!nameLen) break; pos = nameLen.next;
-      var nameBytes = buf.slice(pos, pos + nameLen.value); pos += nameLen.value;
-      var name = nameH ? huffDecode(nameBytes) : new TextDecoder().decode(nameBytes);
-      var valH = (buf[pos] & 0x80) !== 0;
-      var valLen = readPrefixedInt(buf, 7, pos); if (!valLen) break; pos = valLen.next;
-      var valBytes = buf.slice(pos, pos + valLen.value); pos += valLen.value;
-      var value = valH ? huffDecode(valBytes) : new TextDecoder().decode(valBytes);
-      headers[name] = value;
+      var nameLit = decodeStringLiteral(buf, 3, pos, true); if (!nameLit) break; pos = nameLit.next;
+      var val = decodeStringLiteral(buf, 7, pos, true); if (!val) break; pos = val.next;
+      headers[_text(nameLit.bytes)] = _text(val.bytes);
 
     } else {
-      break;
+      // Everything below 0x20 is a post-base field line (RFC 9204 §4.5.3 /
+      // §4.5.5): an index counted forward from the base rather than back from
+      // it, which an encoder may only use for entries inserted after the base.
+      //
+      // Reaching one here means the peer inserted into its dynamic table — but
+      // we advertise SETTINGS_QPACK_MAX_TABLE_CAPACITY 0 (or omit it), so it
+      // was never allowed to. Our table is empty and the reference is
+      // unresolvable, exactly like the out-of-range cases above.
+      //
+      // `break` (what this did before) is the worst possible answer: it drops
+      // this field AND every field after it in the block, silently, and hands
+      // the application a truncated header set that looks complete.
+      throw new Error('QPACK: post-base field line 0x' + byte.toString(16) +
+                      ' but our advertised table capacity is 0');
     }
   }
 
   return headers;
 }
 
-function encodeQpackInt(value, prefixBits) {
-  var max = (1 << prefixBits) - 1;
-  if (value < max) return [value];
-  var bytes = [max];
-  value -= max;
-  while (value >= 128) { bytes.push((value & 0x7f) | 0x80); value >>= 7; }
-  bytes.push(value);
-  return bytes;
-}
-
-
-// ---- Static table lookup maps (built once) ----
-
-var _qpackFullMatch = {};   // "name\0value" → index
-var _qpackNameMatch = {};   // "name" → first index
-
-for (var _i = 0; _i < QPACK_STATIC.length; _i++) {
-  var _key = QPACK_STATIC[_i][0] + '\0' + QPACK_STATIC[_i][1];
-  if (!(_key in _qpackFullMatch)) _qpackFullMatch[_key] = _i;
-  if (!(QPACK_STATIC[_i][0] in _qpackNameMatch)) _qpackNameMatch[QPACK_STATIC[_i][0]] = _i;
-}
-
-
+/**
+ * Encode a header set as a QPACK header block.
+ *
+ * Static table only: RIC = 0 and delta-base = 0 in the prefix, so nothing here
+ * references the dynamic table and no encoder-stream instructions are needed.
+ * That costs some bytes and blocks nothing — a decoder never has to wait on an
+ * insert that has not arrived (QPACK's whole head-of-line hazard).
+ *
+ * Literals are sent unencoded (useHuffman = false), which is what this encoder
+ * has always done; the bytes on the wire are unchanged by the move to shared
+ * primitives. Flipping the three `false` arguments below to `undefined` turns
+ * on Huffman-when-it-helps and is a self-contained, separately testable change.
+ */
 function buildQpackHeaderBlock(headers) {
   var out = [0x00, 0x00]; // QPACK prefix: RIC=0, delta base=0
+
+  function push(bytes) {
+    for (var i = 0; i < bytes.length; i++) out.push(bytes[i]);
+  }
 
   for (var name in headers) {
     var lname = name.toLowerCase();
     var value = String(headers[name]);
 
-    // (1) Try full match: name + value in static table → indexed (1 byte)
-    var fullKey = lname + '\0' + value;
-    if (fullKey in _qpackFullMatch) {
-      var idx = _qpackFullMatch[fullKey];
-      // Indexed: 1 1 NNNNNN (T=1 static, 6-bit prefix)
-      var enc = encodeQpackInt(idx, 6);
-      out.push(0xc0 | enc[0]);
-      for (var i = 1; i < enc.length; i++) out.push(enc[i]);
+    // (1) Full match: name + value both in the static table → 1-byte indexed
+    var idx = _qpackFullMatch[lname + '\0' + value];
+    if (idx !== undefined) {
+      // Indexed field line: 1 T NNNNNN, T=1 (static), 6-bit prefix
+      var enc = encodePrefixedInt(idx, 6);
+      enc[0] |= 0xc0;
+      push(enc);
       continue;
     }
 
-    // (2) Try name match: name in static table → literal with name ref
-    if (lname in _qpackNameMatch) {
-      var nameIdx = _qpackNameMatch[lname];
-      // Literal with name reference: 01 N T PPPP (N=0, T=1 static, 4-bit prefix)
-      var nameEnc = encodeQpackInt(nameIdx, 4);
-      out.push(0x50 | nameEnc[0]);
-      for (var i = 1; i < nameEnc.length; i++) out.push(nameEnc[i]);
-      // Value: H=0 (no huffman), 7-bit length prefix
-      var valBytes = new TextEncoder().encode(value);
-      var valLenEnc = encodeQpackInt(valBytes.length, 7);
-      out.push(valLenEnc[0]);
-      for (var i = 1; i < valLenEnc.length; i++) out.push(valLenEnc[i]);
-      for (var i = 0; i < valBytes.length; i++) out.push(valBytes[i]);
+    // (2) Name match → literal with name reference
+    var nameIdx = _qpackNameMatch[lname];
+    if (nameIdx !== undefined) {
+      // Literal with name reference: 01 N T PPPP, N=0, T=1 (static), 4-bit prefix
+      var nameEnc = encodePrefixedInt(nameIdx, 4);
+      nameEnc[0] |= 0x50;
+      push(nameEnc);
+      push(encodeStringLiteral(value, 7, false));
       continue;
     }
 
-    // (3) No match: literal with literal name (fallback)
-    var nameBytes = new TextEncoder().encode(lname);
-    var nameLenEnc = encodeQpackInt(nameBytes.length, 3);
-    out.push(0x20 | nameLenEnc[0]);
-    for (var i = 1; i < nameLenEnc.length; i++) out.push(nameLenEnc[i]);
-    for (var i = 0; i < nameBytes.length; i++) out.push(nameBytes[i]);
-    var valBytes = new TextEncoder().encode(value);
-    var valLenEnc = encodeQpackInt(valBytes.length, 7);
-    out.push(valLenEnc[0]);
-    for (var i = 1; i < valLenEnc.length; i++) out.push(valLenEnc[i]);
-    for (var i = 0; i < valBytes.length; i++) out.push(valBytes[i]);
+    // (3) Neither → literal with literal name: 001 N H PPP, 3-bit prefix
+    var litName = encodeStringLiteral(lname, 3, false);
+    litName[0] |= 0x20;
+    push(litName);
+    push(encodeStringLiteral(value, 7, false));
   }
 
   return new Uint8Array(out);
@@ -427,13 +322,20 @@ function parseQpackEncoderInstructions(chunks, fromOffset) {
   var pos = 0;
   var instructions = [];
 
-  // Thin wrapper over the shared readPrefixedInt that advances the local `pos`
-  // and returns the value (or null on truncation), preserving call-site usage.
+  // Thin wrappers over the shared primitives that advance the local `pos` and
+  // return the value (or null on truncation), preserving call-site usage.
   function safeVarInt(prefixBits) {
     var r = readPrefixedInt(combined, prefixBits, pos);
     if (!r) return null;
     pos = r.next;
     return r.value;
+  }
+
+  function safeLiteral(prefixBits) {
+    var r = decodeStringLiteral(combined, prefixBits, pos, true);
+    if (!r) return null;
+    pos = r.next;
+    return _text(r.bytes);
   }
 
   while (pos < combined.length) {
@@ -444,25 +346,13 @@ function parseQpackEncoderInstructions(chunks, fromOffset) {
       // Insert with name reference
       var fromStatic = (byte & 0x40) !== 0;
       var nameIdx = safeVarInt(6); if (nameIdx === null) { pos = startPos; break; }
-      var valH = (combined[pos] & 0x80) !== 0;
-      var valLen = safeVarInt(7); if (valLen === null) { pos = startPos; break; }
-      if (pos + valLen > combined.length) { pos = startPos; break; }
-      var valBytes = combined.slice(pos, pos + valLen); pos += valLen;
-      var value = valH ? huffDecode(valBytes) : new TextDecoder().decode(valBytes);
+      var value = safeLiteral(7); if (value === null) { pos = startPos; break; }
       instructions.push({ type: 'insert_name_ref', from_static: fromStatic, name_index: nameIdx, value: value });
 
     } else if ((byte & 0xc0) === 0x40) {
-      // Insert without name reference
-      var nameH = (byte & 0x20) !== 0;
-      var nameLen = safeVarInt(5); if (nameLen === null) { pos = startPos; break; }
-      if (pos + nameLen > combined.length) { pos = startPos; break; }
-      var nameBytes = combined.slice(pos, pos + nameLen); pos += nameLen;
-      var name = nameH ? huffDecode(nameBytes) : new TextDecoder().decode(nameBytes);
-      var valH = (combined[pos] & 0x80) !== 0;
-      var valLen = safeVarInt(7); if (valLen === null) { pos = startPos; break; }
-      if (pos + valLen > combined.length) { pos = startPos; break; }
-      var valBytes = combined.slice(pos, pos + valLen); pos += valLen;
-      var value = valH ? huffDecode(valBytes) : new TextDecoder().decode(valBytes);
+      // Insert without name reference: 01 H NNNNN, 5-bit prefix on the name
+      var name = safeLiteral(5); if (name === null) { pos = startPos; break; }
+      var value = safeLiteral(7); if (value === null) { pos = startPos; break; }
       instructions.push({ type: 'insert_literal', name: name, value: value });
 
     } else if ((byte & 0xe0) === 0x20) {
@@ -480,6 +370,69 @@ function parseQpackEncoderInstructions(chunks, fromOffset) {
 
 
 // ============================================================
+//  Error codes (RFC 9114 §8.1, RFC 9204 §6)
+//
+//  These live in QUIC's APPLICATION error space and must be sent in a 0x1d
+//  CONNECTION_CLOSE — see the note on QUICConnection.close().
+//
+//  RFC 9114 splits failures into two kinds, and they are NOT interchangeable:
+//
+//    Connection errors — the whole connection is unusable, because the shared
+//      state it depends on is now unknown. Every QPACK failure is here: the
+//      dynamic table is a running total of the peer's inserts, so one bad
+//      header block means every later block on every stream decodes to
+//      garbage. There is nothing to salvage per-stream. CONNECTION_CLOSE.
+//
+//    Stream errors — one request is malformed but the connection is fine.
+//      RESET_STREAM / STOP_SENDING on that stream id, everything else
+//      continues. H3_MESSAGE_ERROR is the common case.
+//
+//  Only the connection-error path is wired up below. The stream-error path
+//  needs QUICConnection to be able to *send* RESET_STREAM, which it currently
+//  cannot (transport.js builds the frame and quic_connection.js handles it on
+//  receive, but nothing emits one) — and RESET_STREAM must survive loss, while
+//  this stack has no generic control-frame retransmission: MAX_DATA recovers
+//  via BLOCKED frames, CRYPTO has its own bespoke buffer, stream bytes are
+//  reconciled. A fire-and-forget RESET_STREAM would silently strand the peer
+//  on a stream it thinks is still open.
+//
+//  That work belongs in quic_connection.js next to sendStream(), and it does
+//  NOT generalise to HTTP/2. QUIC owns streams, so H3 resets one by asking the
+//  transport; the error code is an opaque varint QUIC never reads. HTTP/2 has
+//  no such layer beneath it — its streams, its stream ids and its RST_STREAM
+//  frame are all inventions of HTTP/2 itself, sitting on one TCP byte stream
+//  that has nothing to reset. Same idea, different layer, no shared code.
+// ============================================================
+
+var H3_ERR = {
+  H3_NO_ERROR:                0x0100,
+  H3_GENERAL_PROTOCOL_ERROR:  0x0101,
+  H3_INTERNAL_ERROR:          0x0102,
+  H3_STREAM_CREATION_ERROR:   0x0103,
+  H3_CLOSED_CRITICAL_STREAM:  0x0104,
+  H3_FRAME_UNEXPECTED:        0x0105,
+  H3_FRAME_ERROR:             0x0106,
+  H3_EXCESSIVE_LOAD:          0x0107,
+  H3_ID_ERROR:                0x0108,
+  H3_SETTINGS_ERROR:          0x0109,
+  H3_MISSING_SETTINGS:        0x010a,
+  H3_REQUEST_REJECTED:        0x010b,
+  H3_REQUEST_CANCELLED:       0x010c,
+  H3_REQUEST_INCOMPLETE:      0x010d,
+  H3_MESSAGE_ERROR:           0x010e,
+  H3_CONNECT_ERROR:           0x010f,
+  H3_VERSION_FALLBACK:        0x0110,
+
+  QPACK_DECOMPRESSION_FAILED: 0x0200,
+  QPACK_ENCODER_STREAM_ERROR: 0x0201,
+  QPACK_DECODER_STREAM_ERROR: 0x0202
+};
+
+var H3_ERR_NAME = {};
+for (var _ec in H3_ERR) H3_ERR_NAME[H3_ERR[_ec]] = _ec;
+
+
+// ============================================================
 //  H3Connection — reactive pattern
 // ============================================================
 //
@@ -494,6 +447,53 @@ function H3Connection(options) {
 
   var ev = Emitter();
   var quic = options.quicConnection;
+
+  // Set once a connection error has been raised. Everything downstream stops:
+  // the peer is getting a CONNECTION_CLOSE, and continuing to decode against a
+  // dynamic table we no longer trust can only produce more wrong headers.
+  var _fatal = false;
+
+  /**
+   * Raise an HTTP/3 connection error: tell the owner, then close the QUIC
+   * connection with the application error code.
+   *
+   * Before this existed, a malformed header block threw out of the QPACK
+   * decoder, up through processBidiStream, into the quic.on('stream') listener
+   * — where Emitter's catch swallowed it. No error, no close, no RESET_STREAM.
+   * The request simply hung until the idle timeout, and the peer was never told
+   * why. Silently dropping a stream is the one response RFC 9114 does not allow.
+   */
+  // Report-only escape hatch for the checks added alongside this error layer
+  // (strict Huffman padding, unresolvable table indices, post-base field
+  // lines). Every one of them turns something previously ignored into a closed
+  // connection — correct per RFC, but it means any latent bug they touch now
+  // presents as a hard failure against a real peer. With qpackLenient the
+  // condition is logged and the field skipped, restoring the old behaviour, so
+  // a regression can be isolated without reverting the whole layer.
+  var _lenient = options.qpackLenient === true;
+
+  function connectionError(code, reason) {
+    if (_fatal) return;
+    var name = H3_ERR_NAME[code] || ('0x' + code.toString(16));
+
+    if (_lenient) {
+      console.warn('[h3] qpackLenient: ignoring ' + name + ': ' + reason);
+      return;
+    }
+
+    _fatal = true;
+    // Logged unconditionally, not behind DEBUG: this closes the connection, and
+    // the peer only ever sees a generic protocol error. One line here is the
+    // difference between a five-minute diagnosis and a packet capture.
+    console.error('[h3] connection error ' + name + ': ' + reason);
+    var err = new Error('HTTP/3 ' + name + ': ' + reason);
+    err.code = name;
+    err.errorCode = code;
+    ev.emit('error', err);
+    // `true` = application error space (0x1d). H3/QPACK codes are meaningless
+    // in the transport space.
+    try { quic.close(code, name, true); } catch (e) { /* already closing */ }
+  }
 
 
   // ---- Context ----
@@ -652,6 +652,7 @@ function H3Connection(options) {
   var _wtStreams = {};             // streamId → { sessionId, isBidi }
 
   quic.on('stream', function (streamId, data, fin) {
+    if (_fatal) return;   // connection is closing; decoding further is pointless
     var sid = Number(streamId);
 
     // Route data for already-detected WT streams
@@ -720,15 +721,27 @@ function H3Connection(options) {
       }
     }
 
-    // Process by type
-    if (s.type === 'control') {
-      processControlStream(s);
+    // Process by type.
+    //
+    // Each processor decodes attacker-controlled bytes, so each can throw:
+    // a bad prefixed integer, an invalid Huffman code, a truncated literal.
+    // The catch turns that into the connection error RFC 9114 requires,
+    // instead of letting it unwind into Emitter's swallow.
+    try {
+      if (s.type === 'control') {
+        processControlStream(s);
 
-    } else if (s.type === 'qpack_enc') {
-      processQpackEncoderStream(s);
+      } else if (s.type === 'qpack_enc') {
+        processQpackEncoderStream(s);
 
-    } else if (s.type === 'bidi') {
-      processBidiStream(streamId, s);
+      } else if (s.type === 'bidi') {
+        processBidiStream(streamId, s);
+      }
+    } catch (err) {
+      // A code already chosen at the throw site (see decodeHeaders below) wins;
+      // anything else is a framing failure on whichever stream we were reading.
+      connectionError(err.h3ErrorCode || H3_ERR.H3_FRAME_ERROR,
+                      err.message || 'stream processing failed');
     }
   });
 
@@ -780,7 +793,15 @@ function H3Connection(options) {
   }
 
   function processQpackEncoderStream(s) {
-    var ext = parseQpackEncoderInstructions(s.chunks, s.from_offset);
+    var ext;
+    try {
+      ext = parseQpackEncoderInstructions(s.chunks, s.from_offset);
+    } catch (err) {
+      // RFC 9204 §4.2: a malformed encoder stream is QPACK_ENCODER_STREAM_ERROR,
+      // not a decompression failure — nothing was being decompressed yet.
+      err.h3ErrorCode = H3_ERR.QPACK_ENCODER_STREAM_ERROR;
+      throw err;
+    }
     if (ext.instructions.length === 0) return;
     s.from_offset = ext.new_from_offset;
 
@@ -812,6 +833,26 @@ function H3Connection(options) {
     }
   }
 
+  /**
+   * Decode a QPACK header block, re-tagging any failure as
+   * QPACK_DECOMPRESSION_FAILED (RFC 9204 §2.2.3) rather than the generic
+   * framing error. The distinction matters to whoever reads the peer's logs:
+   * a decompression failure says the two dynamic tables have diverged, which
+   * is a different bug from a malformed frame.
+   */
+  function decodeHeaders(payload) {
+    try {
+      return parseQpackHeaderBlock(
+        payload,
+        context.remote_qpack_dynamic_table,
+        context.remote_qpack_table_base_index
+      );
+    } catch (err) {
+      err.h3ErrorCode = H3_ERR.QPACK_DECOMPRESSION_FAILED;
+      throw err;
+    }
+  }
+
   function processBidiStream(streamId, s) {
     var ext = extractH3Frames(s.chunks, s.from_offset);
     if (DEBUG) console.log('[h3] bidi stream ' + streamId + ': extracted ' + ext.frames.length + ' H3 frames, types=' + ext.frames.map(function(f){ return '0x' + f.frame_type.toString(16); }).join(','));
@@ -822,11 +863,7 @@ function H3Connection(options) {
       for (var i = 0; i < ext.frames.length; i++) {
         if (ext.frames[i].frame_type === 1) {
           // HEADERS
-          var headers = parseQpackHeaderBlock(
-            ext.frames[i].payload,
-            context.remote_qpack_dynamic_table,
-            context.remote_qpack_table_base_index
-          );
+          var headers = decodeHeaders(ext.frames[i].payload);
           ev.emit('http_headers', Number(streamId), headers);
 
         } else if (ext.frames[i].frame_type === 0) {
@@ -917,4 +954,4 @@ function H3Connection(options) {
 }
 
 
-export { H3Connection };
+export { H3Connection, H3_ERR, H3_ERR_NAME };

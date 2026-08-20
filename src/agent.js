@@ -321,7 +321,8 @@ class Agent extends EventEmitter {
     this._h3Pending = {};
 
     for (var key in this._h3Pool) {
-      try { this._h3Pool[key].quic.close(0, 'agent destroy'); } catch (e) {}
+      // Pooled connections are HTTP/3 — close with H3_NO_ERROR (RFC 9114 §5.2).
+      try { this._h3Pool[key].quic.close(0x0100, 'agent destroy', true); } catch (e) {}
     }
     this._h3Pool = {};
 

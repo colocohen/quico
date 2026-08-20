@@ -86,7 +86,9 @@ function request(options, callback) {
     },
 
     destroy: function () {
-      if (quic) quic.close(0, 'client destroy');
+      // RFC 9114 §5.2: an HTTP/3 endpoint closes with an HTTP/3 error code in
+      // the application space, not transport NO_ERROR. 0x0100 = H3_NO_ERROR.
+      if (quic) quic.close(0x0100, 'client destroy', true);
       if (udpSocket) { try { udpSocket.close(); } catch (e) {} }
     }
   };
@@ -258,7 +260,7 @@ function request(options, callback) {
         // Auto-close only if we own the connection (see `autoClose` above).
         if (autoClose) {
           setTimeout(function () {
-            if (quic) quic.close(0, 'done');
+            if (quic) quic.close(0x0100, 'done', true);   // H3_NO_ERROR
             if (udpSocket) { try { udpSocket.close(); } catch (e) {} }
           }, 100);
         }
