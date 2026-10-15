@@ -19,7 +19,9 @@ import {
   encodePrefixedInt,
   decodeStringLiteral,
   encodeStringLiteral,
-  bytesToLatin1
+  bytesToLatin1,
+  entrySize,
+  ENTRY_OVERHEAD
 } from './hpack_primitives.js';
 
 
@@ -48,7 +50,7 @@ import {
 
 // RFC 7541 §4.1. The 32 is an allowance for the entry's own bookkeeping, fixed
 // by the spec so that both peers compute the same size for the same entry.
-var ENTRY_OVERHEAD = 32;
+// From hpack_primitives — shared with QPACK, which defines it identically.
 
 // SETTINGS_HEADER_TABLE_SIZE default (RFC 7540 §6.5.2).
 var DEFAULT_TABLE_SIZE = 4096;
@@ -76,9 +78,6 @@ function hpackError(message) {
   return err;
 }
 
-function entrySize(name, value) {
-  return Buffer.byteLength(name, 'utf8') + Buffer.byteLength(value, 'utf8') + ENTRY_OVERHEAD;
-}
 
 
 // ============================================================

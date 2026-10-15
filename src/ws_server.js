@@ -13,10 +13,10 @@ import { Blob } from 'node:buffer';
 
 import {
   WSParser, encodeFrame, acceptKey,
-  isValidUserCloseCode, OPCODE, CLOSE
+  isValidUserCloseCode, OPCODE, CLOSE,
+  installEventSurfaces, emitBoth, nodeMessagePayload
 } from './ws.js';
 import { isToken, STATUS_TEXT } from './http_common.js';
-import { installEventSurfaces, emitBoth, nodeMessagePayload } from './ws_events.js';
 
 
 // ============================================================
@@ -89,7 +89,7 @@ class ServerWebSocket extends EventTarget {
     this._onopen = null; this._onmessage = null;
     this._onerror = null; this._onclose = null; this._onpong = null;
 
-    // Adds .on/.once/.off and the _emitNode helper. See ws_events.js for why
+    // Adds .on/.once/.off and the _emitNode helper. See ws.js (installEventSurfaces) for why
     // the two surfaces receive different arguments for the same event.
     installEventSurfaces(this);
 
@@ -508,11 +508,32 @@ function upgradeWebSocket(req, socket, head, options) {
     }
   }
 
-  if (version !== 13) {
-    // Only version 13 exists, and RFC 8441 §4 keeps the requirement over
-    // HTTP/2 as well. The header tells the client which we accept (§4.2.2).
-    rejectUpgrade(socket, isH2, 400, 'Unsupported Sec-WebSocket-Version',
-                  { 'Sec-WebSocket-Version': '13' });
+  // Over HTTP/1.1 the header is mandatory: it is the only thing that
+  // distinguishes a WebSocket handshake from an ordinary Upgrade, and a
+  // request without it is not one.
+  //
+  // Over HTTP/2 and HTTP/3, `:protocol: websocket` has already said so
+  // unambiguously, and browsers do not reliably send Sec-WebSocket-Version on
+  // the extended CONNECT — Chrome's own network log of a WebSocket request
+  // shows five pseudo-headers and nothing else. RFC 8441 §5 asks for it, but
+  // refusing over it costs far more than it protects: the browser gets a 400,
+  // silently abandons HTTP/2, and reopens the WebSocket over HTTP/1.1. The
+  // connection still works, so nothing looks broken — it just never uses the
+  // multiplexed path, and the reason is invisible from both ends.
+  //
+  // So it is required where it carries meaning and merely validated where it
+  // does not: present and wrong is still an error, absent over h2/h3 is not.
+  if (isH2) {
+    if (headers['sec-websocket-version'] !== undefined && version !== 13) {
+      rejectUpgrade(socket, isH2, 400, 'Unsupported Sec-WebSocket-Version',
+                    { 'Sec-WebSocket-Version': '13' });
+      return null;
+    }
+  } else if (version !== 13) {
+    // Only version 13 exists. The header tells the client which we accept
+    // (RFC 6455 §4.2.2).
+    abortHandshake(socket, 400, 'Unsupported Sec-WebSocket-Version',
+                   { 'Sec-WebSocket-Version': '13' });
     return null;
   }
 
@@ -608,7 +629,10 @@ function upgradeWebSocket(req, socket, head, options) {
     protocol: chosen || '',
     head: head,
     maxPayload: options.maxPayload,
-    url: scheme + '://' + (headers['host'] || '') + (req.url || '')
+    // The origin the client asked for: Host over HTTP/1.1, :authority over
+    // HTTP/2 and HTTP/3 (RFC 9113 §8.3.1, RFC 9114 §4.3.1) — over HTTP/3 the
+    // request carries no Host at all, and the URL came out as "wss:///path".
+    url: scheme + '://' + (headers['host'] || headers[':authority'] || '') + (req.url || '')
   });
 }
 

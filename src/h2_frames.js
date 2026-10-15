@@ -49,7 +49,10 @@ var TYPE = {
   PING:          0x6,
   GOAWAY:        0x7,
   WINDOW_UPDATE: 0x8,
-  CONTINUATION:  0x9
+  CONTINUATION:  0x9,
+  // RFC 9218 §7.1: a stream's priority after its request, client to server,
+  // on stream 0 — the scheme that replaced PRIORITY (RFC 9113 §5.3.2).
+  PRIORITY_UPDATE: 0x10
 };
 
 var TYPE_NAME = {};
@@ -91,7 +94,16 @@ var SETTINGS = {
   MAX_CONCURRENT_STREAMS: 0x3,
   INITIAL_WINDOW_SIZE:    0x4,
   MAX_FRAME_SIZE:         0x5,
-  MAX_HEADER_LIST_SIZE:   0x6
+  MAX_HEADER_LIST_SIZE:   0x6,
+  // RFC 8441 §3. A server that sends this with the value 1 is telling clients
+  // they may use extended CONNECT — a CONNECT request carrying a `:protocol`
+  // pseudo-header — which is how WebSocket runs over HTTP/2. Without it, a
+  // browser will not even try, and opens a separate HTTP/1.1 connection
+  // instead.
+  ENABLE_CONNECT_PROTOCOL: 0x8,
+  // RFC 9218 §2.1: 1 — this endpoint ignores RFC 7540's priority tree (as
+  // RFC 9113 lets it), and reads RFC 9218's signals instead.
+  NO_RFC7540_PRIORITIES: 0x9
 };
 
 var SETTINGS_NAME = {};
@@ -162,7 +174,15 @@ function readFrame(buf, offset, maxFrameSize) {
   if (buf.length - offset < FRAME_HEADER_SIZE + length) return null;
 
   var payload = buf.subarray(offset + FRAME_HEADER_SIZE, offset + FRAME_HEADER_SIZE + length);
-  var frame = parsePayload(type, flags, streamId, payload);
+  var frame;
+  try {
+    frame = parsePayload(type, flags, streamId, payload);
+  } catch (err) {
+    // The frame is whole, so its extent is known: a caller that answers a
+    // STREAM error with RST_STREAM skips exactly this frame and reads on.
+    err.consumed = FRAME_HEADER_SIZE + length;
+    throw err;
+  }
   frame.length = length;
   frame.consumed = FRAME_HEADER_SIZE + length;
   return frame;
@@ -259,15 +279,24 @@ function parsePayload(type, flags, streamId, payload) {
         throw h2Error('SETTINGS payload is not a multiple of 6', ERROR.FRAME_SIZE_ERROR);
       }
       var settings = {};
+      // The same parameters again as an ORDERED list, including the ones
+      // dropped above. Both forms are needed and neither substitutes for the
+      // other: the protocol wants a lookup by name, and fingerprinting wants
+      // the sequence exactly as sent — which parameters appear, in which
+      // order, and which are absent. Unknown identifiers are kept here for the
+      // same reason: an unrecognised setting is still a fact about the peer.
+      var settingsList = [];
       for (var i = 0; i + 6 <= payload.length; i += 6) {
         var id = payload.readUInt16BE(i);
         var value = payload.readUInt32BE(i + 2);
         validateSetting(id, value);
+        settingsList.push({ id: id, value: value });
         // Unknown identifiers must be IGNORED (§6.5.2), not rejected: that is
         // the extension point the whole protocol relies on for future settings.
         if (SETTINGS_NAME[id]) settings[SETTINGS_NAME[id]] = value;
       }
       frame.settings = settings;
+      frame.settingsList = settingsList;
       return frame;
     }
 
@@ -318,6 +347,16 @@ function parsePayload(type, flags, streamId, payload) {
       return frame;
     }
 
+    case TYPE.PRIORITY_UPDATE: {
+      // RFC 9218 §7.1: on stream 0 only, and naming a stream.
+      if (streamId !== 0) throw h2Error('PRIORITY_UPDATE on stream ' + streamId, ERROR.PROTOCOL_ERROR);
+      if (payload.length < 4) throw h2Error('PRIORITY_UPDATE shorter than 4 bytes', ERROR.FRAME_SIZE_ERROR);
+      frame.prioritizedStreamId = payload.readUInt32BE(0) & 0x7fffffff;
+      if (frame.prioritizedStreamId === 0) throw h2Error('PRIORITY_UPDATE for stream 0', ERROR.PROTOCOL_ERROR);
+      frame.priorityField = payload.subarray(4).toString('latin1');
+      return frame;
+    }
+
     case TYPE.CONTINUATION: {
       if (streamId === 0) throw h2Error('CONTINUATION on stream 0', ERROR.PROTOCOL_ERROR);
       frame.headerBlock = payload;
@@ -362,6 +401,20 @@ function validateSetting(id, value) {
     case SETTINGS.ENABLE_PUSH:
       if (value !== 0 && value !== 1) {
         throw h2Error('SETTINGS_ENABLE_PUSH must be 0 or 1', ERROR.PROTOCOL_ERROR);
+      }
+      break;
+    case SETTINGS.ENABLE_CONNECT_PROTOCOL:
+      // RFC 8441 §3: 0 or 1, and once advertised as 1 it may never go back to
+      // 0 — a peer that has started using extended CONNECT cannot be told to
+      // stop mid-connection. The one-way rule is enforced in h2.js, which is
+      // where the previous value is known.
+      if (value !== 0 && value !== 1) {
+        throw h2Error('SETTINGS_ENABLE_CONNECT_PROTOCOL must be 0 or 1', ERROR.PROTOCOL_ERROR);
+      }
+      break;
+    case SETTINGS.NO_RFC7540_PRIORITIES:
+      if (value !== 0 && value !== 1) {
+        throw h2Error('SETTINGS_NO_RFC7540_PRIORITIES must be 0 or 1', ERROR.PROTOCOL_ERROR);
       }
       break;
     case SETTINGS.INITIAL_WINDOW_SIZE:
@@ -453,6 +506,15 @@ function buildGoaway(lastStreamId, errorCode, debugData) {
   return buildFrame(TYPE.GOAWAY, 0, 0, p);
 }
 
+// RFC 9218 §7.1: the stream, then its Priority Field Value.
+function buildPriorityUpdate(streamId, field) {
+  var f = Buffer.from(field || '', 'latin1');
+  var p = Buffer.allocUnsafe(4 + f.length);
+  p.writeUInt32BE(streamId & 0x7fffffff, 0);
+  f.copy(p, 4);
+  return buildFrame(TYPE.PRIORITY_UPDATE, 0, 0, p);
+}
+
 function buildWindowUpdate(streamId, increment) {
   var p = Buffer.allocUnsafe(4);
   p.writeUInt32BE(increment & 0x7fffffff, 0);
@@ -506,6 +568,7 @@ export {
   h2Error,
   readFrame,
   buildFrame,
+  frameHeader,
   buildData,
   buildHeaders,
   buildContinuation,
@@ -514,5 +577,6 @@ export {
   buildPing,
   buildGoaway,
   buildWindowUpdate,
+  buildPriorityUpdate,
   buildHeaderFrames
 };

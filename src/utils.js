@@ -24,31 +24,64 @@ var DEBUG = !!(typeof process !== 'undefined' && process.env && process.env.QUIC
 
 
 // ============================================================
-//  Emitter — lightweight event emitter (single shared copy)
+//  Emitter — the one event emitter, in two behaviours
+//
+//  createEmitter(swallow): with swallow, a listener that throws is caught
+//  and the others still run — the QUIC layers (quic_connection, h3,
+//  tls_bridge, quic_server) emit from inside packet processing, and an
+//  application's listener that throws must not unwind into it: the packet
+//  that delivered the data would be dropped (see the safety net in
+//  receivePackets). Without, the throw goes to the caller, which turns it
+//  into a protocol error (http_common's Emitter, for the parsers that pump
+//  bytes in). Two copies of nearly the same code were kept, one per
+//  behaviour.
 // ============================================================
 
-function Emitter() {
+function createEmitter(swallow) {
   var listeners = {};
+  function call(fn, args) {
+    if (!swallow) { fn.apply(null, args); return; }
+    try { fn.apply(null, args); } catch (e) { /* swallowed: see above */ }
+  }
   return {
-    on: function (name, fn) {
-      (listeners[name] = listeners[name] || []).push(fn);
+    on: function (name, fn) { (listeners[name] = listeners[name] || []).push(fn); return this; },
+    once: function (name, fn) {
+      var self = this;
+      function wrapper() { self.off(name, wrapper); fn.apply(null, arguments); }
+      wrapper.__original = fn;
+      return this.on(name, wrapper);
     },
     off: function (name, fn) {
-      var arr = listeners[name];
-      if (arr) {
-        var idx = arr.indexOf(fn);
-        if (idx !== -1) arr.splice(idx, 1);
+      var a = listeners[name];
+      if (!a) return this;
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] === fn || a[i].__original === fn) { a.splice(i, 1); break; }
       }
+      return this;
     },
     emit: function (name) {
+      var a = listeners[name];
+      if (!a || a.length === 0) return false;
       var args = Array.prototype.slice.call(arguments, 1);
-      var arr = listeners[name] || [];
-      for (var i = 0; i < arr.length; i++) {
-        try { arr[i].apply(null, args); } catch (e) { /* swallow */ }
-      }
+      // One listener, the usual case: called as it is. More: from a copy, as
+      // a listener may add or remove listeners, and mutating the array
+      // mid-loop silently skips one.
+      if (a.length === 1) { call(a[0], args); return true; }
+      a = a.slice();
+      for (var i = 0; i < a.length; i++) call(a[i], args);
+      return true;
+    },
+    listenerCount: function (name) { return (listeners[name] || []).length; },
+    removeAllListeners: function (name) {
+      if (name === undefined) listeners = {};
+      else delete listeners[name];
+      return this;
     }
   };
 }
+
+/** The QUIC layers' emitter: a listener's throw is caught (see above). */
+function Emitter() { return createEmitter(true); }
 
 
 // ============================================================
@@ -331,7 +364,56 @@ function ranges_to_ack_frame(flatRanges, ecnStats, ackDelay) {
 }
 
 
+// A stream's priority, updated from one of two sources — the local
+// application's decision, or the peer's signal (fromPeer: RFC 9218's
+// `priority` header and PRIORITY_UPDATE). A field the application set is its
+// decision: a signal arriving later does not replace it; the application may
+// still change it. The record: { urgency (-1..7), incremental, group, order,
+// mine: the fields the application set }. Both senders keep theirs this way:
+// QUIC's (setStreamPriority) and HTTP/2's (h2.js).
+function mergePriority(cur, p, fromPeer) {
+  if (!p) return cur;
+  function put(k, v) {
+    if (fromPeer && cur.mine && cur.mine[k]) return;
+    cur[k] = v;
+    if (!fromPeer) (cur.mine || (cur.mine = {}))[k] = true;
+  }
+  if (p.urgency != null) put('urgency', Math.max(-1, Math.min(7, Math.floor(Number(p.urgency)) || 0)));
+  if (p.incremental != null) put('incremental', !!p.incremental);
+  if ('group' in p) put('group', p.group || null);
+  if (p.order != null) put('order', Number(p.order) || 0);
+  return cur;
+}
+
+// Flow-control credit for a Readable that the peer fills (a request body, a
+// WebTransport stream): returned as the application reads — for the bytes
+// that have left the Readable's buffer — so the peer is held to one window
+// ahead of the reader. Counted after each read(), which every way of reading
+// goes through (flowing mode, pipe(), async iteration, read() itself).
+// Not in _read: that is also Node's own call to fill its buffer up to
+// highWaterMark, read or not — credited there, a reader that read nothing
+// let the peer a buffer further — and Node makes it before it takes out the
+// bytes it is returning, then not again until the next push: counted there,
+// the credit for the last bytes read waited for a push the peer could not
+// send without it. credit(n) is called with what was read since; the
+// returned function is told of each chunk pushed.
+function creditAsRead(readable, credit) {
+  var received = 0, credited = 0;
+  var read = readable.read;
+  readable._read = function () {};
+  readable.read = function (n) {
+    var chunk = read.call(this, n);
+    var done = received - readable.readableLength;
+    if (done > credited) { var k = done - credited; credited = done; credit(k); }
+    return chunk;
+  };
+  return function (n) { received += n; };
+}
+
 export {
+  createEmitter,
+  mergePriority,
+  creditAsRead,
   DEBUG,
   Emitter,
   writeVarInt,

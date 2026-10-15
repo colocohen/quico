@@ -12,252 +12,61 @@
  *     https://github.com/colocohen/quico
  */
 
-import { Duplex, Readable, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import dns from 'node:dns';
-import { H3Connection } from './h3.js';
+import { H3Connection, wtCloseCapsule, createCapsuleReader } from './h3.js';
 import { createQuicClientSocket } from './quic_socket.js';
-import { readVarInt, concatUint8Arrays, wt_stream_header, wt_datagram_payload } from './utils.js';
-
-
-// ============================================================
-//  WebTransportBidiStream — Duplex + WHATWG .readable/.writable
-//
-//  Node.js style:
-//    stream.write(data);
-//    stream.on('data', chunk => { ... });
-//    stream.pipe(dest);
-//
-//  WHATWG style:
-//    const writer = stream.writable.getWriter();
-//    const reader = stream.readable.getReader();
-// ============================================================
-
-class WebTransportBidiStream extends Duplex {
-
-  constructor(options) {
-    super({ highWaterMark: (options && options.highWaterMark) || 64 * 1024 });
-
-    this._streamId = options.streamId;
-    this._quic = options.quic;
-    this._sessionId = options.sessionId;
-    this._prefixSent = options.prefixSent || false;
-
-    // Lazy WHATWG wrappers
-    this._whatwgReadable = null;
-    this._whatwgWritable = null;
-  }
-
-  // ---- WHATWG getters ----
-
-  get readable() {
-    if (!this._whatwgReadable) {
-      var self = this;
-      this._whatwgReadable = new ReadableStream({
-        start(controller) {
-          self.on('data', function (chunk) {
-            controller.enqueue(chunk);
-          });
-          self.on('end', function () {
-            controller.close();
-          });
-          self.on('error', function (err) {
-            controller.error(err);
-          });
-        }
-      });
-    }
-    return this._whatwgReadable;
-  }
-
-  get writable() {
-    if (!this._whatwgWritable) {
-      var self = this;
-      this._whatwgWritable = new WritableStream({
-        write(chunk) {
-          return new Promise(function (resolve, reject) {
-            self.write(chunk, function (err) { err ? reject(err) : resolve(); });
-          });
-        },
-        close() {
-          return new Promise(function (resolve) { self.end(resolve); });
-        }
-      });
-    }
-    return this._whatwgWritable;
-  }
-
-  // ---- Node.js Duplex implementation ----
-
-  _read(_size) { /* data pushed externally via _pushData */ }
-
-  _write(chunk, encoding, callback) {
-    if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
-    if (Buffer.isBuffer(chunk)) {
-      chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-    }
-
-    // First write on this stream: prepend VarInt(0x41) + VarInt(session_id)
-    if (!this._prefixSent) {
-      this._prefixSent = true;
-      this._quic.sendStream(this._streamId, wt_stream_header(true, this._sessionId, chunk), false);
-    } else {
-      this._quic.sendStream(this._streamId, chunk, false);
-    }
-    callback();
-  }
-
-  _final(callback) {
-    // Send FIN (with type + session_id prefix if nothing was written yet)
-    if (!this._prefixSent) {
-      this._prefixSent = true;
-      this._quic.sendStream(this._streamId, wt_stream_header(true, this._sessionId), true);
-    } else {
-      this._quic.sendStream(this._streamId, new Uint8Array(0), true);
-    }
-    callback();
-  }
-
-  /**
-   * Called by WebTransport when data arrives for this stream.
-   */
-  _pushData(chunk) {
-    if (Buffer.isBuffer(chunk)) this.push(chunk);
-    else if (chunk instanceof Uint8Array) this.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-    else this.push(chunk);
-  }
-
-  _endData() {
-    this.push(null);
-  }
-}
-
-
-// ============================================================
-//  WebTransportUniStream — Writable (outgoing) or Readable (incoming)
-// ============================================================
-
-class WebTransportUniWriteStream extends Writable {
-
-  constructor(options) {
-    super({ highWaterMark: (options && options.highWaterMark) || 64 * 1024 });
-    this._streamId = options.streamId;
-    this._quic = options.quic;
-    this._sessionId = options.sessionId;
-    this._headerSent = false;
-  }
-
-  _write(chunk, encoding, callback) {
-    if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
-    if (Buffer.isBuffer(chunk)) {
-      chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-    }
-
-    if (!this._headerSent) {
-      this._headerSent = true;
-      // Uni stream: VarInt(0x54) (WEBTRANSPORT_STREAM) + VarInt(session_id) + data
-      this._quic.sendStream(this._streamId, wt_stream_header(false, this._sessionId, chunk), false);
-    } else {
-      this._quic.sendStream(this._streamId, chunk, false);
-    }
-    callback();
-  }
-
-  _final(callback) {
-    if (!this._headerSent) {
-      this._headerSent = true;
-      this._quic.sendStream(this._streamId, wt_stream_header(false, this._sessionId), true);
-    } else {
-      this._quic.sendStream(this._streamId, new Uint8Array(0), true);
-    }
-    callback();
-  }
-
-  // WHATWG getter
-  get writable() {
-    if (!this._whatwgWritable) {
-      var self = this;
-      this._whatwgWritable = new WritableStream({
-        write(chunk) {
-          return new Promise(function (resolve, reject) {
-            self.write(chunk, function (err) { err ? reject(err) : resolve(); });
-          });
-        },
-        close() {
-          return new Promise(function (resolve) { self.end(resolve); });
-        }
-      });
-    }
-    return this._whatwgWritable;
-  }
-}
-
-
-class WebTransportUniReadStream extends Readable {
-
-  constructor(options) {
-    super({ highWaterMark: (options && options.highWaterMark) || 64 * 1024 });
-    this._streamId = options.streamId;
-  }
-
-  _read(_size) { /* data pushed externally */ }
-
-  _pushData(chunk) {
-    if (Buffer.isBuffer(chunk)) this.push(chunk);
-    else if (chunk instanceof Uint8Array) this.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-    else this.push(chunk);
-  }
-
-  _endData() { this.push(null); }
-
-  // WHATWG getter
-  get readable() {
-    if (!this._whatwgReadable) {
-      var self = this;
-      this._whatwgReadable = new ReadableStream({
-        start(controller) {
-          self.on('data', function (chunk) { controller.enqueue(chunk); });
-          self.on('end', function () { controller.close(); });
-          self.on('error', function (err) { controller.error(err); });
-        }
-      });
-    }
-    return this._whatwgReadable;
-  }
-}
+import lemonTls from 'lemon-tls';
+import { createHash, X509Certificate } from 'node:crypto';
+import { readVarInt, wt_datagram_payload } from './utils.js';
+import { createWtStream, openWtStream, createSendGroup, wtScheduling, createDatagrams, sessionStats, WebTransportError } from './wt_stream.js';
+import { defaultTransportParams } from './tls_bridge.js';
+import { initialCongestionWindow, checkConnectionOptions } from './quic_connection.js';
+import { sfString, parseSfString } from './http_common.js';
+import { parseVersionList } from './quic_version.js';
 
 
 // ============================================================
 //  WebTransport — Client
 //
-//  Usage:
-//    var wt = new WebTransport('https://server:4433/path');
-//    await wt.ready;
+//  The browser's WebTransport API (W3C), complete — code written for the
+//  browser runs here unchanged — and a Node-style API on the same object:
 //
-//    // Bidi stream (Duplex)
-//    var stream = await wt.createBidirectionalStream();
-//    stream.write('hello');
-//    stream.on('data', chunk => console.log(chunk));
+//    Browser API                              Node API
+//    -----------                              --------
+//    wt.ready / wt.closed / wt.draining       'ready' / 'close' / 'draining'
+//    wt.close({ closeCode, reason })
+//    wt.datagrams.readable / .writable /      wt.sendDatagram(buf), 'datagram'
+//      .createWritable() / .maxDatagramSize   wt.maxDatagramSize()
+//    wt.incomingBidirectionalStreams          'stream' (a Duplex)
+//    wt.incomingUnidirectionalStreams         'unidirectionalStream' (a Readable)
+//    await wt.createBidirectionalStream()     → a Duplex that also has
+//                                               .readable / .writable (WHATWG)
+//    await wt.createUnidirectionalStream()    → a WritableStream (WHATWG) that
+//                                               also has write() / end()
+//    wt.createSendGroup(), wt.getStats(), wt.reliability, wt.congestionControl,
+//    wt.protocol, WebTransportError
 //
-//    // Also works as WHATWG:
-//    var writer = stream.writable.getWriter();
-//    var reader = stream.readable.getReader();
+//    Options: the browser's — serverCertificateHashes, protocols,
+//    congestionControl, allowPooling, requireUnreliable, anticipatedConcurrent…
+//    — and Node's, as for https.request: rejectUnauthorized (default true),
+//    ca, key / cert / passphrase (a client certificate), and session (one
+//    saved from the 'session' event, to resume the TLS session). The
+//    server's certificate is verified against the platform roots
+//    unless `ca` is given, or serverCertificateHashes pins it as a browser
+//    does.
 //
-//    // Uni stream (outgoing only)
-//    var uni = await wt.createUnidirectionalStream();
-//    uni.write('one-way data');
-//    uni.end();
-//
-//    // Datagrams
-//    wt.sendDatagram(Buffer.from('ping'));
-//    wt.on('datagram', data => console.log('pong:', data));
-//
-//    // Incoming streams
-//    wt.on('stream', stream => { ... });          // bidi from server
-//    wt.on('unidirectionalStream', stream => { ... }); // uni from server
-//
-//    wt.close();
+//  A server stream goes to a Node listener if there is one, otherwise to the
+//  browser API's incoming…Streams once that is read; it waits for either.
 // ============================================================
+
+// What the client's unidirectional stream (a WritableStream) carries over
+// from the Node Writable underneath it — see createUnidirectionalStream.
+var UNI_METHODS = ['write', 'end', 'destroy', 'cork', 'uncork', 'setDefaultEncoding', 'resetStream', 'getStats',
+  'on', 'once', 'off', 'addListener', 'removeListener', 'removeAllListeners', 'prependListener',
+  'prependOnceListener', 'emit', 'listeners', 'listenerCount', 'eventNames'];
+var UNI_STATE = ['_streamId', 'id', 'sessionId', 'sendState', 'pending', 'streamErrorCode', 'destroyed', 'writableLength', 'writableHighWaterMark',
+  'writableNeedDrain', 'writableEnded', 'writableFinished', 'writableCorked', 'writableObjectMode', 'closed', 'errored'];
 
 class WebTransport extends EventEmitter {
 
@@ -270,36 +79,78 @@ class WebTransport extends EventEmitter {
     this._port = parseInt(parsed.port) || 443;
     this._path = parsed.pathname + (parsed.search || '');
     this._options = options || {};
+    // Checked here, as the browser checks its options: a bad value throws now,
+    // not later inside the connection.
+    defaultTransportParams(this._options.transportParams);
+    if (this._options.ecdhCurve != null) lemonTls.parseEcdhCurve(this._options.ecdhCurve);
+    if (this._options.sigalgs != null) lemonTls.parseSigalgs(this._options.sigalgs);
+    initialCongestionWindow(this._options.initialCongestionWindow);
+    (function (o) { var c = {}; ['startupCap', 'pmtuDiscovery', 'maxUdpPayloadSize', 'initialRtt', 'reorderWindow'].forEach(function (k) { if (o[k] != null) c[k] = o[k]; }); checkConnectionOptions(c, 'WebTransport'); })(this._options);
+    parseVersionList(this._options.quicVersions, 'quicVersions');
 
     // State
-    this._state = 'connecting'; // connecting → connected → closed
+    this._state = 'connecting'; // connecting → connected → closed, or connecting → failed
     this._sessionId = null;     // stream ID of the CONNECT request
     this._quic = null;
     this._h3 = null;
     this._udpSocket = null;
 
-    // Stream tracking
-    this._streams = {};            // streamId → WebTransportBidiStream | ReadStream
-    this._claimedStreams = new Set(); // stream IDs owned by WT (not H3)
+    // This session's streams, ours and the server's: streamId → stream.
+    this._streams = {};
+    // The server's streams not handed over yet: those that arrived before
+    // its 200 (a packet can overtake another), and those nobody listens for
+    // yet — the server opens streams with its 200, before `await wt.ready`
+    // has even returned to the code that will listen. As the browser's
+    // incomingUnidirectionalStreams holds them until read, they wait here for
+    // a 'stream' / 'unidirectionalStream' listener. Emitted at once, they
+    // were lost.
+    this._waiting = [];   // [event, stream]
 
-    // Client-initiated stream ID counters
-    // Bidi: 0 used for CONNECT, so WT bidi starts at 4, 8, 12...
-    // Uni: 2, 6, 10 used for H3 control/qpack, so WT uni starts at 14, 18, 22...
-    this._nextBidiStreamId = 4;
-    this._nextUniStreamId = 14;
-
-    // Incoming stream prefix buffers (for parsing session_id)
-    this._incomingBuffers = {};
-
-    // Promises (browser-compatible API)
+    // The browser API's promises. A rejection nobody awaits is logged by a
+    // browser; in Node it would end the process — so each has a handler of
+    // its own, and a caller that awaits it still sees the rejection.
     var self = this;
     this.ready = new Promise(function (resolve, reject) {
       self._readyResolve = resolve;
       self._readyReject = reject;
     });
-
-    this.closed = new Promise(function (resolve) {
+    this.ready.catch(function () {});
+    this.closed = new Promise(function (resolve, reject) {
       self._closedResolve = resolve;
+      self._closedReject = reject;
+    });
+    this.closed.catch(function () {});
+    this.draining = new Promise(function (resolve) { self._drainingResolve = resolve; });
+
+    // The browser API's attributes.
+    var o = this._options;
+    this.reliability = 'pending';     // then 'supports-unreliable' or 'reliable-only'
+    this.congestionControl = 'default';
+    this.protocol = '';               // the server's choice among options.protocols
+    this.anticipatedConcurrentIncomingUnidirectionalStreams = o.anticipatedConcurrentIncomingUnidirectionalStreams != null ? o.anticipatedConcurrentIncomingUnidirectionalStreams : null;
+    this.anticipatedConcurrentIncomingBidirectionalStreams = o.anticipatedConcurrentIncomingBidirectionalStreams != null ? o.anticipatedConcurrentIncomingBidirectionalStreams : null;
+    this._incoming = { stream: null, unidirectionalStream: null };   // the browser API's queues, once read
+    // The session, as wt_stream's createDatagrams / sessionStats take it —
+    // the server's res hands in the same.
+    var self = this;
+    this._dgStats = { droppedIncoming: 0, expiredIncoming: 0 };
+    this._dgOwner = { maxAge: null, expired: 0 };
+    this._session = {
+      get quic() { return self._quic; },
+      connected: function () { return self._state === 'connected'; },
+      send: function (u8, options) { return self.sendDatagram(u8, options); },
+      maxDatagramSize: function () { return self.maxDatagramSize(); },
+      owner: this._dgOwner,
+      dgStats: this._dgStats
+    };
+    this.datagrams = createDatagrams(this._session);
+
+    // A listener for the server's streams: those waiting go to it — once it
+    // is in place ('newListener' comes just before).
+    this.on('newListener', function (event) {
+      if ((event === 'stream' || event === 'unidirectionalStream') && self._waiting.length > 0) {
+        queueMicrotask(function () { self._handOver(); });
+      }
     });
 
     // Start connection
@@ -308,6 +159,32 @@ class WebTransport extends EventEmitter {
 
 
   // ---- Connection setup ----
+
+  // The session could not be established. `ready` rejects — that is how the
+  // browser API reports it, and how a caller written against it (try/await
+  // ready) expects to hear. 'error' is emitted as well, but only to listeners:
+  // an unheard 'error' would throw from inside a socket callback and take the
+  // process down where the browser would have rejected a promise.
+  //
+  // As in the browser the state becomes 'failed' and the connection is torn
+  // down: a session refused by the server (a CONNECT answered 403, say) left
+  // its QUIC connection open until the idle timeout.
+  _failSetup(err) {
+    if (this._state !== 'connecting') return;
+    this._state = 'failed';
+    // As the browser's: a WebTransportError, source 'session' — keeping the
+    // cause's message and code (node:tls's, say) for a Node caller.
+    if (!(err instanceof WebTransportError)) {
+      var we = new WebTransportError(err.message, { source: 'session' });
+      if (err.code) we.code = err.code;
+      we.cause = err;
+      err = we;
+    }
+    this._readyReject(err);
+    this._closedReject(err);
+    if (this.listenerCount('error') > 0) this.emit('error', err);
+    if (this._quic) this._quic.close(0x0100, 'WebTransport session not established', true);  // H3_NO_ERROR
+  }
 
   _connect() {
     var host = this._hostname;
@@ -318,7 +195,7 @@ class WebTransport extends EventEmitter {
       this._startQuic(ip);
     } else {
       dns.lookup(host, function (err, address) {
-        if (err) { self._readyReject(err); self.emit('error', err); return; }
+        if (err) { self._failSetup(err); return; }
         self._startQuic(address);
       });
     }
@@ -327,29 +204,79 @@ class WebTransport extends EventEmitter {
   _startQuic(remoteIp) {
     var self = this;
     var remotePort = this._port;
+    // Encrypted Client Hello: options.ech (the server's ECHConfigList), or
+    // GREASE ECH — as a browser sends — unless echGrease is false. Rejected
+    // with new keys, the session is attempted once more with them; an
+    // attempt given up for another is ignored from then on.
+    var attempt = this._attempt = (this._attempt || 0) + 1;
+    var ech = this._echConfig || this._options.ech || null;
 
     this._udpSocket = createQuicClientSocket({
       remoteIp: remoteIp,
       remotePort: remotePort,
       hostname: this._hostname,
+      // serverCertificateHashes pins the certificate instead of a CA (checked
+      // in onConnect, before anything is sent on the connection).
+      rejectUnauthorized: this._options.serverCertificateHashes ? false : this._options.rejectUnauthorized,
+      key: this._options.key, cert: this._options.cert, passphrase: this._options.passphrase,
+      ca: this._options.ca,
+      // A saved session ('session' event) to resume with, as tls.connect
+      // takes it. Not with serverCertificateHashes: a resumed handshake has
+      // no certificate to pin, and the pin is the only check there is.
+      session: this._options.serverCertificateHashes ? null : (this._options.session || null),
+      onSocket: function (q) {
+        q.on('session', function (buf) { self.emit('session', buf); });
+      },
+      transportParams: this._options.transportParams,
+      quicVersions: this._options.quicVersions,
+      initialCongestionWindow: this._options.initialCongestionWindow,
+      startupCap: this._options.startupCap,
+      pmtuDiscovery: this._options.pmtuDiscovery,
+      maxUdpPayloadSize: this._options.maxUdpPayloadSize,
+      initialRtt: this._options.initialRtt,
+      reorderWindow: this._options.reorderWindow,
+      ech: ech,
+      echGrease: !ech && this._options.echGrease !== false,
+      // The key-exchange groups to offer (tls.connect's ecdhCurve; checked
+      // in the constructor).
+      ecdhCurve: this._options.ecdhCurve,
+      sigalgs: this._options.sigalgs,
 
       onError: function (err) {
-        if (self._state === 'connecting') self._readyReject(err);
-        self.emit('error', err);
+        if (attempt !== self._attempt) return;
+        if (self._state === 'connecting' && err && err.code === 'ERR_ECH_REJECTED' && err.retryConfigs && !self._echRetried) {
+          self._echRetried = true;
+          self._echConfig = err.retryConfigs;
+          self._startQuic(remoteIp);
+          return;
+        }
+        if (self._state === 'connecting') { self._failSetup(err); return; }
+        if (self.listenerCount('error') > 0) self.emit('error', err);
       },
 
       onConnect: function (q, s) {
+        if (attempt !== self._attempt) { try { q.close(0x100, 'superseded', true); } catch (e) {} return; }
         self._quic = q;
         self._udpSocket = s;
+        var pinErr = self._checkCertificateHashes();
+        if (pinErr) { self._failSetup(pinErr); return; }
         self._h3 = new H3Connection({ quicConnection: self._quic, isServer: false, enableWebTransport: true });
         self._setupH3Handlers();
         self._sendConnect();
       },
 
       onClose: function () {
-        self._state = 'closed';
-        self._closedResolve();
-        self.emit('close');
+        if (attempt !== self._attempt) return;
+        // Gone before the CONNECT was answered — after the QUIC handshake, so
+        // onError did not see it. `ready` must settle (it rejects in the
+        // browser too); left pending, the caller would wait forever.
+        if (self._state === 'connecting') {
+          var err = new Error('WebTransport connection closed before the session was established');
+          err.code = 'ERR_WEBTRANSPORT_SESSION_FAILED';
+          self._failSetup(err);
+        }
+        if (self._state !== 'failed') self._state = 'closed';
+        self._sessionClosed();
         // The helper closes the UDP socket.
       }
     });
@@ -361,31 +288,74 @@ class WebTransport extends EventEmitter {
   _setupH3Handlers() {
     var self = this;
 
+    // The CONNECT stream after the 200: capsules. The server's
+    // CLOSE_WEBTRANSPORT_SESSION ends the session, its DRAIN asks us to wind
+    // down ('draining').
+    var readCapsules = createCapsuleReader(function (info) {
+      if (!self.closeInfo) self.closeInfo = info;
+      self.close(info);
+    }, function () { self._drainingResolve(); self.emit('draining'); });
+    this._h3.on('http_body', function (streamId, data) {
+      if (streamId === self._sessionId && self._state === 'connected') readCapsules(data);
+    });
+
     // CONNECT response headers
     this._h3.on('http_headers', function (streamId, headers) {
       if (streamId === self._sessionId) {
         var status = parseInt(headers[':status']) || 0;
+        // 1xx (103 Early Hints) is not the answer to the CONNECT: it follows.
+        if (status >= 100 && status < 200) return;
         if (status === 200) {
+          var reliability = self._quic.maxDatagramSize() > 0 ? 'supports-unreliable' : 'reliable-only';
+          if (self._options.requireUnreliable && reliability !== 'supports-unreliable') {
+            self._failSetup(new Error('the server does not take datagrams (requireUnreliable)'));
+            return;
+          }
           self._state = 'connected';
+          self.reliability = reliability;
+          // The server's choice among options.protocols (WT-Protocol, a
+          // structured-field string), if it made one from them.
+          var chosen = parseSfString(headers['wt-protocol']);
+          if (chosen !== null && (self._options.protocols || []).indexOf(chosen) >= 0) self.protocol = chosen;
           self._readyResolve();
           self.emit('ready');
+          self._handOver();
         } else {
-          var err = new Error('WebTransport CONNECT failed: HTTP ' + status);
-          self._readyReject(err);
-          self.emit('error', err);
+          self._failSetup(new Error('WebTransport CONNECT failed: HTTP ' + status));
+          return;
         }
       }
     });
 
-    // Raw QUIC stream data — intercept WT streams before H3 processes them
-    // We register on QUIC directly. H3 will also receive these events,
-    // but we call h3.claimStream() for WT streams so H3 skips them.
-    this._quic.on('stream', function (streamId, data, fin) {
-      // Skip streams owned by H3 (CONNECT stream, control streams)
-      if (streamId === self._sessionId) return; // H3 handles CONNECT response
-      if (!self._isWebTransportStream(streamId)) return;
+    // The server's streams. h3.js recognises them by their prefix — 0x41 or
+    // 0x54 and this session's ID — exactly as it does the client's on the
+    // server, and hands them over. They were picked out here by stream number
+    // (3, 7, 11 taken for HTTP/3's own, 15 and up for WebTransport), true only
+    // while the server opened its streams in that order and no others; and
+    // their bytes were read past HTTP/3's back, uncredited and unbounded.
+    this._h3.on('wt_stream', function (sessionId, streamId, data, fin, isBidi) {
+      if (sessionId !== self._sessionId) return;
+      var stream = self._newStream(streamId, isBidi ? 'bidi' : 'uni-in');
+      if (data.byteLength > 0) stream._pushData(data);
+      if (fin) stream._endData();
+      self._waiting.push([isBidi ? 'stream' : 'unidirectionalStream', stream]);
+      self._handOver();
+    });
+    this._h3.on('wt_data', function (sessionId, streamId, data, fin) {
+      var stream = self._streams[streamId];
+      if (!stream) return;
+      if (data.byteLength > 0) stream._pushData(data);
+      if (fin) stream._endData();
+    });
 
-      self._handleStreamData(streamId, data, fin);
+    // The server gave up on a stream: it ends with the server's code.
+    this._h3.on('stream_reset', function (streamId, code) { self._peerCancelled(streamId, 'stream_reset', code); });
+    this._h3.on('stop_sending', function (streamId, code) { self._peerCancelled(streamId, 'stop_sending', code); });
+
+    // The session is over in HTTP/3 (its CONNECT stream ended): its streams,
+    // already reset there, end here too.
+    this._h3.on('wt_session_closed', function (sessionId) {
+      if (sessionId === self._sessionId) self._destroyStreams();
     });
 
     // Datagrams — QUIC DATAGRAM payload = VarInt(quarter_stream_id) + app data (RFC 9297)
@@ -396,125 +366,103 @@ class WebTransport extends EventEmitter {
       var result = readVarInt(rawData, 0);
       if (!result) return;
       var qsid = result.value;
-      var payload = rawData.slice(result.byteLength);
 
       var expectedQsid = Math.floor(self._sessionId / 4);
       if (self._sessionId !== null && qsid === expectedQsid) {
-        self.emit('datagram', Buffer.from(payload));
+        // One copy, into a buffer of its own: exact size, byteOffset 0 — not
+        // slice() + Buffer.from(), which copied twice and put anything under
+        // 4KB into Node's shared 8KB Buffer pool (see h3_server.js).
+        var payload = new Uint8Array(rawData.byteLength - result.byteLength);
+        payload.set(rawData.subarray(result.byteLength));
+        self.datagrams._push(payload);
+        self.emit('datagram', Buffer.from(payload.buffer));
       }
     });
   }
 
-  _isWebTransportStream(streamId) {
-    // Already claimed
-    if (this._claimedStreams.has(streamId)) return true;
-
-    // Server-initiated bidi: 1, 5, 9, 13... (could be WT)
-    // Server-initiated uni: 3, 7, 11, 15... (11+ could be WT, 3/7/11 are H3)
-    // Client-initiated bidi: 4+ are WT (0 is CONNECT)
-    // Client-initiated uni: 14+ are WT (2/6/10 are H3)
-    var type = streamId & 0x3;
-
-    if (type === 0x0) {
-      // Client bidi — stream 0 is CONNECT, 4+ are WT
-      return streamId >= 4;
-    } else if (type === 0x1) {
-      // Server bidi — all are potentially WT
-      return true;
-    } else if (type === 0x2) {
-      // Client uni — 2/6/10 are H3, 14+ are WT
-      return streamId >= 14;
-    } else {
-      // Server uni — 3/7/11 are H3, 15+ are potentially WT
-      return streamId >= 15;
-    }
+  // A stream of this session, ours or the server's (wt_stream.js), forgotten
+  // when it closes.
+  _newStream(streamId, kind, prefixLength) {
+    var self = this;
+    var stream = createWtStream(this._quic, streamId, kind, function () {
+      if (self._streams[streamId] === stream) delete self._streams[streamId];
+      if (self._h3) self._h3.releaseWebTransportStream(streamId);
+    }, prefixLength, this._sched, this._sessionId);
+    this._streams[streamId] = stream;
+    return stream;
   }
 
-  _handleStreamData(streamId, data, fin) {
-    // Already have a stream object?
-    if (streamId in this._streams) {
-      var stream = this._streams[streamId];
-      if (data.byteLength > 0) stream._pushData(data);
-      if (fin) { stream._endData(); delete this._streams[streamId]; }
-      return;
+  // The peer gave up on one direction of a stream: that direction ends (the
+  // stream is forgotten when it closes — see _newStream).
+  _peerCancelled(streamId, how, code) {
+    var stream = this._streams[streamId];
+    if (stream) stream._peerCancelled(how, code);
+  }
+
+  // Hand the server's waiting streams to whoever listens for them, in
+  // order; the rest keep waiting (see _waiting).
+  // A Node listener first; otherwise the browser API's queue, once it is
+  // read (incomingBidirectionalStreams yields the Duplex, which has the
+  // browser's .readable and .writable; incomingUnidirectionalStreams yields
+  // the stream's ReadableStream, as the browser does).
+  _handOver() {
+    if (this._state !== 'connected') return;
+    var keep = [];
+    for (var i = 0; i < this._waiting.length; i++) {
+      var w = this._waiting[i];
+      if (w[1].destroyed) continue;
+      if (this.listenerCount(w[0]) > 0) this.emit(w[0], w[1]);
+      else if (this._incoming[w[0]]) this._incoming[w[0]].enqueue(w[0] === 'stream' ? w[1] : w[1].readable);
+      else keep.push(w);
     }
+    this._waiting = keep;
+  }
 
-    // New incoming stream — need to parse session_id prefix
-    if (!(streamId in this._incomingBuffers)) {
-      this._incomingBuffers[streamId] = { chunks: [], totalLen: 0 };
+  _incomingStreams(event) {
+    var self = this;
+    var rs = new ReadableStream({
+      start: function (controller) { self._incoming[event] = controller; }
+    });
+    queueMicrotask(function () { self._handOver(); });
+    return rs;
+  }
+
+  // The session is over: each stream still open goes with WT_SESSION_GONE
+  // (draft-ietf-webtrans-http3 §4.6), not an application code.
+  _destroyStreams() {
+    for (var id in this._streams) { this._streams[id]._sessionGone(); this._streams[id].destroy(); }
+    for (var i = 0; i < this._waiting.length; i++) { var w = this._waiting[i][1]; if (w._sessionGone) w._sessionGone(); w.destroy(); }
+    this._waiting = [];
+    for (var ev in this._incoming) {
+      if (this._incoming[ev]) { try { this._incoming[ev].close(); } catch (e) {} }
     }
+    this.datagrams._close();
+  }
 
-    var buf = this._incomingBuffers[streamId];
-    buf.chunks.push(data);
-    buf.totalLen += data.byteLength;
-
-    // Try to parse prefix
-    var combined = buf.totalLen === data.byteLength ? data : concatUint8Arrays(buf.chunks);
-    var isBidi = (streamId & 0x2) === 0;
-    var offset = 0;
-
-    // Parse stream type as VarInt (0x41=bidi WT, 0x54=uni WT)
-    var typeResult = readVarInt(combined, 0);
-    if (!typeResult) { if (fin) delete this._incomingBuffers[streamId]; return; }
-    var streamType = typeResult.value;
-    offset = typeResult.byteLength;
-
-    if (!isBidi) {
-      if (streamType !== 0x54) {
-        // Not a WT uni stream — let H3 handle it
-        delete this._incomingBuffers[streamId];
-        return;
-      }
-    } else {
-      if (streamType !== 0x41) {
-        delete this._incomingBuffers[streamId];
-        return;
-      }
-    }
-
-    // Parse VarInt session_id
-    if (offset >= combined.byteLength) { if (fin) delete this._incomingBuffers[streamId]; return; }
-    var result = readVarInt(combined, offset);
-    if (!result) { if (fin) delete this._incomingBuffers[streamId]; return; }
-
-    var sessionId = result.value;
-    var afterPrefix = offset + result.byteLength;
-
-    // Verify it matches our session
-    if (sessionId !== this._sessionId) {
-      delete this._incomingBuffers[streamId];
-      return;
-    }
-
-    // Claim stream — tell H3 to skip it
-    this._claimedStreams.add(streamId);
-    if (this._h3 && this._h3.claimStream) this._h3.claimStream(streamId);
-    delete this._incomingBuffers[streamId];
-
-    // Create stream object
-    var remaining = combined.byteLength > afterPrefix
-      ? combined.slice(afterPrefix)
-      : new Uint8Array(0);
-
-    if (isBidi) {
-      var stream = new WebTransportBidiStream({
-        streamId: streamId,
-        quic: this._quic,
-        sessionId: this._sessionId,
-        prefixSent: false // server-initiated, prefix not needed for writes back
-      });
-      this._streams[streamId] = stream;
-      if (remaining.byteLength > 0) stream._pushData(remaining);
-      if (fin) { stream._endData(); delete this._streams[streamId]; }
-      this.emit('stream', stream);
-
-    } else {
-      var stream = new WebTransportUniReadStream({ streamId: streamId });
-      this._streams[streamId] = stream;
-      if (remaining.byteLength > 0) stream._pushData(remaining);
-      if (fin) { stream._endData(); delete this._streams[streamId]; }
-      this.emit('unidirectionalStream', stream);
-    }
+  // serverCertificateHashes (the browser's way to trust a certificate it
+  // cannot verify by CA): the leaf's SHA-256 must be one of them, and — as
+  // the browser requires of such a certificate — it must be valid now, for
+  // no more than 14 days. Checked once the handshake is done and before
+  // anything is sent: the handshake has already proved the server holds the
+  // certificate's key. null when it passes (or none were given).
+  _checkCertificateHashes() {
+    var hashes = this._options.serverCertificateHashes;
+    if (!hashes || !hashes.length) return null;
+    var chain = this._quic.getPeerCertificateChain && this._quic.getPeerCertificateChain();
+    if (!chain || !chain.length) return new Error('serverCertificateHashes: the server sent no certificate');
+    var der = Buffer.from(chain[0]);
+    var digest = createHash('sha256').update(der).digest();
+    var match = hashes.some(function (h) {
+      if (!h || String(h.algorithm).toLowerCase() !== 'sha-256' || !h.value) return false;
+      var v = ArrayBuffer.isView(h.value) ? Buffer.from(h.value.buffer, h.value.byteOffset, h.value.byteLength) : Buffer.from(h.value);
+      return v.length === digest.length && v.equals(digest);
+    });
+    if (!match) return new Error('serverCertificateHashes: the certificate matches none of them');
+    var cert = new X509Certificate(der), now = Date.now();
+    var from = Date.parse(cert.validFrom), to = Date.parse(cert.validTo);
+    if (!(now >= from && now <= to)) return new Error('serverCertificateHashes: the certificate is not valid now');
+    if (to - from > 14 * 24 * 3600 * 1000) return new Error('serverCertificateHashes: the certificate is valid for more than 14 days');
+    return null;
   }
 
   // ---- Send CONNECT ----
@@ -523,8 +471,11 @@ class WebTransport extends EventEmitter {
     // Send H3 control streams (SETTINGS)
     this._h3.sendControlStreams();
 
-    // CONNECT uses stream 0 (first client bidi)
-    this._sessionId = 0;
+    // The CONNECT goes on the first bidirectional stream; its number is the
+    // session's ID, and the server's streams for it carry that ID — so they
+    // are recognised from now on, even one that overtakes the 200.
+    this._sessionId = this._quic.nextLocalStreamId(true);
+    this._sched = wtScheduling(this._quic, this._sessionId);
 
     // Send Extended CONNECT — no FIN (session stays open)
     var headers = {
@@ -534,8 +485,14 @@ class WebTransport extends EventEmitter {
       ':authority': this._hostname + (this._port !== 443 ? ':' + this._port : ''),
       ':path': this._path
     };
+    // The browser's `protocols`: the application protocols it offers, as a
+    // structured-field list of strings; the server answers with WT-Protocol.
+    if (Array.isArray(this._options.protocols) && this._options.protocols.length > 0) {
+      headers['wt-available-protocols'] = this._options.protocols.map(sfString).join(', ');
+    }
 
     this._h3.sendHeaders(this._sessionId, headers, false);
+    this._h3.registerWebTransportSession(this._sessionId);
   }
 
 
@@ -543,98 +500,137 @@ class WebTransport extends EventEmitter {
   //  Public API
   // ============================================================
 
-  /**
-   * Create a bidirectional stream.
-   * Returns a Duplex stream (Node.js) with .readable/.writable (WHATWG).
-   */
-  createBidirectionalStream() {
+  // The browser's stream options — sendOrder, sendGroup, waitUntilAvailable
+  // (wt_stream's openWtStream, as the server's): a stream past the server's
+  // limit without waitUntilAvailable is refused, as the browser refuses it.
+  // Resolved once the stream is open — at once if the server allows it, or
+  // when it does (waitUntilAvailable), as the browser's.
+  _openStream(bidi, options) {
+    if (this._state !== 'connected') return Promise.reject(new WebTransportError('the session is not connected', { source: 'session' }));
     var self = this;
     return new Promise(function (resolve, reject) {
-      if (self._state !== 'connected') {
-        return reject(new Error('WebTransport is not connected'));
-      }
-
-      var streamId = self._nextBidiStreamId;
-      self._nextBidiStreamId += 4;
-
-      // Claim this stream so H3 doesn't process it
-      self._claimedStreams.add(streamId);
-      if (self._h3 && self._h3.claimStream) self._h3.claimStream(streamId);
-
-      var stream = new WebTransportBidiStream({
-        streamId: streamId,
-        quic: self._quic,
-        sessionId: self._sessionId,
-        prefixSent: false
-      });
-
-      self._streams[streamId] = stream;
-
-      // Listen for incoming data on this bidi stream
-      // (already handled by _handleStreamData via QUIC stream event)
-
-      resolve(stream);
+      var stream = openWtStream(self._h3, self._quic, self._sessionId, bidi, options,
+        function (id, kind, prefix) { return self._newStream(id, kind, prefix); },
+        function (err, st) { if (err) reject(new WebTransportError(err.message, { source: 'session' })); else resolve(st); });
+      if (!stream) reject(new WebTransportError('the server allows no more streams now', { source: 'session' }));
     });
   }
 
+  /** Whether a stream could be opened now, within the server's MAX_STREAMS — as the server's res.canOpenStream(). */
+  canOpenStream(options) {
+    return this._state === 'connected' && !!this._quic && this._quic.canOpenStream(!!(options && options.bidirectional));
+  }
+
   /**
-   * Create a unidirectional stream (outgoing only).
-   * Returns a Writable stream (Node.js) with .writable (WHATWG).
+   * A bidirectional stream: a Duplex (wt_stream.js) — and, as the browser's
+   * WebTransportBidirectionalStream, it has .readable and .writable.
    */
-  createUnidirectionalStream() {
-    var self = this;
-    return new Promise(function (resolve, reject) {
-      if (self._state !== 'connected') {
-        return reject(new Error('WebTransport is not connected'));
-      }
+  createBidirectionalStream(options) {
+    return this._openStream(true, options);
+  }
 
-      var streamId = self._nextUniStreamId;
-      self._nextUniStreamId += 4;
-
-      // Claim this stream
-      self._claimedStreams.add(streamId);
-      if (self._h3 && self._h3.claimStream) self._h3.claimStream(streamId);
-
-      var stream = new WebTransportUniWriteStream({
-        streamId: streamId,
-        quic: self._quic,
-        sessionId: self._sessionId
+  /**
+   * A unidirectional stream: as the browser's, a WritableStream
+   * (getWriter(), pipeTo() into it) — and Node's Writable on the same object,
+   * whole: write() / 'drain', end(), resetStream(), its events, the
+   * writable* state, and readable.pipe() into it, as the server's stream is.
+   * Only write(), end() and a few events were carried over: there was no
+   * writableLength, no destroyed, and pipe() failed on the missing emit().
+   */
+  createUnidirectionalStream(options) {
+    return this._openStream(false, options).then(function (stream) {
+      var w = stream.writable;
+      UNI_METHODS.forEach(function (m) {
+        if (!(m in w) || m === 'getStats') w[m] = stream[m].bind(stream);
       });
-
-      resolve(stream);
+      UNI_STATE.forEach(function (k) {
+        Object.defineProperty(w, k, { configurable: true, get: function () { return stream[k]; } });
+      });
+      return w;
     });
+  }
+
+  /** The browser's incoming streams, as ReadableStreams of streams. */
+  get incomingBidirectionalStreams() {
+    return this._incomingBidi || (this._incomingBidi = this._incomingStreams('stream'));
+  }
+  get incomingUnidirectionalStreams() {
+    return this._incomingUni || (this._incomingUni = this._incomingStreams('unidirectionalStream'));
+  }
+
+  /** The browser's WebTransportSendGroup. */
+  createSendGroup() {
+    return createSendGroup();
+  }
+
+  /**
+   * The browser's getStats(): the connection's figures, as QUIC has them.
+   */
+  getStats() {
+    return sessionStats(this._session);   // wt_stream: as the server's res.getStats()
   }
 
   /**
    * Send an unreliable datagram.
    */
-  sendDatagram(data) {
+  // As the server's res.sendDatagram: true when queued (sent under
+  // congestion control, never retransmitted), false when it cannot be sent at
+  // all — larger than maxDatagramSize(), or the server takes no datagrams.
+  // options { sendOrder, sendGroup }: its place among the session's streams
+  // (wt_stream's wtScheduling); without them, ahead of every stream.
+  sendDatagram(data, options) {
     if (this._state !== 'connected') throw new Error('WebTransport is not connected');
     if (typeof data === 'string') data = Buffer.from(data);
     if (Buffer.isBuffer(data)) data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    // VarInt(quarter stream ID) + payload (RFC 9297)
+    return this._quic.sendDatagram(wt_datagram_payload(this._sessionId, data), this._sched.forDatagram(options), this._dgOwner);
+  }
 
-    // Build datagram: VarInt(quarter_stream_id) + payload (RFC 9297)
-    var frame = wt_datagram_payload(this._sessionId, data);
-
-    // Send via QUIC DATAGRAM frame
-    if (this._quic && this._quic.sendDatagram) {
-      this._quic.sendDatagram(frame);
-    }
+  /** The largest datagram this session can send, in bytes of payload. */
+  maxDatagramSize() {
+    if (this._state !== 'connected') return 0;
+    return Math.max(0, this._quic.maxDatagramSize() - wt_datagram_payload(this._sessionId, new Uint8Array(0)).byteLength);
   }
 
   /**
    * Close the WebTransport session.
    */
+  // The session is over: `closed` resolves and 'close' is emitted, once. As
+  // in the browser, closed resolves with the code and reason the session was
+  // closed with — the server's CLOSE_WEBTRANSPORT_SESSION, or ours — and
+  // { closeCode: 0, reason: '' } when there was none. At the session's close,
+  // not the QUIC connection's: that one lingers in its closing period
+  // (RFC 9000 §10.2) for three PTOs after, and `closed` waited it out.
+  _sessionClosed() {
+    if (this._closedDone) return;
+    this._closedDone = true;
+    this._destroyStreams();
+    this._closedResolve(this.closeInfo || { closeCode: 0, reason: '' });
+    this.emit('close');
+  }
+
   close(info) {
-    if (this._state === 'closed') return;
+    if (this._state === 'closed' || this._state === 'failed') return;
     this._state = 'closed';
 
-    // Send CLOSE_WEBTRANSPORT_SESSION on CONNECT stream (optional)
-    // Then close QUIC connection
-    if (this._quic) {
-      // WebTransport runs over HTTP/3, so the application space applies here too.
-      this._quic.close(0x0100, (info && info.reason) || 'WebTransport closed', true);
+    // CLOSE_WEBTRANSPORT_SESSION with the code and reason, and the CONNECT
+    // stream's end — so the server learns them, as from a browser's
+    // wt.close(). Then the QUIC connection, which is this session's alone,
+    // once the capsule has left: closed at once, it was dropped unsent.
+    var quic = this._quic;
+    if (!this.closeInfo) this.closeInfo = { closeCode: (info && info.closeCode) || 0, reason: (info && info.reason) || '' };
+    if (quic) {
+      var closeQuic = function () { quic.close(0x0100, 'WebTransport closed', true); };   // H3_NO_ERROR
+      if (this._h3 && this._sessionId !== null) {
+        this._h3.sendBody(this._sessionId, wtCloseCapsule(this.closeInfo.closeCode, this.closeInfo.reason), true);
+        quic.whenStreamSent(this._sessionId, 0, closeQuic);
+        var t = setTimeout(closeQuic, 1000);   // a capsule that cannot leave does not hold the close
+        if (t.unref) t.unref();
+      } else {
+        closeQuic();
+      }
     }
+    this._sessionClosed();
   }
 
   /**
@@ -653,4 +649,4 @@ class WebTransport extends EventEmitter {
 }
 
 
-export { WebTransport, WebTransportBidiStream, WebTransportUniWriteStream, WebTransportUniReadStream };
+export { WebTransport, WebTransportError };

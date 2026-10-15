@@ -471,7 +471,29 @@ function _utf8(str) {
 }
 
 
+// ============================================================
+//  Dynamic table entry size
+//
+//  RFC 7541 §4.1 and RFC 9204 §3.2.1 define it identically: the name, the
+//  value, and 32 bytes of assumed per-entry overhead. The constant stands in
+//  for the bookkeeping a real implementation carries, and BOTH PEERS MUST
+//  AGREE ON IT — a table sized any other way drifts apart from the peer's and
+//  every index after the first eviction resolves to the wrong field.
+//
+//  In bytes, not characters. Sizing by string length overflows the table on
+//  any non-ASCII header value, and does so silently.
+// ============================================================
+
+var ENTRY_OVERHEAD = 32;
+
+function entrySize(name, value) {
+  return Buffer.byteLength(name, 'utf8') + Buffer.byteLength(value, 'utf8') + ENTRY_OVERHEAD;
+}
+
+
 export {
+  ENTRY_OVERHEAD,
+  entrySize,
   // Huffman
   HUFF_CODES,
   HUFF_BITS,

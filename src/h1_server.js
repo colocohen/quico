@@ -15,7 +15,7 @@
 import { EventEmitter } from 'node:events';
 
 import { H1Parser, buildResponseHead, encodeChunk, encodeLastChunk } from './h1.js';
-import { STATUS_TEXT } from './http_common.js';
+import { corkForTick, STATUS_TEXT, runRequestHandler, DEFAULT_HEADERS_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, maxRequestsPerSocket, trailerFields, statusHasNoBody, httpDate } from './http_common.js';
 import { IncomingMessage, ServerResponse } from './streams.js';
 import { createTcpListener } from './tcp_listener.js';
 
@@ -39,10 +39,23 @@ import { createTcpListener } from './tcp_listener.js';
 // A peer that opens a connection and then says nothing — or sends a head one
 // byte at a time — costs us a socket and a buffer for as long as we let it.
 // h1.js deliberately cannot help here: an incomplete head is indistinguishable
-// from a slow one, and it has no clock. The clock lives here.
-var DEFAULT_HEADERS_TIMEOUT = 60 * 1000;
+// from a slow one, and it has no clock. The clock lives here. (The headers and
+// request defaults are every version's: http_common.)
 var DEFAULT_KEEPALIVE_TIMEOUT = 5 * 1000;
-var DEFAULT_REQUEST_TIMEOUT = 0;          // 0 = no limit on a whole request
+
+
+// The hints as header fields: names lowercased, and only real values.
+// Everything else about them (which links, which rels) is the caller's.
+function earlyHintHeaders(hints) {
+  var out = {};
+  for (var n in (hints || {})) {
+    if (!Object.prototype.hasOwnProperty.call(hints, n)) continue;
+    var v = hints[n];
+    if (v === undefined || v === null || (Array.isArray(v) && v.length === 0)) continue;
+    out[String(n).toLowerCase()] = v;
+  }
+  return out;
+}
 
 
 function createServer(options, handler) {
@@ -57,13 +70,25 @@ function createServer(options, handler) {
   var headersTimeout = options.headersTimeout != null ? options.headersTimeout : DEFAULT_HEADERS_TIMEOUT;
   var keepAliveTimeout = options.keepAliveTimeout != null ? options.keepAliveTimeout : DEFAULT_KEEPALIVE_TIMEOUT;
   var requestTimeout = options.requestTimeout != null ? options.requestTimeout : DEFAULT_REQUEST_TIMEOUT;
-  var maxHeadSize = options.maxHeadSize;
+  // maxHeaderSize is node:http's name for the same limit.
+  var maxHeadSize = options.maxHeadSize || options.maxHeaderSize;
   var maxHeaderCount = options.maxHeaderCount;
+  // node:http's: the Nth response says Connection: close and the connection
+  // ends after it; a request past it (pipelined) is answered 503.
+  var maxRequests = maxRequestsPerSocket(options.maxRequestsPerSocket);
 
   // Advertised on every response so a client learns HTTP/3 is available on the
   // same authority (RFC 9114 §3.3). The unified server sets it; a standalone
   // h1 server has nothing to advertise.
   var altSvc = options.altSvc || null;
+
+  // node:http's shouldUpgradeCallback(request): whether an upgrade request
+  // reaches 'upgrade' (true) or is handled as an ordinary 'request' (false).
+  // Node's default, and ours: true when something listens for 'upgrade'.
+  // It used to be answered 501 when nothing did — a refusal Node never gives.
+  var shouldUpgradeCallback = typeof options.shouldUpgradeCallback === 'function'
+    ? options.shouldUpgradeCallback
+    : function () { return ev.listenerCount('upgrade') > 0; };
 
 
   // ============================================================
@@ -77,10 +102,19 @@ function createServer(options, handler) {
     var parser = new H1Parser({
       isServer: true,
       maxHeadSize: maxHeadSize,
-      maxHeaderCount: maxHeaderCount
+      maxHeaderCount: maxHeaderCount,
+      // The request as the callback sees it: method, url, headers — what
+      // node:http's IncomingMessage carries at that point.
+      shouldUpgrade: function (info) {
+        return shouldUpgradeCallback({
+          method: info.method, url: info.url, headers: info.headers,
+          rawHeaders: info.rawHeaders, httpVersion: info.httpVersion, socket: socket
+        });
+      }
     });
 
     var current = null;        // { req, res, info }
+    var served = 0;            // requests seen on this connection (maxRequestsPerSocket)
     var destroyed = false;
     var timer = null;
 
@@ -92,7 +126,8 @@ function createServer(options, handler) {
         // Nothing is half-written at this point in the states we arm the timer
         // for, so a hard destroy is honest: a 408 to a peer that has sent no
         // complete request may itself never be read.
-        if (reason === 'headers' && !current) {
+        // requestTimeout with nothing answered yet: a 408 too, as node:http.
+        if ((reason === 'headers' && !current) || (reason === 'request' && current && !current.res.headersSent)) {
           try { socket.end(buildResponseHead(408, null, { 'Connection': 'close', 'Content-Length': '0' })); }
           catch (e) {}
         }
@@ -108,6 +143,7 @@ function createServer(options, handler) {
       clearTimer();
       connections.delete(socket);
       if (current && current.req && !current.req.complete) current.req._abort(err || null);
+      if (current && current.res) current.res._abortResponse();   // see ServerResponse
       try { socket.destroy(); } catch (e) {}
     }
 
@@ -132,8 +168,30 @@ function createServer(options, handler) {
 
     function resumeParsing() {
       if (destroyed) return;
+      holdForResponse = false;
+      updateReading();
       try { parser.resume(); }
       catch (err) { ev.emit('clientError', err, socket); destroy(err); }
+    }
+
+    // Reading from the socket stops while nothing would take what it brings,
+    // as node:http does it — the kernel's buffer fills, and TCP slows the
+    // client down:
+    //   holdForReader    the request body is not being read: the
+    //                    IncomingMessage's buffer is full (push() said so),
+    //                    until it asks for more (_read).
+    //   holdForResponse  the request is complete and its response is not:
+    //                    what follows is the next request, not looked at
+    //                    until then (pipelining, RFC 9112 §9.3).
+    // Neither stopped the socket. The parser took everything in — a body
+    // the handler had not started reading (it was waiting on a lookup, say)
+    // was held in memory as fast as the client could send it, hundreds of MB
+    // in seconds; so were pipelined bytes behind a slow response.
+    var holdForReader = false, holdForResponse = false;
+    function updateReading() {
+      if (destroyed) return;
+      if (holdForReader || holdForResponse) { if (!socket.isPaused()) socket.pause(); }
+      else if (socket.isPaused()) socket.resume();
     }
 
     socket.on('error', function (err) {
@@ -161,6 +219,7 @@ function createServer(options, handler) {
       // the next message starts, so the connection always closes after this.
       if (!destroyed && socket.writable) {
         var code = err.statusCode || 400;
+        if (options.stats) options.stats.status(options.stats.closes.http1.sent, code);
         try {
           socket.end(buildResponseHead(code, null, {
             'Connection': 'close',
@@ -174,6 +233,15 @@ function createServer(options, handler) {
     parser.on('headers', function (info) {
       clearTimer();
       setTimer(requestTimeout, 'request');
+      served++;
+      if (maxRequests > 0 && served > maxRequests) {
+        // Past the limit (node:http: "subsequent requests ... will get 503").
+        try {
+          socket.end(buildResponseHead(503, null, { 'Connection': 'close', 'Content-Length': '0' }));
+        } catch (e) {}
+        destroy(null);
+        return;
+      }
 
       var req = new IncomingMessage({
         httpVersion: info.httpVersion,
@@ -184,12 +252,27 @@ function createServer(options, handler) {
       });
       req.rawHeaders = info.rawHeaders;
       req.complete = false;
+      // Read whole from 0-RTT data (TLS early data): it could be a replay
+      // (server.js holds it to earlyDataFilter). A request completed by
+      // bytes after the handshake cannot be replayed, and is not early.
+      req.earlyData = socket.isEarlyData === true;
 
       var res = new ServerResponse({ socket: socket });
       res.req = req;
+      // res.destroy([err]) / req.destroy([err]) by the application, the
+      // response unfinished: the socket goes, as on node:http — the only way
+      // HTTP/1.1 has to say the response will not be completed. It stayed
+      // open, and the client waited for the rest.
+      res._onDestroy(function () { destroy(null); });
+      req._onDestroy(function (err) { if (!res.writableFinished && !res.destroyed) res.destroy(err); });
+      // The reader wants more: reading from the socket goes on (see
+      // holdForReader).
+      req._read = function () {
+        if (holdForReader && current && current.req === req) { holdForReader = false; updateReading(); }
+      };
 
       current = { req: req, res: res, info: info };
-      wireResponse(info, req, res);
+      wireResponse(info, req, res, maxRequests > 0 && served >= maxRequests);
 
       // Expect: 100-continue (RFC 9110 §10.1.1). The client is waiting for
       // permission before sending the body; if we never answer, it stalls for
@@ -199,7 +282,7 @@ function createServer(options, handler) {
       var expect = String(info.headers['expect'] || '').toLowerCase();
       if (expect === '100-continue') {
         if (ev.listenerCount('checkContinue') > 0) {
-          ev.emit('checkContinue', req, res);
+          runRequestHandler(function () { ev.emit('checkContinue', req, res); }, handlerFailed);
           return;   // the listener owns the exchange from here
         }
         try { socket.write('HTTP/1.1 100 Continue\r\n\r\n'); } catch (e) {}
@@ -212,12 +295,36 @@ function createServer(options, handler) {
       // is an ordinary request the application should answer (and probably
       // ignore the Upgrade on), not one to drop on the floor. The early return
       // that used to sit here hung exactly those.
-      if (typeof handler === 'function') handler(req, res);
-      ev.emit('request', req, res);
+      runRequestHandler(function () {
+        if (typeof handler === 'function') handler(req, res);
+        ev.emit('request', req, res);
+      }, handlerFailed);
+
+      // The handler threw (see runRequestHandler): a 500 if nothing has been
+      // sent yet, and the connection closed — the response may be half
+      // written, and nothing after it on this connection can be trusted to
+      // line up. A response it had already ended is left to finish.
+      function handlerFailed() {
+        if (destroyed || res.writableEnded) return;
+        if (!res.headersSent && socket.writable) {
+          try {
+            socket.end(buildResponseHead(500, null, { 'Connection': 'close', 'Content-Length': '0' }));
+          } catch (e) {}
+        }
+        destroy(null);
+      }
     });
 
     parser.on('body', function (chunk) {
-      if (current && current.req) current.req._pushData(chunk);
+      var req = current && current.req;
+      if (!req) return;
+      // Destroyed by the application: it will read no more. Dropped, and
+      // reading goes on — a body nobody reads must not stop the connection.
+      if (req.destroyed) return;
+      if (req._pushData(chunk) === false && !holdForReader) {
+        holdForReader = true;
+        updateReading();
+      }
     });
 
     parser.on('trailers', function (trailers) {
@@ -225,13 +332,19 @@ function createServer(options, handler) {
     });
 
     parser.on('end', function () {
+      // requestTimeout bounds the request's arrival, as node:http's does —
+      // not the response: a long download or an event stream runs as long as
+      // the application keeps writing. It ran until the response was done,
+      // harmless while the default was 0 (none), not with node's 300 s.
+      clearTimer();
+
       // The request is complete. Stop looking at anything after it until its
       // response is on the wire — pipelined request N+1 must not be handled
       // before response N is sent. Pausing here rather than at 'headers' is
       // the difference between "do not read ahead" and "do not read the body
       // of the request we are answering", and the latter deadlocks any client
       // that waits for 100-continue.
-      if (current && !current.res.finished) parser.pause();
+      if (current && !current.res.finished) { parser.pause(); holdForResponse = true; updateReading(); }
       if (current && current.req) current.req._endData();
     });
 
@@ -261,11 +374,10 @@ function createServer(options, handler) {
       socket.removeAllListeners('end');
 
       if (ev.listenerCount('upgrade') === 0) {
-        // Nobody wants it. RFC 9110 §15.4.7: refuse rather than leave the
-        // client waiting for a 101 that will never come.
-        try {
-          socket.end(buildResponseHead(501, null, { 'Connection': 'close', 'Content-Length': '0' }));
-        } catch (e) {}
+        // Accepted by shouldUpgradeCallback, yet nobody listens: as node:http
+        // does, the socket is destroyed — the request is half-switched, and
+        // there is no one to finish the job.
+        try { socket.destroy(); } catch (e) {}
         return;
       }
 
@@ -280,10 +392,10 @@ function createServer(options, handler) {
     //  three hooks to write H3 frames). Here they become HTTP/1.1 bytes.
     // ============================================================
 
-    function wireResponse(info, req, res) {
+    function wireResponse(info, req, res, lastOnSocket) {
       var chunked = false;
       var bodyAllowed = true;
-      var willClose = false;
+      var willClose = !!lastOnSocket;   // maxRequestsPerSocket reached: this one closes it
       var finished = false;
 
       res._flushHeaders = function () {
@@ -294,7 +406,7 @@ function createServer(options, handler) {
 
         // Status codes that define themselves as bodiless, plus HEAD, whose
         // response carries the headers of the body it is not sending.
-        var bodiless = (code >= 100 && code < 200) || code === 204 || code === 304;
+        var bodiless = statusHasNoBody(code);
         bodyAllowed = !bodiless && info.method !== 'HEAD';
 
         // A bodiless status must not carry framing headers at all: a
@@ -310,6 +422,13 @@ function createServer(options, handler) {
           if ('transfer-encoding' in headers) {
             chunked = String(headers['transfer-encoding']).toLowerCase().indexOf('chunked') !== -1;
           } else if ('content-length' in headers) {
+            chunked = false;
+          } else if (res._endLength !== undefined) {
+            // The whole body was given to end() with nothing written before
+            // it: its length is known, and sent — as node:http does. It was
+            // chunked: res.end('hello') cost a chunk header and a terminating
+            // chunk, and a client could not tell the size before it arrived.
+            headers['content-length'] = String(res._endLength);
             chunked = false;
           } else if (info.httpVersion === '1.1' && info.keepAlive) {
             // Length unknown and the connection is reusable, so chunk it —
@@ -333,12 +452,36 @@ function createServer(options, handler) {
         willClose = !keepAlive;
 
         if (keepAlive && info.httpVersion === '1.0') headers['keep-alive'] = 'timeout=5';
-        if (!('date' in headers)) headers['date'] = new Date().toUTCString();
-        if (altSvc && !('alt-svc' in headers)) headers['alt-svc'] = altSvc;
+        if (!('date' in headers)) headers['date'] = httpDate();
+        // A function when the server was built before its port was known —
+        // the unified server builds its layers at creation and learns the
+        // port from listen(), or from options.port when fed from outside.
+        var altSvcNow = typeof altSvc === 'function' ? altSvc() : altSvc;
+        if (altSvcNow && !('alt-svc' in headers)) headers['alt-svc'] = altSvcNow;
 
-        var head = buildResponseHead(code, res.statusMessage || STATUS_TEXT[code], headers);
+        // The application's reason phrase, else the standard one for the code
+        // — and statusMessage then says what was sent, as node:http does.
+        var reason = res.statusMessage || STATUS_TEXT[code] || '';
+        res.statusMessage = reason;
+        var head = buildResponseHead(code, reason, headers);
+        // Corked: the head and the body written after it in this tick — all
+        // of res.end(body) — leave as one segment, not one each.
+        corkForTick(socket);
         try { socket.write(head); } catch (e) { destroy(e); return; }
         res.headersSent = true;
+      };
+
+      // 103 Early Hints before the response (RFC 8297): an interim response,
+      // written whole before the final head. HTTP/1.0 has no interim
+      // responses, and after the head it is too late — both send nothing.
+      // node:http's signature: (hints, callback).
+      res.writeEarlyHints = function (hints, callback) {
+        var ok = !res.headersSent && info.httpVersion !== '1.0' && !destroyed;
+        if (ok) {
+          try { socket.write(buildResponseHead(103, null, earlyHintHeaders(hints))); }
+          catch (e) { ok = false; }
+        }
+        if (typeof callback === 'function') process.nextTick(callback);
       };
 
       res._write = function (chunk, encoding, callback) {
@@ -351,9 +494,15 @@ function createServer(options, handler) {
         // them.
         if (!bodyAllowed) { callback(); return; }
 
-        var ok;
-        try { ok = socket.write(chunked ? encodeChunk(chunk) : chunk); }
-        catch (e) { callback(e); return; }
+        var ok = true;
+        try {
+          if (!chunked) ok = socket.write(chunk);
+          else {
+            var parts = encodeChunk(chunk);
+            if (parts.length) corkForTick(socket);
+            for (var i = 0; i < parts.length; i++) ok = socket.write(parts[i]);
+          }
+        } catch (e) { callback(e); return; }
 
         // Respect back-pressure: without this a fast producer piped into a slow
         // client buffers the whole body in memory.
@@ -367,7 +516,7 @@ function createServer(options, handler) {
         if (!res.headersSent) res._flushHeaders();
 
         try {
-          if (bodyAllowed && chunked) socket.write(encodeLastChunk(res.trailers));
+          if (bodyAllowed && chunked) socket.write(encodeLastChunk(trailerFields(res.trailers)));
         } catch (e) { callback(e); return; }
 
         callback();
@@ -377,6 +526,11 @@ function createServer(options, handler) {
       function onResponseComplete() {
         clearTimer();
         current = null;
+        // Whatever of the body is still to come is dropped from here on (the
+        // parser reads it, to find the next request): the reader no longer
+        // holds the socket back.
+        holdForReader = false;
+        updateReading();
 
         if (willClose || closing) {
           // Half-close: let the peer read what we wrote before the socket goes.
@@ -422,6 +576,7 @@ function createServer(options, handler) {
     tcpServer.register('http/1.1', handleConnection);
     tcpServer.on('error', function (err) { ev.emit('error', err); });
     tcpServer.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
+    tcpServer.on('tlsClientError', function (err, sock) { ev.emit('tlsClientError', err, sock); });
     tcpServer.listen(port, host, function () {
       ev.emit('listening');
       if (typeof callback === 'function') callback();

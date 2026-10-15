@@ -13,11 +13,13 @@ import net from 'node:net';
 import { Blob } from 'node:buffer';
 
 import { request as h1Request } from './h1_client.js';
+import lemonTls from 'lemon-tls';
+import { globalAgent } from './agent.js';
 import {
   WSParser, encodeFrame, generateKey, acceptKey,
-  isValidUserCloseCode, OPCODE, CLOSE
+  isValidUserCloseCode, OPCODE, CLOSE,
+  installEventSurfaces, emitBoth, nodeMessagePayload
 } from './ws.js';
-import { installEventSurfaces, emitBoth, nodeMessagePayload } from './ws_events.js';
 
 
 // ============================================================
@@ -152,7 +154,7 @@ class WebSocket extends EventTarget {
 
     // Adds .on/.once/.off alongside the WHATWG properties. Both surfaces fire
     // for every event, with the arguments each interface promises — see
-    // ws_events.js.
+    // ws.js (installEventSurfaces).
     installEventSurfaces(this);
 
     // The spec's "establish a WebSocket connection" runs in parallel — the
@@ -394,21 +396,47 @@ class WebSocket extends EventTarget {
       for (var h in this._options.headers) headers[h] = this._options.headers[h];
     }
 
-    var req = h1Request({
+    // TLS session resumption, as quico.request has it: a session from the
+    // agent's cache (options.agent, or the global one) — each used once — and
+    // each the server sends kept there, and emitted as 'session'. An
+    // explicit options.session wins. wss:// began with a full handshake
+    // every time.
+    var sAgent = secure ? (this._options.agent && this._options.agent._sessionKey ? this._options.agent : globalAgent) : null;
+    var sKey = sAgent && this._options.agent !== false ? sAgent._sessionKey('tcp:http/1.1', parsed.hostname, port, this._options) : null;
+    var explicitSession = this._options.session, sessionTaken = false, sessionNow;
+    var reqOptions = {
       hostname: parsed.hostname,
       port: port,
       path: (parsed.pathname || '/') + (parsed.search || ''),
       method: 'GET',
       headers: headers,
-      tls: secure ? this._options.tls : null,
+      // wss:// means TLS whether or not the caller passed a TLS module. It
+      // took options.tls alone, and without one h1_client connected over
+      // plain TCP: to a real server the handshake hung (it waits for a
+      // ClientHello), and to anyone answering in the clear the upgrade —
+      // headers, cookies, tokens — went out unencrypted under a wss:// URL.
+      tls: secure ? (this._options.tls || lemonTls) : null,
       ca: this._options.ca,
       rejectUnauthorized: this._options.rejectUnauthorized,
+      // The key-exchange groups to offer (tls.connect's ecdhCurve).
+      ecdhCurve: this._options.ecdhCurve,
+      sigalgs: this._options.sigalgs,
       // A WebSocket handshake must not come off a reused keep-alive socket:
       // the socket is about to leave HTTP entirely, and the pool would hand it
       // to another request.
       pool: freshPool()
-    });
+    };
+    Object.defineProperty(reqOptions, 'session', { enumerable: true, get: function () {
+      if (explicitSession) return explicitSession;
+      if (!sessionTaken) { sessionTaken = true; sessionNow = sKey ? sAgent._takeSession(sKey) : undefined; }
+      return sessionNow;
+    } });
+    var req = h1Request(reqOptions);
     this._req = req;
+    req.on('session', function (s) {
+      if (sKey) sAgent._cacheSession(sKey, s);
+      self._emitNode('session', [s]);   // .on('session'), as on node:tls
+    });
 
     req.on('upgrade', function (info, socket, head) {
       self._onHandshake(info, socket, head, key);

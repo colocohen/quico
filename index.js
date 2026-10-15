@@ -24,9 +24,17 @@ import { request, get } from './src/client.js';
 import { Agent, globalAgent } from './src/agent.js';
 import { IncomingMessage, ServerResponse, ClientRequest } from './src/streams.js';
 import { createSecureContext } from './src/tls_bridge.js';
-import { WebTransport } from './src/webtransport.js';
+import lemonTls from 'lemon-tls';
+
+// Encrypted Client Hello keys (RFC 9849) — LemonTLS's; for createServer's `ech`.
+const generateEchKey = lemonTls.generateEchKey;
+import { WebTransport, WebTransportError } from './src/webtransport.js';
 import { WebSocket } from './src/ws_client.js';
+import { connectUdp } from './src/connect_udp_client.js';
 import { WebSocketServer, upgradeWebSocket } from './src/ws_server.js';
+import { ja4h } from './src/ja4h.js';
+import { h2Fingerprint, h3Fingerprint, observeH2 } from './src/h2_fingerprint.js';
+import { profileRequest } from './src/client_profile.js';
 
 // Transport layers, for building something other than HTTP on top.
 import { createQuicServer } from './src/quic_server.js';
@@ -44,7 +52,8 @@ import { request as h3Request } from './src/h3_client.js';
 const api = {
   createServer, request, get, Agent, globalAgent,
   IncomingMessage, ServerResponse, ClientRequest,
-  createSecureContext, WebTransport, WebSocket, WebSocketServer, upgradeWebSocket,
+  connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebSocket, WebSocketServer, upgradeWebSocket,
+  ja4h, h2Fingerprint, h3Fingerprint, observeH2, profileRequest,
   createQuicServer, createQuicClientSocket, createTcpListener,
   createH1Server, createH2Server, createH3Server,
   h1Request, h2Request, h3Request
@@ -53,7 +62,8 @@ const api = {
 export {
   createServer, request, get, Agent, globalAgent,
   IncomingMessage, ServerResponse, ClientRequest,
-  createSecureContext, WebTransport, WebSocket, WebSocketServer, upgradeWebSocket,
+  connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebSocket, WebSocketServer, upgradeWebSocket,
+  ja4h, h2Fingerprint, h3Fingerprint, observeH2, profileRequest,
   createQuicServer, createQuicClientSocket, createTcpListener,
   createH1Server, createH2Server, createH3Server,
   h1Request, h2Request, h3Request

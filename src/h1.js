@@ -32,8 +32,8 @@
 
 
 import {
-  Emitter, isToken, isValidFieldValue, addHeader, parseContentLength,
-  responseHasBody, STATUS_TEXT
+  Emitter, isToken, isValidFieldValue, isValidAuthority, addHeader, parseContentLength,
+  responseHasBody, STATUS_TEXT, TRAILER_FORBIDDEN
 } from './http_common.js';
 
 
@@ -41,14 +41,27 @@ import {
 // before we know anything about the sender: an unbounded head is a trivial
 // memory exhaustion, and the peer can hold the connection open while sending
 // it one byte at a time.
-var MAX_HEAD_SIZE = 80 * 1024;
-var MAX_HEADER_COUNT = 128;
+//
+// The defaults are node:http's: 16 KB for the whole head (its maxHeaderSize),
+// 2000 field lines (its maxHeadersCount — which drops the extra lines; here
+// they are refused, as a dropped header is a header two hops disagree about).
+// The head was allowed 80 KB and only 128 lines: a 20 KB request line that
+// node answers with 431 was served, and a request with 200 headers that node
+// serves was refused.
+var MAX_HEAD_SIZE = 16 * 1024;
+var MAX_HEADER_COUNT = 2000;
 
 // A chunk size is a hex number. 16 digits already exceeds any real body and
 // Number.MAX_SAFE_INTEGER; more than that is an attack or a bug.
 var MAX_CHUNK_SIZE_DIGITS = 16;
 
 var EMPTY = Buffer.alloc(0);
+
+// chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+// chunk-ext-name = token; chunk-ext-val = token / quoted-string (RFC 9112 §7.1.1)
+var TOKEN_RE = "[!#$%&'*+\\-.^_`|~0-9A-Za-z]+";
+var QSTRING_RE = '"(?:[\\t \\x21\\x23-\\x5b\\x5d-\\x7e\\x80-\\xff]|\\\\[\\t \\x21-\\x7e\\x80-\\xff])*"';
+var CHUNK_EXT = new RegExp('^(?:[ \\t]*;[ \\t]*' + TOKEN_RE + '(?:[ \\t]*=[ \\t]*(?:' + TOKEN_RE + '|' + QSTRING_RE + '))?)*$');
 var CRLF = Buffer.from('\r\n');
 var CRLFCRLF = Buffer.from('\r\n\r\n');
 
@@ -104,8 +117,23 @@ function H1Parser(options) {
   var isServer = options.isServer !== false;
   var maxHeadSize = options.maxHeadSize || MAX_HEAD_SIZE;
   var maxHeaderCount = options.maxHeaderCount || MAX_HEADER_COUNT;
+  // Server side: whether an upgrade request is taken up (true) or handled as
+  // an ordinary request (false) — node:http's shouldUpgradeCallback. Absent,
+  // every upgrade request switches, as before.
+  var shouldUpgrade = typeof options.shouldUpgrade === 'function' ? options.shouldUpgrade : null;
+
+  // Line endings. A request must end its lines with CRLF (see splitLines):
+  // a server that took a bare LF where a hop in front of it did not would
+  // read another message than that hop did — request smuggling. A response
+  // is read by its final recipient, the client, which has no one behind it
+  // to disagree with; RFC 9112 §2.2 lets it take a bare LF as a line end,
+  // and browsers and curl do, so a server that ends its lines with LF alone
+  // — old ones, hand-written ones — can be talked to. Only here: the
+  // request parser's rule is unchanged, and so is its code path.
+  var lenientLf = !isServer;
 
   var buf = EMPTY;
+  var lfScanned = 0;      // how far into buf the head has been checked for bare LF
   var paused = false;
   var state = 'head';
   var msg = null;
@@ -141,7 +169,55 @@ function H1Parser(options) {
    * bare LF — every client, proxy and curl sends CRLF — so accepting it buys
    * no compatibility and costs the guarantee.
    */
+  // Where the line starting at `from` ends: { idx, len } — its terminator's
+  // position and length (CRLF 2; a bare LF 1, in a response) — or null when
+  // it has not arrived yet.
+  function lineEnd(b, from) {
+    if (!lenientLf) {
+      var c = b.indexOf(CRLF, from);
+      return c === -1 ? null : { idx: c, len: 2 };
+    }
+    var lf = b.indexOf(0x0a, from);
+    if (lf === -1) return null;
+    return (lf > from && b[lf - 1] === 0x0d) ? { idx: lf - 1, len: 2 } : { idx: lf, len: 1 };
+  }
+
+  // The end of a field section — the empty line after it, in a response
+  // with either terminator: { head, rest } (head: up to and including its
+  // last line's terminator; rest: after the empty line), or null.
+  function sectionEnd(b) {
+    if (!lenientLf) {
+      var c = b.indexOf(CRLFCRLF);
+      return c === -1 ? null : { head: c + 2, rest: c + 4 };
+    }
+    var at = 0;
+    while (true) {
+      var e = lineEnd(b, at);
+      if (!e) return null;
+      if (e.idx === at) return { head: at, rest: at + e.len };
+      at = e.idx + e.len;
+    }
+  }
+
+  // A response's head, split on LF with an optional CR before it. A CR
+  // anywhere else — a bare CR — is refused (§2.2: "MUST consider that
+  // element to be invalid"): some parsers end the line there.
+  function splitLinesLenient(head) {
+    var lines = [];
+    var start = 0;
+    while (start < head.length) {
+      var e = lineEnd(head, start);
+      if (!e) throw h1Error('malformed line terminator', 400);
+      var cr = head.indexOf(0x0d, start);
+      if (cr !== -1 && cr < e.idx) throw h1Error('bare CR in message head', 400);
+      lines.push(head.toString('latin1', start, e.idx));
+      start = e.idx + e.len;
+    }
+    return lines;
+  }
+
   function splitLines(head) {
+    if (lenientLf) return splitLinesLenient(head);
     // Reject a bare LF explicitly, before splitting.
     //
     // This check is deliberately redundant: a bare LF inside a field line also
@@ -247,6 +323,10 @@ function H1Parser(options) {
 
     if (!isToken(method)) throw h1Error('invalid method', 400);
     if (target.length === 0) throw h1Error('empty request target', 400);
+    // No control characters in the target (RFC 9112 §3.2, RFC 3986): a NUL
+    // reached the handler in req.url, where a file path built from it is cut
+    // short by the system call that reads it. node:http answers 400.
+    if (/[\x00-\x1f\x7f]/.test(target)) throw h1Error('invalid character in request target', 400);
     if (line.indexOf(' ', sp2 + 1) !== -1) throw h1Error('malformed request line', 400);
 
     var v = parseVersion(version);
@@ -290,6 +370,14 @@ function H1Parser(options) {
     var h = info.headers;
     var hasTE = 'transfer-encoding' in h;
     var hasCL = 'content-length' in h;
+
+    // RFC 9112 §6.1: an HTTP/1.0 message with Transfer-Encoding is to be
+    // treated as having faulty framing — 1.0 has no chunked coding, and a hop
+    // that speaks 1.0 reads the body by Content-Length or to the close, not
+    // by the chunks this one would. Refused, as nginx does since 1.21.2.
+    if (hasTE && isServer && info.httpVersion === '1.0') {
+      throw h1Error('Transfer-Encoding in an HTTP/1.0 request', 400);
+    }
 
     if (hasTE && hasCL) {
       // §6.1: a message with both is an attack or a broken sender, and the RFC
@@ -410,13 +498,31 @@ function H1Parser(options) {
   // ---- The state machine ----
 
   function processHead() {
-    var idx = buf.indexOf(CRLFCRLF);
+    // A bare LF is refused as it arrives (see splitLines for the rule). It was
+    // checked only once a CRLFCRLF had been found — and a head written with LF
+    // alone has none, so the connection waited, unanswered, for the head
+    // limit or the timeout. node:http answers 400 at once. Checked from where
+    // the last pass stopped, so a head arriving in pieces is scanned once.
+    // (A request only: a response may end its lines with LF — see lenientLf.)
+    if (!lenientLf) {
+      for (var li = Math.max(lfScanned, 0); li < buf.length; li++) {
+        if (buf[li] === 0x0a && (li === 0 || buf[li - 1] !== 0x0d)) {
+          fail('bare LF in message head (CRLF required)', 400);
+          return false;
+        }
+      }
+      lfScanned = buf.length;
+    }
 
-    if (idx === -1) {
+    var end = sectionEnd(buf);
+    var idx = end ? end.head - 2 : -1;
+
+    if (!end) {
       // A leading CRLF before a request line is tolerated (RFC 9112 §2.2):
       // buggy clients append one after a body, and it is unambiguous.
       if (isServer && buf.length >= 2 && buf[0] === 0x0d && buf[1] === 0x0a) {
         buf = buf.subarray(2);
+        lfScanned = Math.max(0, lfScanned - 2);
         return true;
       }
       if (buf.length > maxHeadSize) {
@@ -428,8 +534,8 @@ function H1Parser(options) {
 
     if (idx > maxHeadSize) { fail('header section too large', 431); return false; }
 
-    var head = buf.subarray(0, idx + 2);   // include the final field line's CRLF
-    var rest = buf.subarray(idx + 4);
+    var head = buf.subarray(0, end.head);   // include the final field line's CRLF
+    var rest = buf.subarray(end.rest);
 
     var info;
     try {
@@ -446,9 +552,14 @@ function H1Parser(options) {
       // Two Host headers let two hops route to two different origins.
       if (isServer && info.httpVersion === '1.1') {
         if (!('host' in info.headers)) throw h1Error('missing Host header', 400);
+      }
+      // One Host, and a well-formed one (see isValidAuthority) — on HTTP/1.0
+      // too, which need not send it but must not send two.
+      if (isServer && 'host' in info.headers) {
         if (String(info.headers['host']).indexOf(',') !== -1) {
           throw h1Error('multiple Host headers', 400);
         }
+        if (!isValidAuthority(String(info.headers['host']))) throw h1Error('invalid Host header', 400);
       }
 
       resolveFraming(info);
@@ -464,6 +575,7 @@ function H1Parser(options) {
     }
 
     buf = rest;
+    lfScanned = 0;
     msg = info;
 
     // ---- Upgrade / tunnel: hand the socket over ----
@@ -475,7 +587,8 @@ function H1Parser(options) {
     // node:http calls this parameter `head` and so do we.
     var switching = (!isServer && info.statusCode === 101) ||
                     (!isServer && info.framing === 'tunnel') ||
-                    (isServer && info.upgrade && info.framing === 'none');
+                    (isServer && info.upgrade && info.framing === 'none' &&
+                     (!shouldUpgrade || !!shouldUpgrade(info)));
 
     if (switching) {
       state = 'upgraded';
@@ -523,7 +636,8 @@ function H1Parser(options) {
   }
 
   function processChunkSize() {
-    var idx = buf.indexOf(CRLF);
+    var le = lineEnd(buf, 0);
+    var idx = le ? le.idx : -1;
     if (idx === -1) {
       if (buf.length > 1024) { fail('chunk size line too long', 400); return false; }
       return false;
@@ -537,6 +651,16 @@ function H1Parser(options) {
     var semi = line.indexOf(';');
     var sizeStr = semi === -1 ? line : line.slice(0, semi);
 
+    // The extensions themselves are ignored, but they must be well formed
+    // (RFC 9112 §7.1.1): ;name[=value], a token or a quoted string. They were
+    // skipped unread — so a control character or a bare CR in them, which
+    // another parser on the path may treat as the end of the line, passed
+    // here (the class of node's CVE-2021-22960).
+    if (semi !== -1 && !CHUNK_EXT.test(line.slice(semi))) {
+      fail('invalid chunk extension', 400);
+      return false;
+    }
+
     if (sizeStr.length === 0 || sizeStr.length > MAX_CHUNK_SIZE_DIGITS ||
         !/^[0-9a-fA-F]+$/.test(sizeStr)) {
       fail('invalid chunk size: ' + JSON.stringify(sizeStr), 400);
@@ -546,7 +670,7 @@ function H1Parser(options) {
     var size = parseInt(sizeStr, 16);
     if (!isFinite(size)) { fail('chunk size out of range', 400); return false; }
 
-    buf = buf.subarray(idx + 2);
+    buf = buf.subarray(idx + le.len);
 
     if (size === 0) { state = 'trailers'; trailerBytes = 0; return true; }
 
@@ -567,6 +691,12 @@ function H1Parser(options) {
   }
 
   function processChunkCrlf() {
+    // A response's chunk may end in LF alone (see lenientLf).
+    if (lenientLf && buf.length >= 1 && buf[0] === 0x0a) {
+      buf = buf.subarray(1);
+      state = 'chunk-size';
+      return true;
+    }
     if (buf.length < 2) return false;
     if (buf[0] !== 0x0d || buf[1] !== 0x0a) {
       fail('chunk data not terminated by CRLF', 400);
@@ -578,7 +708,8 @@ function H1Parser(options) {
   }
 
   function processTrailers() {
-    var idx = buf.indexOf(CRLF);
+    var le = lineEnd(buf, 0);
+    var idx = le ? le.idx : -1;
     if (idx === -1) {
       trailerBytes += buf.length;
       if (trailerBytes > maxHeadSize) { fail('trailer section too large', 431); return false; }
@@ -586,33 +717,29 @@ function H1Parser(options) {
     }
 
     if (idx === 0) {            // blank line — trailer section done
-      buf = buf.subarray(2);
+      buf = buf.subarray(le.len);
       finishMessage();
       return true;
     }
 
     // Collect the whole trailer section before parsing it.
-    var end = buf.indexOf(CRLFCRLF);
-    if (end === -1) {
+    var tend = sectionEnd(buf);
+    if (!tend) {
       trailerBytes = buf.length;
       if (trailerBytes > maxHeadSize) { fail('trailer section too large', 431); return false; }
       return false;
     }
 
-    var section = buf.subarray(0, end + 2);
-    buf = buf.subarray(end + 4);
+    var section = buf.subarray(0, tend.head);
+    buf = buf.subarray(tend.rest);
 
     try {
       var parsed = parseFields(splitLines(section), 0);
       // RFC 9110 §6.5.1: framing and routing fields are forbidden in trailers.
       // A Content-Length or Transfer-Encoding that arrives AFTER the body has
       // been read is a re-framing attempt against whoever reads it late.
-      var forbidden = ['content-length', 'transfer-encoding', 'host', 'te',
-                       'trailer', 'connection', 'expect', 'authorization'];
-      for (var i = 0; i < forbidden.length; i++) {
-        if (forbidden[i] in parsed.headers) {
-          throw h1Error('field not permitted in trailers: ' + forbidden[i], 400);
-        }
+      for (var fname in parsed.headers) {
+        if (TRAILER_FORBIDDEN[fname]) throw h1Error('field not permitted in trailers: ' + fname, 400);
       }
       ev.emit('trailers', parsed.headers);
     } catch (err) {
@@ -790,15 +917,17 @@ function buildResponseHead(statusCode, statusMessage, headers) {
   return Buffer.from(lines.join('\r\n') + '\r\n\r\n', 'latin1');
 }
 
-/** One chunk of a chunked body: hex size, CRLF, data, CRLF. */
+/**
+ * One chunk of a chunked body — hex size, CRLF, data, CRLF — as the three
+ * pieces to write, the data among them as given: not copied into one buffer
+ * with its framing, which for a large body was a second copy of all of it.
+ * Written in the same tick to a corked socket, they still leave as one.
+ * Nothing for empty data: a zero-size chunk would end the body.
+ */
 function encodeChunk(data) {
   if (typeof data === 'string') data = Buffer.from(data);
-  if (data.length === 0) return EMPTY;   // a zero-size chunk would end the body
-  return Buffer.concat([
-    Buffer.from(data.length.toString(16) + '\r\n', 'latin1'),
-    data,
-    CRLF
-  ]);
+  if (data.length === 0) return [];
+  return [Buffer.from(data.length.toString(16) + '\r\n', 'latin1'), data, CRLF];
 }
 
 /** Terminating chunk, with optional trailers. */
