@@ -28,7 +28,8 @@ import lemonTls from 'lemon-tls';
 
 // Encrypted Client Hello keys (RFC 9849) — LemonTLS's; for createServer's `ech`.
 const generateEchKey = lemonTls.generateEchKey;
-import { WebTransport, WebTransportError } from './src/webtransport.js';
+import { WebTransport, WebTransportError, WebTransportBidirectionalStream, WebTransportReceiveStream, WebTransportSendStream,
+         WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream } from './src/webtransport.js';
 import { WebSocket } from './src/ws_client.js';
 import { connectUdp } from './src/connect_udp_client.js';
 import { WebSocketServer, upgradeWebSocket } from './src/ws_server.js';
@@ -52,7 +53,8 @@ import { request as h3Request } from './src/h3_client.js';
 const api = {
   createServer, request, get, Agent, globalAgent,
   IncomingMessage, ServerResponse, ClientRequest,
-  connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebSocket, WebSocketServer, upgradeWebSocket,
+  connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebTransportBidirectionalStream, WebTransportReceiveStream, WebTransportSendStream,
+  WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream, WebSocket, WebSocketServer, upgradeWebSocket,
   ja4h, h2Fingerprint, h3Fingerprint, observeH2, profileRequest,
   createQuicServer, createQuicClientSocket, createTcpListener,
   createH1Server, createH2Server, createH3Server,
@@ -62,7 +64,8 @@ const api = {
 export {
   createServer, request, get, Agent, globalAgent,
   IncomingMessage, ServerResponse, ClientRequest,
-  connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebSocket, WebSocketServer, upgradeWebSocket,
+  connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebTransportBidirectionalStream, WebTransportReceiveStream, WebTransportSendStream,
+  WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream, WebSocket, WebSocketServer, upgradeWebSocket,
   ja4h, h2Fingerprint, h3Fingerprint, observeH2, profileRequest,
   createQuicServer, createQuicClientSocket, createTcpListener,
   createH1Server, createH2Server, createH3Server,

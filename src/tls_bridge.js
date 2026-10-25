@@ -620,6 +620,10 @@ function TLSBridge(options) {
      */
     getJA4: function (opts) { return session && session.getJA4 ? session.getJA4(quicOpts(opts)) : null; },
 
+    /** TLS keying material (RFC 8446 §7.5), as node:tls's exportKeyingMaterial(length, label, context) — or null before the handshake has the secret. */
+    exportKeyingMaterial: function (length, label, context) {
+      return session && session.exportKeyingMaterial ? session.exportKeyingMaterial(length, label, context) : null;
+    },
     /** The peer's certificate chain, leaf first, as DER — or null. */
     getPeerCertificateChain: function () {
       var chain = session && session.getPeerCertificate ? session.getPeerCertificate() : null;

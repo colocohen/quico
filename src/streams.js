@@ -64,9 +64,20 @@ class IncomingMessage extends Readable {
     this._streamId = options.streamId != null ? options.streamId : null;
     this._timeoutTimer = null;
 
-    // Build rawHeaders
-    for (var name in this.headers) {
-      this.rawHeaders.push(name, String(this.headers[name]));
+    // Build rawHeaders: one name and value per field line, as node:http has
+    // them — the field lines as they came when the decoder kept them
+    // (validateFieldSection's _rawHeaders); otherwise from the map, a list
+    // (Set-Cookie) one entry per value. String(list) made two cookies one
+    // "a=1,b=2".
+    var rawList = this.headers._rawHeaders;
+    if (Array.isArray(rawList)) {
+      for (var ri = 0; ri < rawList.length; ri++) this.rawHeaders.push(rawList[ri]);
+    } else {
+      for (var name in this.headers) {
+        var hv = this.headers[name];
+        if (Array.isArray(hv)) { for (var hi = 0; hi < hv.length; hi++) this.rawHeaders.push(name, String(hv[hi])); }
+        else this.rawHeaders.push(name, String(hv));
+      }
     }
   }
 

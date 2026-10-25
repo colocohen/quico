@@ -201,8 +201,28 @@ function createQuicServer(options) {
   // gave it, with the time, sealed (AES-256-GCM) to the client's IP address
   // under a key of this server's own. It lives seconds, so a key drawn at
   // start is enough: a restart costs only the Retries in flight.
+  //
+  // tokenSecret (node:quic's name, at least 16 bytes) gives the key instead:
+  // servers that pass the same one open each other's tokens. That is what
+  // several servers sharing a port need (one per thread, SO_REUSEPORT): a
+  // client back with a NEW_TOKEN from another port is hashed to another of
+  // them, and without the key its token does not open — no harm, only the
+  // shortcut lost. The AES key is derived from it (SHA-256), so a 16-byte
+  // secret serves as well as a 32-byte one.
   var validateAddress = options.validateAddress === true;
-  var retryTokenKey = crypto.randomBytes(32);
+  var tokenSecret = checkTokenSecret(options.tokenSecret) || crypto.randomBytes(32);
+  var retryTokenKey = tokenKeyOf(tokenSecret);
+
+  function checkTokenSecret(secret) {
+    if (secret === undefined || secret === null) return null;
+    if (!(secret instanceof Uint8Array) || secret.byteLength < 16) {
+      throw new TypeError('tokenSecret must be a Buffer or Uint8Array of at least 16 bytes');
+    }
+    return secret;
+  }
+  function tokenKeyOf(secret) {
+    return crypto.createHash('sha256').update('quico address-validation token key').update(secret).digest();
+  }
   var RETRY_TOKEN_LIFETIME = 10000;   // ms
   // Tokens of two kinds, sealed alike (RFC 9000 §8.1.3): a Retry's, good for
   // seconds and one connection attempt; and a NEW_TOKEN's, given to a client
@@ -724,7 +744,7 @@ function createQuicServer(options) {
   var ELSEWHERE = {
     key: 'setSecureContext()', cert: 'setSecureContext()', ca: 'setSecureContext()', pfx: 'setSecureContext()',
     passphrase: 'setSecureContext()', SNICallback: 'setSecureContext()',
-    ticketKeys: 'setTicketKeys()', ech: 'setEchKeys()', resetTokenSecret: 'setResetTokenSecret()',
+    ticketKeys: 'setTicketKeys()', ech: 'setEchKeys()', resetTokenSecret: 'setResetTokenSecret()', tokenSecret: 'setTokenSecret()',
     transportParams: 'connectionOptions, per connection'
   };
   function optErr(Ctor, code, msg) { var e = new Ctor(msg); e.code = code; return e; }
@@ -1004,13 +1024,47 @@ function createQuicServer(options) {
   //  External packet API (for shared UDP port scenarios)
   // ============================================================
 
-  // Query whether the given 5-tuple matches an active QUIC connection.
-  // Used by the demuxer to disambiguate byte 0 in range 64-79 between
-  // QUIC short header and TURN ChannelData (RFC 9443). Fresh connections
-  // must be classified by byte 0 range (80-127 or 192+ = QUIC).
-  function hasConnection(rinfo) {
-    var key = rinfo.address + ':' + rinfo.port;
-    return (key in addressMap) && (addressMap[key] in connections);
+  // Query whether a datagram belongs to an active QUIC connection.
+  //
+  // hasConnection(rinfo) — by the address it came from. Used by the demuxer
+  // to disambiguate byte 0 in range 64-79 between QUIC short header and TURN
+  // ChannelData (RFC 9443). Fresh connections must be classified by byte 0
+  // range (80-127 or 192+ = QUIC).
+  //
+  // hasConnection(rinfo, msg) — by the connection ID the datagram is
+  // addressed to, from wherever it came: the answer to "is this one mine"
+  // when several servers share the port (one per thread, SO_REUSEPORT) and a
+  // datagram can reach one that does not hold its connection — a client
+  // whose address changed is hashed to another socket. Asked before
+  // handlePacket: given a short-header packet for an ID it does not know,
+  // handlePacket answers with a Stateless Reset, and that would end a
+  // connection another server holds. The address does not count here: an ID
+  // that leads nowhere is not ours, whatever address sent it.
+  function hasConnection(rinfo, msg) {
+    if (msg === undefined || msg === null) {
+      var key = rinfo.address + ':' + rinfo.port;
+      return (key in addressMap) && (addressMap[key] in connections);
+    }
+    var dcid = datagramDcid(msg);
+    if (!dcid) return false;
+    var k = cidKey(dcid);
+    return (k in cidMap) && (cidMap[k] in connections);
+  }
+
+  // The Destination Connection ID of a datagram's first packet, without
+  // parsing the rest (RFC 9000 §17.2, §17.3; RFC 8999 for any version): a
+  // long header carries its length, a short header ours (SERVER_CID_LEN).
+  // null for one too short to hold it.
+  function datagramDcid(msg) {
+    if (!(msg instanceof Uint8Array) || msg.length < 1) return null;
+    if (msg[0] & 0x80) {
+      if (msg.length < 6) return null;
+      var len = msg[5];
+      if (msg.length < 6 + len) return null;
+      return msg.subarray(6, 6 + len);
+    }
+    if (msg.length < 1 + SERVER_CID_LEN) return null;
+    return msg.subarray(1, 1 + SERVER_CID_LEN);
   }
 
 
@@ -1027,8 +1081,10 @@ function createQuicServer(options) {
      *  rinfo must be in Node's dgram format: { address, port, family, size }. */
     handlePacket: onUdpMessage,
 
-    /** Returns true if the 5-tuple matches an active QUIC connection.
-     *  Used by demuxers for routing decisions on shared UDP ports. */
+    /** hasConnection(rinfo): the address matches an active QUIC connection.
+     *  hasConnection(rinfo, msg): the datagram is addressed to one (by its
+     *  connection ID). Used by demuxers for routing decisions on shared UDP
+     *  ports — the second when several servers share it (see above). */
     hasConnection: hasConnection,
 
     /** The session ticket keys — tls.Server's names. A new key applies to
@@ -1059,7 +1115,18 @@ function createQuicServer(options) {
     setOptions: setOptions,
 
     getResetTokenSecret: function () { return resetTokenSecret; },
-    setResetTokenSecret: function (secret) { resetTokenSecret = checkResetTokenSecret(secret) || resetTokenSecret; }
+    setResetTokenSecret: function (secret) { resetTokenSecret = checkResetTokenSecret(secret) || resetTokenSecret; },
+
+    /** The address-validation token secret (Retry, NEW_TOKEN — see
+     *  tokenSecret above). A new one applies from now on; tokens sealed
+     *  under the one before no longer open: a client back with a NEW_TOKEN
+     *  loses its shortcut, and one mid-Retry its attempt (it accepts no
+     *  second Retry). */
+    getTokenSecret: function () { return tokenSecret; },
+    setTokenSecret: function (secret) {
+      var s = checkTokenSecret(secret);
+      if (s) { tokenSecret = s; retryTokenKey = tokenKeyOf(s); }
+    }
   };
 }
 

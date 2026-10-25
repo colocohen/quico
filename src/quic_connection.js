@@ -613,6 +613,13 @@ function QUICConnection(options) {
     stats_bytes_sent: 0,
     stats_packets_received: 0,
     stats_bytes_received: 0,
+    // The application's bytes in them, for WebTransport's getStats() (W3C
+    // WebTransportConnectionStats): DATAGRAM payloads sent (new STREAM bytes
+    // are max_data_sent), the payload of the packets acknowledged, and the
+    // size of the packets declared lost.
+    stats_datagram_bytes_sent: 0,
+    stats_payload_acked: 0,
+    stats_bytes_lost: 0,
     // Streams that hit the peer's flow-control limit since the last check —
     // for STREAM_DATA_BLOCKED (maybeSendBlockedFrames), instead of a walk of
     // every stream on every send pass.
@@ -888,6 +895,7 @@ function QUICConnection(options) {
     //   pn → { t: expiry wall-time, spans: [[sid, ranges, finLost], ...] }
     //   (ranges: the packet's flat range list of that stream)
     expired_unacked: {},
+    limbo_n: 0,                     // entries in expired_unacked (kept, not counted)
     reorder_in_count: 0,        // app packets that arrived below the highest PN seen (network reordering, peer→us)
 
     // --- BBR-lite measurement (Phase 4b, step 1+2 — measure only, no control). ---
@@ -1122,6 +1130,18 @@ function QUICConnection(options) {
     if (changed.state && (context.state === 'draining' || context.state === 'closing' || context.state === 'closed')) handshakeEnded(false);
 
     if (changed.state && (context.state === 'draining' || context.state === 'closing')) {
+      // 'closing': the connection is over for the application now — the
+      // peer's CONNECTION_CLOSE came (draining), or ours went (closing).
+      // 'close' follows when the closing or draining period ends (RFC 9000
+      // §10.2: up to three PTOs, here at most 3 s), which is packet
+      // housekeeping, not news: a session above that waited for 'close'
+      // learned the peer was gone seconds late. With the peer's code and
+      // reason (context.peer_close) when it was the peer; null when we
+      // closed. Once.
+      if (!context.closing_emitted) {
+        context.closing_emitted = true;
+        ev.emit('closing', context.state === 'draining' ? (context.peer_close || null) : null);
+      }
       failPermitWaiters();
       clearIdleTimer();
       // A draining/closing endpoint must stop retransmitting CRYPTO — the
@@ -1660,6 +1680,7 @@ function QUICConnection(options) {
     context.sending_app_pn_in_flight.clear();
     context.pn_sids.clear();
     context.expired_unacked = {};
+    context.limbo_n = 0;
     context.no_resend_in_flight = {};
     context.control_in_flight = {};
     for (var sid in context.send_streams) {
@@ -4522,6 +4543,16 @@ function QUICConnection(options) {
     }
   }
 
+  // A 1-RTT packet carrying stream data or datagrams declared lost: counted
+  // (getStats' packetsLost, and bytesLost by its size on the wire), and
+  // Careful Resume told.
+  function countLostPacket(pnum) {
+    context.lost_count++;
+    var h = context.sending_app_pn_history[pnum - (context.send_pn.app - context.sending_app_pn_history.length)];
+    if (h) context.stats_bytes_lost += h[1];
+    crOnLoss();
+  }
+
   // A packet given up on — expired, or its control frames deemed lost: out
   // of the bytes in flight. Returns its size (0: not in flight any more).
   function forgetPacket(pn) {
@@ -4530,6 +4561,58 @@ function QUICConnection(options) {
     context.pkt_in_flight.delete(pn);
     context.app_bytes_in_flight -= pk.bytes;
     return pk.bytes;
+  }
+
+  // How many of the values in `r` (flat [from, to) pairs) `a` already
+  // covers — flat_ranges.length(flat_ranges.intersect(a, r)), found by binary
+  // search in `a` for each pair of `r` instead of a walk of both. Both are
+  // the library's sorted, merged lists; `r` not so (never seen) is answered
+  // the original way.
+  function coveredLength(a, r) {
+    var na = a.length, total = 0, prevTo = -Infinity;
+    if (na === 0 || r.length === 0) return 0;
+    for (var i = 0; i < r.length; i += 2) {
+      var f = r[i], t = r[i + 1];
+      if (f < prevTo) return flat_ranges.length(flat_ranges.intersect(a, r));
+      prevTo = t;
+      if (f >= t) continue;
+      // first pair of a whose `to` > f
+      var lo = 0, hi = na >> 1;
+      while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        if (a[(mid << 1) + 1] <= f) lo = mid + 1; else hi = mid;
+      }
+      for (var k = lo << 1; k < na && a[k] < t; k += 2) {
+        var from = a[k] > f ? a[k] : f;
+        var to = a[k + 1] < t ? a[k + 1] : t;
+        if (to > from) total += to - from;
+      }
+    }
+    return total;
+  }
+
+  // Would flat_ranges.remove(list, r) change `list`? Only if a pair of `r`
+  // overlaps one of it (half-open; flat_ranges.overlaps, a binary search).
+  function overlapsAny(list, r) {
+    if (list.length === 0) return false;
+    for (var i = 0; i < r.length; i += 2) {
+      if (flat_ranges.overlaps(list, r[i], r[i + 1])) return true;
+    }
+    return false;
+  }
+
+  // How many packet numbers a flat [from, to, from, to, ...] list of
+  // inclusive ranges covers.
+  function rangesSpan(r) {
+    var n = 0;
+    for (var i = 0; i < r.length; i += 2) n += r[i + 1] - r[i] + 1;
+    return n;
+  }
+
+  // Entries in the limbo table (kept as it changes — counting them meant
+  // walking it).
+  function limboCount() {
+    return context.limbo_n > 0 ? context.limbo_n : 0;
   }
 
   function processAckFrame(space, frame) {
@@ -4665,9 +4748,28 @@ function QUICConnection(options) {
       // Mark in-flight as acked. Collect the acked PNs first, then mutate —
       // deleting from a Set while iterating it with for-of is fragile.
       var ackedPns = [];
-      for (var pn of context.sending_app_pn_in_flight) {
+      // Walked from whichever side is smaller: the packets in flight, or the
+      // packet numbers this ACK covers. Every in-flight packet was tested
+      // against every range on every ACK — at a high RTT the window holds
+      // thousands, and a page's worth of ACKs cost that many times over.
+      // Ascending either way (the set is in send order), as before.
+      if (rangesSpan(ackedRanges) < context.sending_app_pn_in_flight.size) {
         for (var ri = 0; ri < ackedRanges.length; ri += 2) {
-          if (pn >= ackedRanges[ri] && pn <= ackedRanges[ri + 1]) { ackedPns.push(pn); break; }
+          for (var rpn0 = ackedRanges[ri]; rpn0 <= ackedRanges[ri + 1]; rpn0++) {
+            if (context.sending_app_pn_in_flight.has(rpn0)) ackedPns.push(rpn0);
+          }
+        }
+      } else {
+        // Both in ascending order (ack_frame_to_ranges sorts and merges the
+        // ranges; the set is in packet-number order): one pointer into the
+        // ranges, and the walk ends past the largest acknowledged — what is
+        // in flight above it cannot be in this ACK. Each packet was tested
+        // against every range, and the walk went on to the newest packet.
+        var rp1 = 0, rTop1 = ackedRanges[ackedRanges.length - 1];
+        for (var pn of context.sending_app_pn_in_flight) {
+          if (pn > rTop1) break;
+          while (ackedRanges[rp1 + 1] < pn) rp1 += 2;
+          if (pn >= ackedRanges[rp1]) ackedPns.push(pn);
         }
       }
       // A packet's ranges of a stream, acknowledged. Returns the bytes newly
@@ -4675,12 +4777,19 @@ function QUICConnection(options) {
       // transmission and a retransmission of the same range ending up ACKed
       // (routine once late ACKs for expired packets are honoured) count once.
       function creditRanges(st, ranges) {
-        var fresh = flat_ranges.length(ranges) - flat_ranges.length(flat_ranges.intersect(st.acked_ranges, ranges));
+        // The bytes of `ranges` not acknowledged before — what
+        // length(intersect(acked, ranges)) gave, without walking all of
+        // acked_ranges and building the intersection for every packet. After
+        // a loss acked_ranges holds hundreds of pieces until the hole is
+        // filled, and this ran once per acknowledged packet (coveredLength).
+        var fresh = flat_ranges.length(ranges) - coveredLength(st.acked_ranges, ranges);
         flat_ranges.add(st.acked_ranges, ranges);
         // Out of missing, whatever it was: an ACK is proof — a late one too,
         // for bytes already given up on and not yet resent (add_have would
         // leave those missing: it defers to what not_have says).
-        flat_ranges.remove(st.missing_ranges, ranges);
+        // remove() walks and rebuilds the whole list; it is called only when
+        // it would change something — when the ranges touch a missing one.
+        if (overlapsAny(st.missing_ranges, ranges)) flat_ranges.remove(st.missing_ranges, ranges);
         if (st.acked_ranges[0] === 0) sendQueueRelease(st, st.acked_ranges[1]);
         return fresh > 0 ? fresh : 0;
       }
@@ -4714,15 +4823,17 @@ function QUICConnection(options) {
       var largestAckedPn = -1;
       for (var lri = 0; lri < ackedRanges.length; lri += 2) if (ackedRanges[lri + 1] > largestAckedPn) largestAckedPn = ackedRanges[lri + 1];
       var ackedPkts = [];
+      var rp2 = 0;   // pointer into the ranges, as for ackedPns above
       for (var pke of context.pkt_in_flight) {
         var ppn = pke[0];
         if (ppn > largestAckedPn) break;
-        for (var pri = 0; pri < ackedRanges.length; pri += 2) {
-          if (ppn >= ackedRanges[pri] && ppn <= ackedRanges[pri + 1]) { ackedPkts.push(ppn); break; }
-        }
+        while (ackedRanges[rp2 + 1] < ppn) rp2 += 2;
+        if (ppn >= ackedRanges[rp2]) ackedPkts.push(ppn);
       }
       var ackedSizes = [];
       for (var api = 0; api < ackedPkts.length; api++) {
+        var apk = context.pkt_in_flight.get(ackedPkts[api]);
+        if (apk && apk.payload) context.stats_payload_acked += apk.payload;
         var asz = forgetPacket(ackedPkts[api]);
         ackedSizes.push(asz);
         ackedPacketBytes += asz;
@@ -4756,14 +4867,33 @@ function QUICConnection(options) {
       // DID arrive — the timer was simply wrong — so: credit the goodput
       // (repairing the BtlBw signal), mark the spans acked (cancelling any
       // retransmit that hasn't left yet), and take back the loss we counted.
-      for (var lpn in context.expired_unacked) {
-        var lnum = Number(lpn);
-        var hit = false;
-        for (var ri2 = 0; ri2 < ackedRanges.length; ri2 += 2) {
-          if (lnum >= ackedRanges[ri2] && lnum <= ackedRanges[ri2 + 1]) { hit = true; break; }
+      // The limbo table holds up to ~10 s of expired packets: walking all of
+      // it for each ACK (for-in, a string key made per entry) was the larger
+      // part of an ACK's cost on a lossy, distant path. The covered numbers
+      // are looked up instead when they are fewer — ascending, as for-in
+      // visits integer keys.
+      var lateHits = [];
+      if (rangesSpan(ackedRanges) < limboCount()) {
+        for (var lr = 0; lr < ackedRanges.length; lr += 2) {
+          for (var lq = ackedRanges[lr]; lq <= ackedRanges[lr + 1]; lq++) {
+            if (lq in context.expired_unacked) lateHits.push(String(lq));
+          }
         }
-        if (!hit) continue;
+      } else {
+        // Ascending (integer keys), so: one pointer into the ranges, and
+        // done past the largest acknowledged.
+        var rp3 = 0, rTop3 = ackedRanges[ackedRanges.length - 1];
+        for (var lpn0 in context.expired_unacked) {
+          var lnum = Number(lpn0);
+          if (lnum > rTop3) break;
+          while (ackedRanges[rp3 + 1] < lnum) rp3 += 2;
+          if (lnum >= ackedRanges[rp3]) lateHits.push(lpn0);
+        }
+      }
+      for (var lhi = 0; lhi < lateHits.length; lhi++) {
+        var lpn = lateHits[lhi];
         var rec = context.expired_unacked[lpn];
+        if (!rec) continue;
         for (var si2 = 0; si2 < rec.spans.length; si2++) {
           var sidL = rec.spans[si2][0];
           var stL = context.send_streams[sidL];
@@ -4776,6 +4906,7 @@ function QUICConnection(options) {
         ackedPacketBytes += rec.bytes || 0;
         if (rec.early) context.stats_spurious_early++;
         delete context.expired_unacked[lpn];
+        context.limbo_n--;
         if (context.lost_count > 0) context.lost_count--;   // it wasn't a loss after all
       }
 
@@ -6454,11 +6585,14 @@ function QUICConnection(options) {
         // found by anything and held a slot of the packet budget forever.
         // DATAGRAM frames are in flight too, with nothing to resend
         // (no_resend_in_flight, see sendDatagram).
-        var has_data = false, datagramBytes = 0;
+        var has_data = false, datagramBytes = 0, payloadBytes = 0;
         for (var i = 0; i < frameList.length; i++) {
-          if (frameList[i].type === 'stream') has_data = true;
+          if (frameList[i].type === 'stream') { has_data = true; payloadBytes += frameList[i].data ? frameList[i].data.byteLength : 0; }
           else if (frameList[i].type === 'datagram') datagramBytes += frameList[i].data.byteLength;
         }
+        context.stats_datagram_bytes_sent += datagramBytes;
+        var inFlightPk = context.pkt_in_flight.get(pn);
+        if (inFlightPk) inFlightPk.payload = payloadBytes + datagramBytes;   // getStats' bytesAcknowledged
         if (has_data || datagramBytes > 0) context.sending_app_pn_in_flight.add(pn);
         if (datagramBytes > 0) {
           context.no_resend_in_flight[pn] = (context.no_resend_in_flight[pn] || 0) + datagramBytes;
@@ -6702,6 +6836,19 @@ function QUICConnection(options) {
     for (var i = 0; i < w.length; i++) w[i].cb(new Error('the connection is closing'));
   }
 
+  function streamSendWindow(streamId) {
+    var st = context.send_streams[Number(streamId)];
+    if (!st) return 0;
+    var queued = 0;
+    for (var k in context.send_streams) {
+      var o = context.send_streams[k];
+      if (o.write_offset > o.max_sent_offset) queued += o.write_offset - o.max_sent_offset;
+    }
+    var streamRoom = st.remote_max_stream_data - st.write_offset;
+    var connRoom = context.remote_max_data - context.max_data_sent - queued;
+    return Math.max(0, Math.min(streamRoom, connRoom));
+  }
+
   // The connection's figures, as WebTransport's getStats() reports them
   // (W3C WebTransportConnectionStats), and what QUICO's congestion control
   // knows besides. Times in ms; estimatedSendRate in bits per second (BBR's
@@ -6709,9 +6856,21 @@ function QUICConnection(options) {
   // An exception of ours, caught: in the connection (internal_errors, the
   // last one's stack) and the server's counters. The packet being processed
   // is dropped (above), or HTTP/3 closes with H3_INTERNAL_ERROR (h3.js).
+  // Reading e.stack formats the whole trace — a few hundred microseconds,
+  // paid for every bad packet: a peer (or a scanner) sending many of them
+  // cost the thread more in traces than in packets. The message always; the
+  // stack, and a log line, once a minute per connection — the bug it points
+  // at is the same one.
   function countInternalError(e) {
     context.internal_errors = (context.internal_errors || 0) + 1;
-    context.last_internal_error = (e && e.stack) || String(e);
+    var now = Date.now();
+    if (now - (context.internal_error_logged_at || 0) >= 60000) {
+      context.internal_error_logged_at = now;
+      context.last_internal_error = (e && e.stack) || String(e);
+      console.warn('[quic] packet dropped on an internal error (' + context.internal_errors + ' on this connection so far): ' + context.last_internal_error);
+    } else {
+      context.last_internal_error = (e && e.message) || String(e);
+    }
     if (serverStats) serverStats.internalErrors++;
   }
 
@@ -6720,6 +6879,11 @@ function QUICConnection(options) {
       bytesSent: context.stats_bytes_sent,
       packetsSent: context.stats_packets_sent,
       packetsLost: context.lost_count,
+      bytesLost: context.stats_bytes_lost,
+      // The application's bytes: new STREAM data and DATAGRAM payloads sent
+      // (no retransmissions, no framing), and the payload acknowledged.
+      payloadBytesSent: context.max_data_sent + context.stats_datagram_bytes_sent,
+      payloadBytesAcknowledged: context.stats_payload_acked,
       bytesReceived: context.stats_bytes_received,
       packetsReceived: context.stats_packets_received,
       smoothedRtt: context.srtt,
@@ -7063,7 +7227,7 @@ function QUICConnection(options) {
       // honoured (see expired_unacked above). Keyed per-PN; a packet that
       // carried several streams accumulates one entry per stream.
       var limbo = context.expired_unacked[pnum];
-      if (!limbo) limbo = context.expired_unacked[pnum] = { t: now, spans: [] };
+      if (!limbo) { limbo = context.expired_unacked[pnum] = { t: now, spans: [] }; context.limbo_n++; }
       var finLost = !!(st.fin_pns && st.fin_pns[pnum]);
       var lostRanges = st.in_flight_ranges[pn];
       limbo.spans.push([sid, lostRanges, finLost]);
@@ -7081,7 +7245,7 @@ function QUICConnection(options) {
       // Count the loss once per packet: the Set holds each PN once, so the
       // first stream to expire it returns true; later same-PN deletes (a
       // multi-stream packet) return false and don't double-count.
-      if (context.sending_app_pn_in_flight.delete(pnum)) { context.lost_count++; crOnLoss(); }
+      if (context.sending_app_pn_in_flight.delete(pnum)) countLostPacket(pnum);
     }
   }
 
@@ -7098,7 +7262,7 @@ function QUICConnection(options) {
     if (context.expired_unacked[pnum]) context.expired_unacked[pnum].early = true;
     if (pnum in context.no_resend_in_flight) {
       delete context.no_resend_in_flight[pnum];
-      if (context.sending_app_pn_in_flight.delete(pnum)) { context.lost_count++; crOnLoss(); }
+      if (context.sending_app_pn_in_flight.delete(pnum)) countLostPacket(pnum);
     }
     if (context.pkt_in_flight.has(pnum)) {
       var pBytes = forgetPacket(pnum);
@@ -7290,7 +7454,7 @@ function QUICConnection(options) {
                      (now - context.sending_app_pn_history[ridx][0] >= timeout);
       if (!rexpired) continue;
       delete context.no_resend_in_flight[rpn];
-      if (context.sending_app_pn_in_flight.delete(rnum)) { context.lost_count++; crOnLoss(); }
+      if (context.sending_app_pn_in_flight.delete(rnum)) countLostPacket(rnum);
     }
 
     // And every packet past the same timeout leaves the bytes in flight —
@@ -7306,9 +7470,15 @@ function QUICConnection(options) {
 
     // Bound the limbo table: entries older than ~8 timeouts (min 10s) will
     // never see their ACK — the peer retires ACK ranges long before that.
-    var limboCutoff = now - Math.max(10000, timeout * 8);
-    for (var lpn in context.expired_unacked) {
-      if (context.expired_unacked[lpn].t < limboCutoff) delete context.expired_unacked[lpn];
+    // At most once a second: it walks the whole table, and this runs on
+    // every send burst. An entry kept a second longer only means a late ACK
+    // for it is still honoured.
+    if (now - (context.limbo_pruned_at || 0) >= 1000) {
+      context.limbo_pruned_at = now;
+      var limboCutoff = now - Math.max(10000, timeout * 8);
+      for (var lpn in context.expired_unacked) {
+        if (context.expired_unacked[lpn].t < limboCutoff) { delete context.expired_unacked[lpn]; context.limbo_n--; }
+      }
     }
   }
 
@@ -8284,6 +8454,13 @@ function QUICConnection(options) {
     getJA4: function (opts) { return (tls && tls.getJA4) ? tls.getJA4(opts) : null; },
     /** The peer's certificate chain, leaf first, as DER — or null. */
     getPeerCertificateChain: function () { return (tls && tls.getPeerCertificateChain) ? tls.getPeerCertificateChain() : null; },
+    // TLS keying material (RFC 8446 §7.5), as node:tls's: WebTransport's
+    // exportKeyingMaterial builds on it. null before the handshake has it.
+    exportKeyingMaterial: function (length, label, context) { return (tls && tls.exportKeyingMaterial) ? tls.exportKeyingMaterial(length, label, context) : null; },
+    // How many new bytes stream `streamId` could send now under flow control
+    // (RFC 9000 §4.1): its own window, and the connection's less what every
+    // stream has written and not yet sent. WebTransport's atomicWrite asks.
+    streamSendWindow: streamSendWindow,
     // The client's certificate, node:tls-shaped, and whether it was verified
     // (requestCert): what req.socket answers over HTTP/3.
     getPeerCertificate: function () { return (tls && tls.getPeerCertificate) ? tls.getPeerCertificate() : {}; },

@@ -84,6 +84,7 @@ var HUFF_BITS = new Uint8Array([
 ]);
 
 var HUFF_EOS = 256;   // index of the EOS symbol; decoding it is an error
+var _HD_HAS_SYM = 1 << 17, _HD_INVALID = 1 << 18;   // huffDecode table flags
 
 var _huffRoot = (function () {
   var root = {};
@@ -99,6 +100,51 @@ var _huffRoot = (function () {
   return root;
 })();
 
+
+// Table-driven decoding, four bits at a time.
+//
+// The decoder used to walk the code tree one bit per step: eight object
+// lookups per input byte. Here every internal node of that same tree is a
+// state, and for each state and each 4-bit nibble a table holds what four
+// steps of the walk would have done — the node it ends on, the symbol it
+// completed (at most one: the shortest code is 5 bits), and whether it fell
+// off the tree. Two lookups per byte, same walk, same results.
+//
+// The padding checks at the end need only the state the input stopped in:
+// the bits since the last complete symbol are that node's depth, and they
+// are all ones exactly when its path from the root is.
+var _huffDec = (function () {
+  var nodes = [_huffRoot], depth = [0], ones = [1];
+  var idOf = new Map([[_huffRoot, 0]]);
+  for (var q = 0; q < nodes.length; q++) {
+    for (var b = 0; b <= 1; b++) {
+      var child = nodes[q][b];
+      if (child && child.sym === undefined && !idOf.has(child)) {
+        idOf.set(child, nodes.length);
+        nodes.push(child);
+        depth.push(depth[q] + 1);
+        ones.push(ones[q] && b === 1 ? 1 : 0);
+      }
+    }
+  }
+  // entry = next | sym << 8 | HAS_SYM | INVALID ; sym is 0..256
+  var table = new Int32Array(nodes.length * 16);
+  for (var st = 0; st < nodes.length; st++) {
+    for (var nib = 0; nib < 16; nib++) {
+      var node = nodes[st], entry = 0;
+      for (var k = 3; k >= 0; k--) {
+        node = node[(nib >> k) & 1];
+        if (!node) { entry |= _HD_INVALID; node = _huffRoot; break; }
+        if (node.sym !== undefined) {
+          entry |= _HD_HAS_SYM | (node.sym << 8);
+          node = _huffRoot;
+        }
+      }
+      table[st * 16 + nib] = entry | idOf.get(node);
+    }
+  }
+  return { table: table, depth: Uint8Array.from(depth), ones: Uint8Array.from(ones) };
+})();
 
 /**
  * Decode a Huffman-coded byte string (RFC 7541 §5.2). Returns the raw
@@ -117,42 +163,35 @@ var _huffRoot = (function () {
  * decoders that must answer a malformed peer with COMPRESSION_ERROR pass true.
  */
 function huffDecode(buf, strict) {
-  var out = [];
-  var node = _huffRoot;
-  var nbits = 0, current = 0;
-  var sincePadStart = 0;   // bits consumed since the last complete symbol
-  var padIsOnes = true;    // were all of those bits 1?
+  var table = _huffDec.table;
+  var out = new Uint8Array(((buf.length * 8) / 5) | 0);
+  var n = 0, state = 0;
 
   for (var i = 0; i < buf.length; i++) {
-    current = (current << 8) | buf[i];
-    nbits += 8;
-    while (nbits > 0) {
-      var bit = (current >> (nbits - 1)) & 1;
-      node = node[bit];
-      if (!node) throw new Error('Invalid Huffman code');
-      nbits--;
-      sincePadStart++;
-      if (bit === 0) padIsOnes = false;
-      if (node.sym !== undefined) {
-        if (strict && node.sym === HUFF_EOS) {
+    var byte = buf[i];
+    for (var half = 0; half < 2; half++) {
+      var e = table[(state << 4) | (half === 0 ? byte >> 4 : byte & 15)];
+      if (e & _HD_INVALID) throw new Error('Invalid Huffman code');
+      if (e & _HD_HAS_SYM) {
+        var sym = (e >> 8) & 0x1FF;
+        if (strict && sym === HUFF_EOS) {
           throw new Error('Huffman: EOS symbol in input');
         }
-        out.push(node.sym);
-        node = _huffRoot;
-        sincePadStart = 0;
-        padIsOnes = true;
+        out[n++] = sym;   // EOS (256) stores as 0, as Uint8Array.from did
       }
+      state = e & 0xFF;
     }
   }
 
-  if (strict && node !== _huffRoot) {
+  if (strict && state !== 0) {
     // Trailing bits that did not complete a symbol are padding. They must be
     // at most 7 bits and must be the most-significant bits of the EOS code.
-    if (sincePadStart > 7) throw new Error('Huffman: padding longer than 7 bits');
-    if (!padIsOnes) throw new Error('Huffman: padding is not the EOS prefix');
+    if (_huffDec.depth[state] > 7) throw new Error('Huffman: padding longer than 7 bits');
+    if (!_huffDec.ones[state]) throw new Error('Huffman: padding is not the EOS prefix');
   }
 
-  return Uint8Array.from(out);
+  // A view, not a copy: every caller turns the bytes into a string at once.
+  return out.subarray(0, n);
 }
 
 

@@ -458,6 +458,10 @@ function validateFieldSection(list, opts) {
   // m,p,a,s, Safari m,s,p,a. See h2_fingerprint.js. Collected here because
   // this loop is the only place that sees the list in its original sequence.
   var pseudoOrder = [];
+  // The fields as they came, one name and value per field line, pseudo-headers
+  // first: for rawHeaders, which node:http2 keeps that way (the map combines
+  // repeated ones).
+  var raw = [];
   var bad = function (m) { var e = new Error(m); e.malformed = true; return e; };
 
   for (var i = 0; i < list.length; i++) {
@@ -477,6 +481,7 @@ function validateFieldSection(list, opts) {
       if (!pseudo[name]) throw bad('unknown or misdirected pseudo-header ' + name);
       if (hasOwn.call(headers, name)) throw bad('duplicate pseudo-header ' + name);
       headers[name] = value;
+      raw.push(name, value);   // node:http2 keeps them in rawHeaders too
       continue;
     }
     seenRegular = true;
@@ -491,6 +496,7 @@ function validateFieldSection(list, opts) {
     // Repeat-combining is RFC 9110 §5.3: set-cookie never joins, cookie joins
     // with "; " (which h2 and h3 rely on: a sender may split it to compress).
     addHeader(headers, name, value);
+    raw.push(name, value);
   }
 
   var protocol = null;
@@ -543,6 +549,7 @@ function validateFieldSection(list, opts) {
   }
   if (!isServer && !trailers && !headers[':status']) throw bad('response is missing :status');
 
+  Object.defineProperty(headers, '_rawHeaders', { value: raw, enumerable: false });
   return { headers: headers, pseudoOrder: pseudoOrder, protocol: protocol };
 }
 

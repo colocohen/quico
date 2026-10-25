@@ -28,7 +28,8 @@ import { createQuicServer } from './quic_server.js';
 import { pickTlsOptions } from './tls_options.js';
 import { _makeSocketStub } from './streams.js';
 import { H3Connection, H3_ERR, wtCloseCapsule, wtDrainCapsule, createCapsuleReader, h3SettingsContext } from './h3.js';
-import { createWtStream, openWtStream, createSendGroup, wtScheduling, createDatagrams, sessionStats } from './wt_stream.js';
+import { createWtStream, openWtStream, createSendGroup, wtScheduling, createDatagrams, sessionStats,
+         exporterArgs, exportSessionKeyingMaterial } from './wt_stream.js';
 import { contextZero, datagramCapsule, STREAM_QUEUE_MAX } from './connect_udp.js';
 
 
@@ -132,6 +133,7 @@ function createServer(options, handler) {
     ech: options.ech || null,
     ocspRequest: options.ocspRequest || null,
     resetTokenSecret: options.resetTokenSecret || null,
+    tokenSecret: options.tokenSecret || null,
     validateAddress: options.validateAddress === true,
     handshakeLoadThreshold: options.handshakeLoadThreshold,
     earlyData: options.earlyData, earlyDataMaxAge: options.earlyDataMaxAge, earlyDataReplay: options.earlyDataReplay,
@@ -607,10 +609,15 @@ function createServer(options, handler) {
         // writeHead, when the status is known.
         _bodyAllowed: true,
 
+        // A list is kept a list, and goes as one field line per value, as
+        // HTTP/1.1 and HTTP/2 send it here and as Node's http does. It was
+        // String(list): two cookies became one "a=1,b=2", which a browser
+        // reads as a single cookie a with the value "1,b=2" (Set-Cookie
+        // never combines, RFC 9110 §5.3).
         setHeader: function (name, value) {
           validateHeaderName(name);
           validateHeaderValue(name, value);
-          res.headers[name.toLowerCase()] = String(value);
+          res.headers[name.toLowerCase()] = Array.isArray(value) ? value.map(String) : String(value);
         },
 
         getHeader: function (name) {
@@ -867,6 +874,17 @@ function createServer(options, handler) {
         // The browser's WebTransportSendGroup, for a stream's sendGroup or a
         // datagram's.
         createSendGroup: function () { return createSendGroup(); },
+
+        // The browser's exportKeyingMaterial, as the client's: this session's
+        // keying material from the TLS exporter — the same bytes the client
+        // gets for the same label and context.
+        exportKeyingMaterial: function (label, context, outputLength) {
+          var a;
+          try { a = exporterArgs(arguments); } catch (e) { return Promise.reject(e); }
+          if (!req._isWebTransport || req._wtClosed) return Promise.reject(new DOMException('the session is closed', 'InvalidStateError'));
+          try { return Promise.resolve(exportSessionKeyingMaterial(conn.quic, Number(streamId), a)); }
+          catch (e) { return Promise.reject(e); }
+        },
 
         // A stream of ours: a Duplex, or a Writable — recorded with its
         // session, so the session's end destroys it. options { sendOrder,
@@ -1639,7 +1657,9 @@ function createServer(options, handler) {
     getOptions: qserver.getOptions,
     setOptions: qserver.setOptions,
     getResetTokenSecret: qserver.getResetTokenSecret,
-    setResetTokenSecret: qserver.setResetTokenSecret
+    setResetTokenSecret: qserver.setResetTokenSecret,
+    getTokenSecret: qserver.getTokenSecret,
+    setTokenSecret: qserver.setTokenSecret
   };
 }
 

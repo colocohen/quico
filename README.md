@@ -288,6 +288,8 @@ QUICO takes from Node is `node:net` (TCP), `node:dgram` (UDP) and `node:crypto`
 - Bidirectional and unidirectional streams (Node.js Duplex API)
 - Unreliable datagrams
 - Natural API: `req.on('stream')`, `res.sendDatagram()`, `res.writeHead(200)` to accept
+- Over HTTP/3 only: a session asked for over HTTP/1.1 or HTTP/2 is answered `501`,
+  with no body, before the application sees it
 
 ### WebSocket
 - Server over all three versions: HTTP/1.1 Upgrade, HTTP/2 extended CONNECT
@@ -1006,6 +1008,7 @@ Creates a server for HTTP/3, HTTP/2 and HTTP/1.1. Returns a server object with
 | `handshakeLoadThreshold` | `number` | `500` | HTTP/3 handshakes under way at which `'handshakeLoad'` fires (`high: true`), and again under half of it (`high: false`). `0`: off. |
 | `maxHandshakesPerAddress` | `number` | `64` | HTTP/3 handshakes under way from one client address; past it an Initial from there makes no connection. `0`: no cap. |
 | `resetTokenSecret` | `Buffer` (≥ 16 bytes) | random | Secret for QUIC stateless-reset tokens. Keep it stable across restarts so clients of a crashed instance get a reset instead of a timeout. |
+| `tokenSecret` | `Buffer` (≥ 16 bytes) | random | Secret the HTTP/3 address-validation tokens (Retry, and NEW_TOKEN for a client's next connection) are sealed under — node:quic's name. Servers that share it open each other's tokens: several on one port (a thread each, `SO_REUSEPORT`), or one restarted. |
 | `socket` | `dgram.Socket` | `null` | Use an externally-bound IPv4 UDP socket instead of creating one. Must already be bound. |
 | `socket6` | `dgram.Socket` | `null` | Same, for IPv6. |
 | `greaseQuicBit` | `boolean` | `true`; `false` with `socket` / `socket6` | QUIC: invite clients to send the fixed bit unpredictable (RFC 9287), so the bit stays free to change. Off by default on an external socket, whose port may be shared with STUN, TURN or DTLS — told apart from QUIC by that bit (RFC 9443). `true` when that port carries QUIC alone. |
@@ -1094,15 +1097,21 @@ HTTP/1.1 and h2c.
   a connection idle for `msecs` emits `'timeout'` with its socket, and is destroyed
   if nothing listens. `0` (default) disables it; changes apply to new connections.
   TCP connections (HTTP/1.1, HTTP/2) — an HTTP/3 connection has QUIC's idle timeout.
-- `server.handlePacket(msg, rinfo)` / `server.hasConnection(rinfo)` — feed UDP
-  datagrams yourself when sharing a port (external socket mode).
+- `server.handlePacket(msg, rinfo)` / `server.hasConnection(rinfo[, msg])` — feed UDP
+  datagrams yourself when sharing a port (external socket mode). `hasConnection(rinfo)`
+  asks by the sender's address; `hasConnection(rinfo, msg)` by the connection ID the
+  datagram is addressed to — for servers sharing a port across threads, where a client
+  whose address changed can reach one that does not hold its connection. Ask it before
+  `handlePacket`: given a short-header packet for an ID it does not know, `handlePacket`
+  answers with a Stateless Reset, which would end a connection another server holds.
 - `server.addProtocol(name, handler, { sniff? })` — serve another protocol on the same
   TCP port: by ALPN `name`, or for TLS connections without ALPN, by
   `sniff(firstBytes) → true | false | null`. `handler(socket, protocol)`.
 - `server.getTicketKeys()` / `setTicketKeys(keys)`,
   `getEchKeys()` / `setEchKeys(ech)`,
   `getValidateAddress()` / `setValidateAddress(on)`,
-  `getResetTokenSecret()` / `setResetTokenSecret(secret)` — change these at runtime.
+  `getResetTokenSecret()` / `setResetTokenSecret(secret)`,
+  `getTokenSecret()` / `setTokenSecret(secret)` — change these at runtime.
 - `server.setOptions(options)` / `server.getOptions()` — every other option that can
   change while the server runs, in one call, by the names `createServer` takes. See
   [Changing options while running](#changing-options-while-running).
@@ -1780,6 +1789,21 @@ quico.createServer({ key: KEY, cert: CERT }, (req, res) => {
 }).listen(4433);
 ```
 
+**Only over HTTP/3.** A WebTransport session is an extended CONNECT over HTTP/3 (RFC 9220).
+When one is asked for over HTTP/1.1 or HTTP/2, the server answers it itself: **`501` with no
+body** (`content-length: 0`, `cache-control: no-store`). The request never reaches the handler,
+`'request'` or `'upgrade'`. Two signs mark such a request, and either one is enough:
+
+- the browser's Fetch destination, `Sec-Fetch-Dest: webtransport`;
+- an extended CONNECT for `:protocol: webtransport` over HTTP/2.
+
+A browser that cannot reach HTTP/3 may still send its session request over TCP. Firefox 158 does
+this when HTTP/3 has been excluded for an origin: it sends a plain `GET` with
+`Sec-Fetch-Dest: webtransport` on a new HTTP/1.1 connection. If that request were answered as a
+page, the body would land in the browser's WebTransport session, and Firefox would abort the whole
+browser. With the `501`, the session fails cleanly (`wt.ready` rejects in the page), and the page
+can fall back to WebSocket.
+
 **Datagrams** (`res.sendDatagram(data)`) are never retransmitted, but they are sent under
 the connection's congestion control (RFC 9221 §5.4): they wait for room in a packet and
 go ahead of stream data. While the path cannot keep up, the oldest are dropped — any that
@@ -1789,14 +1813,27 @@ the peer takes no datagrams). Datagrams sent right after accepting the session a
 until the `200` has left: a browser drops datagrams for a session it does not know yet.
 
 `res.datagrams` is the browser's datagrams object too — the client's `wt.datagrams`,
-the same code: `readable`, `writable`, `createWritable({ sendOrder, sendGroup })`,
-`maxDatagramSize`, `incomingMaxAge`, `outgoingMaxAge` and the high-water marks. Its
-`outgoingMaxAge` is the session's own: sessions on one connection share its queue, each
-with its own age limit and its own count of datagrams dropped.
+the same code: `readable`, `createWritable({ sendOrder, sendGroup })`, `maxDatagramSize`,
+`incomingMaxAge`, `outgoingMaxAge`, `incomingMaxBufferedDatagrams` and
+`outgoingMaxBufferedDatagrams`, as the current W3C spec has them. Each writable has its own
+queue and backpressure: `writer.ready` waits while `outgoingMaxBufferedDatagrams` of its
+datagrams wait to go. A write that is not an `ArrayBuffer` or a view onto one, or is
+empty, rejects with a `TypeError`; one larger than `maxDatagramSize` is dropped. The
+setters take values as the browser's do: an age of `0` is no limit (`null`), a negative
+one is a `RangeError`; a buffer count below 1 is 1. Its `outgoingMaxAge` is the session's
+own: sessions on one connection share its queue, each with its own age limit and its own
+count of datagrams dropped. The names from before the spec changed still work, for code
+written then: `datagrams.writable` (one writable, made on first use) and
+`incomingHighWaterMark` / `outgoingHighWaterMark` (the same settings as
+`…MaxBufferedDatagrams`).
 
 **Statistics** — `res.getStats()`, as the client's `wt.getStats()` (the same function):
-a Promise of the browser's `WebTransportConnectionStats` — `bytesSent`, `packetsSent`,
-`packetsLost`, `bytesReceived`, `packetsReceived` (whole packets), `smoothedRtt`,
+a Promise of the browser's `WebTransportConnectionStats` — `bytesSent` (the application's
+bytes: new stream data and datagram payloads, without framing or retransmissions),
+`bytesSentOverhead` (what the packets carried besides), `bytesAcknowledged` (the payload the
+peer acknowledged), `packetsSent`, `packetsLost` and `bytesLost` (packets of stream data or
+datagrams declared lost, and their size), `bytesReceived`, `packetsReceived` (whole
+packets), `smoothedRtt`,
 `rttVariation`, `minRtt` (ms), `estimatedSendRate` (bits/s, the congestion control's
 bandwidth estimate; `null` until measured), `atSendCapacity` (the congestion window is
 full) — with QUICO's `congestionWindow` and `bytesInFlight` besides, and `datagrams`:
@@ -1805,6 +1842,13 @@ The connection's figures are shared by every session on it, as in the browser. A
 that has to choose what to drop for a slow receiver reads `atSendCapacity`, or
 `bytesInFlight` against `congestionWindow`: the congestion is the connection's, not one
 stream's.
+
+**Keying material** — `res.exportKeyingMaterial(label, context, outputLength)`, as the
+client's `wt.exportKeyingMaterial()`: a Promise of `outputLength` bytes (1 to 4096) from the
+TLS exporter, this session's own (draft-ietf-webtrans-http3: the label
+`EXPORTER-WebTransport`, the session ID, the application's label and context, each at most
+255 bytes). Both ends get the same bytes for the same label and context, which lets a token
+be bound to the session it was sent on.
 
 **Priorities** are the browser's: a stream's `sendOrder` and `sendGroup`
 (`stream.sendGroup = res.createSendGroup()`), and `res.sendDatagram(data, { sendOrder,
@@ -1834,7 +1878,7 @@ stream are independent:
 | `'committed'` | Our sending part is "all data committed" (draft-ietf-webtrans-overview §4.3; "Data Recvd", RFC 9000 §3.1): every byte written and the FIN acknowledged by the peer. Once; never for a stream reset first. `'finish'` (and `end()`'s callback) only says the bytes were handed to QUIC — a delivery deadline (MOQT's SUBGROUP_DELIVERY_TIMEOUT) runs from the FIN to here, and `resetStream()` before it drops what is left. `sendState` is then `'committed'`. |
 | `stream.id`, `stream.sessionId` | Its QUIC stream ID, and its session's — read-only. |
 | `stream.sendState`, `stream.recvState` | Each direction, read-only: `'open'`, `'finished'` (the FIN sent / received), `'committed'` (ours: all of it and the FIN acknowledged), `'reset'` (we gave up sending / the peer did), `'stopped'` (the peer asked us to stop / we stopped reading); `null` for the direction a unidirectional stream does not have. A `'drain'` says the writer may write; `sendState` says whether what it writes still goes anywhere. |
-| `'close'` | Once both directions are over — by FIN, reset or stop, from either side, in any order. When the peer's reset or stop is what ends the last one, an `Error` (`ERR_WEBTRANSPORT_STREAM_RESET` / `ERR_WEBTRANSPORT_STOP_SENDING`) goes to an `'error'` listener — only if there is one. |
+| `'close'` | Once both directions are over — by FIN, reset or stop, from either side, in any order. When the peer's reset or stop is what ends the last one, an `Error` (`ERR_WEBTRANSPORT_STREAM_RESET` / `ERR_WEBTRANSPORT_STOP_SENDING`) goes to an `'error'` listener — only if there is one. `pipe()` adds a listener of its own that re-throws, as it does for a `net.Socket`: a stream piped with `pipe()` needs an `'error'` listener of yours, or use `stream.pipeline()`. The session's end is not such a cancel: when the peer closes the session it resets the streams with `WT_SESSION_GONE`, and they close without an `'error'`. |
 
 **Opening streams** is the browser's: `res.createBidirectionalStream(options[, callback])`
 and `res.createUnidirectionalStream(options[, callback])` take `{ sendOrder, sendGroup,
@@ -1902,19 +1946,20 @@ const uni = await wt.createUnidirectionalStream();             // a WritableStre
 await uni.getWriter().abort(new WebTransportError({ streamErrorCode: 7 }));   // RESET_STREAM, code 7
 
 const incoming = wt.incomingUnidirectionalStreams.getReader(); // ReadableStream of ReadableStreams
-const dgWriter = wt.datagrams.writable.getWriter();            // and wt.datagrams.readable
+const dgWriter = wt.datagrams.createWritable().getWriter();    // and wt.datagrams.readable
 
 wt.close({ closeCode: 0, reason: 'done' });
 const { closeCode, reason } = await wt.closed;                 // the server's, if it closed first
 ```
 
-The whole browser API is there: `ready`, `closed` (resolving with `{ closeCode, reason }`),
+The whole browser API is there: `ready`, `closed` (see [How the session ends](#how-the-session-ends) below),
 `draining`, `close()`, `createBidirectionalStream()` / `createUnidirectionalStream()` with
 `sendOrder`, `sendGroup` and `waitUntilAvailable`, `incomingBidirectionalStreams`,
-`incomingUnidirectionalStreams`, `datagrams` (`readable`, `writable`, `createWritable()`,
-`maxDatagramSize`, `incomingMaxAge`, `outgoingMaxAge`, `incomingHighWaterMark`,
-`outgoingHighWaterMark`), `createSendGroup()`, `getStats()`, `reliability`,
-`congestionControl`, `protocol`, and stream `getStats()`; the options
+`incomingUnidirectionalStreams`, `datagrams` (`readable`, `createWritable()`,
+`maxDatagramSize`, `incomingMaxAge`, `outgoingMaxAge`, `incomingMaxBufferedDatagrams`,
+`outgoingMaxBufferedDatagrams` — see the server's `res.datagrams` above), `createSendGroup()`, `getStats()`, `reliability`,
+`congestionControl`, `protocol`, `responseHeaders`, `exportKeyingMaterial()`,
+`WebTransport.supportsReliableOnly` (`false`: HTTP/3 only), and stream `getStats()`; the options
 `serverCertificateHashes` (the leaf's SHA-256, a certificate valid for at most 14 days, as
 the browser requires), `protocols`, `requireUnreliable`, `congestionControl`,
 `transportParams` (QUICO's own: the windows and stream limits, as the server's),
@@ -1923,10 +1968,49 @@ the browser requires), `protocols`, `requireUnreliable`, `congestionControl`,
 `session` (a TLS session from an earlier `'session'` event, to resume — not with
 `serverCertificateHashes`: a resumed handshake has no certificate to pin),
 `initialCongestionWindow` (as the server's),
-`allowPooling` and the `anticipatedConcurrent…` hints. `WebTransportError` takes the browser's
-`{ streamErrorCode }` form as well as the spec's `(message, options)`. A test runs the same
+`allowPooling`, the `anticipatedConcurrent…` hints and `datagramsReadableType`. A test runs the same
 client function in Chromium and in Node against a QUICO server and checks both see the same.
 `sendOrder` and `sendGroup` order what the client sends, as on the server (see above).
+
+**The browser's interfaces** are exported, for `instanceof` as in the browser:
+`WebTransportBidirectionalStream`, `WebTransportSendStream`, `WebTransportReceiveStream`,
+`WebTransportWriter`, `WebTransportSendGroup`, `WebTransportDatagramsWritable`,
+`WebTransportDatagramDuplexStream`. As in the browser, none of them can be constructed by
+the application. `WebTransportError` is a `DOMException` (its `name` is
+`'WebTransportError'`, with `source` and `streamErrorCode`) and takes the browser's
+`{ message, source, streamErrorCode }` form as well as the spec's `(message, options)`. Where
+QUICO gives a Node code too (`ERR_WEBTRANSPORT_SESSION_LOST`, say), it is in `err.code`, in
+place of the `DOMException`'s number.
+
+| | |
+|---|---|
+| `wt.responseHeaders` | The server's answer to the CONNECT: a `Headers` that cannot be changed, `null` until `ready`. No pseudo-headers and no `wt-protocol` (that is `wt.protocol`). `set-cookie` is there (`getSetCookie()`): a browser keeps it from its page, but in Node the program is the user agent, as with Node's `fetch`. |
+| `writer.atomicWrite(chunk)` | `getWriter()` of a send stream gives a `WebTransportWriter`. An atomic write goes only if all of it fits the flow-control window when its turn comes; otherwise none of it is sent and it rejects with an `AbortError`, as does any atomic write queued behind it, and the stream goes on. A plain write queued behind it fails the stream, as the spec has it. |
+| `writer.commit()` | What was written so far is delivered even if the stream is aborted later: `abort()` then sends RESET_STREAM_AT with that many bytes reliable (a MOQT subgroup's header, say) — `stream.resetStream(code, { reliableSize })` in the Node API. A peer that does not take RESET_STREAM_AT gets a plain RESET_STREAM. |
+| `readable.getReader({ mode: 'byob' })` | Streams are byte streams, as the browser's: a BYOB reader reads into its own buffer, and what does not fit stays for the next read. Datagrams too, with `datagramsReadableType: 'bytes'`: each datagram whole into the reader's buffer, a `RangeError` if it does not fit. |
+
+It behaves as the browser's does where the web-platform-tests check it:
+
+- **The constructor checks its arguments.** A URL that does not parse, is not `https:`, or
+  has a fragment is a `SyntaxError` (a `DOMException`, as Node's own `WebSocket` throws), and
+  so is a protocol in `protocols` that is empty, longer than 512, not printable ASCII, or
+  given twice. A malformed `serverCertificateHashes` entry, a `congestionControl` that is
+  not one of the three, or an `anticipatedConcurrent…` hint outside 0–65535 is a
+  `TypeError`. The hints are attributes that can be set later, with the same checks.
+- **Streams and datagrams can be used before `ready`.** `create…Stream()` waits for the
+  session and then resolves; a datagram written meanwhile goes once the session is up.
+- **The Promises reject as the browser's do.** `create…Stream()` on a session that is over
+  rejects with an `InvalidStateError`, a send group of another session's with a
+  `TypeError`, and a stream past the server's limit without `waitUntilAvailable` with a
+  `QuotaExceededError`. `getStats()` on a session that failed rejects with an
+  `InvalidStateError`.
+- **A stream fails as soon as its direction is given up on.** The server's `STOP_SENDING`
+  rejects `writer.closed`, its `RESET_STREAM` rejects `reader.closed`, and the session's
+  end fails both, without waiting for the next read or write. A stream write that is not
+  an `ArrayBuffer` or a view onto one, or is empty, rejects with a `TypeError`.
+- **The anticipated-streams hints take effect.** Given to the constructor, they raise the
+  stream limits the client grants the server from the start, unless `transportParams`
+  sets those limits itself.
 
 The same object also has a Node-style API, for Node code:
 
@@ -1953,7 +2037,45 @@ platform roots unless `ca` is given or `serverCertificateHashes` pins it. If the
 cannot be established, `ready` and `closed` reject with a `WebTransportError` (source
 `'session'`, keeping node:tls's `err.code`, e.g. `DEPTH_ZERO_SELF_SIGNED_CERT`, when TLS is
 the reason), `state` becomes `'failed'` and the connection is closed, as in the browser.
-`'error'` is emitted too, but only when a listener is attached.
+`'error'` is emitted too, but only when a listener is attached. Any `2xx` answer to the
+CONNECT establishes the session, as in the browser (draft-ietf-webtrans-http3 §3.3), not
+only `200`.
+
+**Fields on the CONNECT request.** A browser always sends its page's `Origin`, and servers
+check it (the web-platform-tests WebTransport server refuses a session without one). Node has
+no page, so the client takes `origin`, and `headers` for other fields, as QUICO's WebSocket
+client does:
+
+```js
+new WebTransport(url, { origin: 'https://app.example', headers: { authorization: 'Bearer …' } });
+```
+
+`headers` is the browser's `HeadersInit`: a `Headers`, a list of `[name, value]` pairs, or
+an object. The fields go after the pseudo-headers and are treated as the browser's
+`Headers` treats them: names are lower-cased, leading and trailing whitespace is removed
+from values, and a name given twice is sent once with its values joined by `, `.
+
+| Field | What happens |
+|---|---|
+| A pseudo-header, `wt-available-protocols` (that is `protocols`), a name or value that is not valid | The constructor throws a `TypeError`, as the browser's does |
+| `host`, `te`, `content-length`, `trailer`, connection-specific fields (`connection`, `keep-alive`, `transfer-encoding`, `upgrade`, …) | Dropped, as the browser drops them: they cannot go on an HTTP/3 request (the authority is `:authority`) |
+| `cookie`, `referer`, `sec-*` and the rest | Sent. A browser keeps them from a page for the page's safety; in Node the program is the user agent, as with Node's `fetch` |
+
+##### How the session ends
+
+| | `closed` | `'close'` |
+|---|---|---|
+| Either side sends `CLOSE_WEBTRANSPORT_SESSION` (`wt.close({ closeCode, reason })`, `res.closeSession(code, reason)`) | resolves with `{ closeCode, reason }` | emitted |
+| The server ends the CONNECT stream with a FIN and no capsule | resolves with `{ closeCode: 0, reason: '' }`, at once (draft-ietf-webtrans-http3 §5) | emitted |
+| The session is lost: the server resets the CONNECT stream, or the connection goes (an error, the idle timeout, the server gone) | **rejects** with a `WebTransportError` (source `'session'`, `code` `'ERR_WEBTRANSPORT_SESSION_LOST'`, and `quicError` `{ code, application, reason }` when the peer closed the connection), as soon as the server's CONNECTION_CLOSE arrives, not after QUIC's draining period; `state` is `'failed'` | emitted |
+| The session could not be established, or `wt.close()` was called before `ready` | rejects, with the same error as `ready` | emitted |
+
+As in the browser, `{ closeCode: 0 }` means a close someone asked for; a session that was
+lost rejects instead. The session's streams, its incoming-stream queues and its datagrams
+fail with it. When the session was lost or never established, they fail with the very
+error object `closed` rejects with. After our own `close()` they fail with an
+`AbortError`, and after the server's with a `WebTransportError`. A clean close closes the
+incoming-stream queues and the datagrams' `readable` instead of failing them.
 
 #### Client (Browser)
 
@@ -1964,7 +2086,7 @@ needed:
 const wt = new WebTransport('https://yourserver.com:4433/live');
 await wt.ready;
 
-const writer = wt.datagrams.writable.getWriter();
+const writer = wt.datagrams.createWritable().getWriter();
 await writer.write(new TextEncoder().encode('Hello QUIC'));
 
 const reader = wt.datagrams.readable.getReader();
@@ -2250,10 +2372,11 @@ For non-HTTP protocols over QUIC, or full control of the connection.
 | `handshakeLoadThreshold`, `maxHandshakesPerAddress` | `number` | `500`, `64` | As `createServer`; `getPendingHandshakes()`, `setOptions()` / `getOptions()` too |
 | `pmtuDiscovery`, `maxUdpPayloadSize`, `initialRtt`, `reorderWindow` | | | As `createServer` |
 | `resetTokenSecret` | `Buffer` | random | Stateless-reset secret |
+| `tokenSecret` | `Buffer` (≥ 16 bytes) | random | Address-validation token secret (Retry, NEW_TOKEN), as `createServer` |
 | `socket` / `socket6` | `dgram.Socket` | `null` | External, already-bound UDP sockets |
 
 Returns `{ listen, close, on, handlePacket, hasConnection }` plus the runtime getters and
-setters for ticket keys, address validation and the reset secret. The `'connection'`
+setters for ticket keys, address validation, the reset secret and the token secret. The `'connection'`
 event fires with `(quicConnection, peer)`.
 
 ```js
@@ -2274,7 +2397,7 @@ qs.on('connection', (quic, peer) => {
 qs.listen(4433);
 ```
 
-`handlePacket(msg, rinfo)` and `hasConnection(rinfo)` support **external socket
+`handlePacket(msg, rinfo)` and `hasConnection(rinfo[, msg])` support **external socket
 mode**, where QUICO shares a UDP port with another protocol (STUN/TURN, for example)
 and you route datagrams yourself.
 
@@ -2305,6 +2428,10 @@ and you route datagrams yourself.
 finalSize`), `'stop_sending'` (`id, code`), `'datagram'`, `'path'` (`address, port`),
 `'peer_transport_params'`, `'close'`, `'error'`, `'keylog'`; a client's 0-RTT: `'early'` (it may
 send application data now), `'early_accepted'`, `'early_rejected'` (what went early is forgotten — send it again).
+`'closing'` (`peerClose` — `{ error, application, reason }` when the peer's CONNECTION_CLOSE
+ended it, `null` when we did) fires once, the moment the connection is over for the
+application; `'close'` follows when the closing or draining period ends (RFC 9000 §10.2, up to
+3 s), which is packet housekeeping. Code that reacts to the end belongs on `'closing'`.
 
 **Connection options** (when constructing directly): `idleTimeout` (default `30000`),
 `handshakeTimeout` (default `10000`), `keepAlive` (`true` → half the idle timeout, or

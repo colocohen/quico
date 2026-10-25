@@ -317,6 +317,9 @@ function createServer(options, handler) {
     // The HTTP/3 side's stateless reset secret (see quic_server). Random when
     // not given.
     resetTokenSecret: options.resetTokenSecret || null,
+    // The secret HTTP/3 address-validation tokens (Retry, NEW_TOKEN) are
+    // sealed under (see quic_server). Random when not given.
+    tokenSecret: options.tokenSecret || null,
     // HTTP/3 address validation with Retry — node:quic's validateAddress.
     // Off unless set; see setValidateAddress below.
     validateAddress: options.validateAddress === true,
@@ -549,7 +552,8 @@ function createServer(options, handler) {
 
     // ---- Methods of the HTTP/3 response: its priority, and WebTransport's ----
     ['setPriority', 'sendDatagram', 'maxDatagramSize', 'createBidirectionalStream', 'createUnidirectionalStream',
-     'createSendGroup', 'canOpenStream', 'setWebTransportProtocol', 'getStats', 'closeSession', 'drainSession'].forEach(function (m) {
+     'createSendGroup', 'canOpenStream', 'setWebTransportProtocol', 'getStats', 'closeSession', 'drainSession',
+     'exportKeyingMaterial'].forEach(function (m) {
       if (typeof plainRes[m] === 'function') res[m] = plainRes[m].bind(plainRes);
     });
     if ('datagrams' in plainRes) {
@@ -657,7 +661,34 @@ function createServer(options, handler) {
   var tcpServer = null;
   var hasTlsCredentials = (tlsKey && tlsCert) || options.SNICallback;
 
+  // ---- A WebTransport session asked for over HTTP/1.1 or HTTP/2 ----
+  //
+  // WebTransport runs here over HTTP/3 only (an extended CONNECT, RFC 9220;
+  // HTTP/2 advertises no WebTransport). A browser that cannot reach HTTP/3
+  // may still send its session request over TCP: Firefox 158, with HTTP/3
+  // excluded for the origin, sends a plain "GET /" with
+  // Sec-Fetch-Dest: webtransport on a new HTTP/1.1 connection. Handed to the
+  // application it is answered as a page, and that body lands in the
+  // browser's WebTransport session — Firefox aborts the whole browser on it
+  // (MOZ_RELEASE_ASSERT in WebTransportSessionProxy::OnDataAvailable).
+  //
+  // So the server answers it itself: 501 and no body (RFC 9110 §15.6.2 — the
+  // functionality asked for is not offered on this version). The session
+  // fails cleanly, and the client can fall back to whatever it has. The
+  // application never sees it. Two signs, either enough: the Fetch
+  // destination a browser sends (Sec-Fetch-Dest: webtransport), and an
+  // extended CONNECT for :protocol webtransport over HTTP/2.
+  function isWebTransportRequest(req) {
+    var h = req.headers || {};
+    return h['sec-fetch-dest'] === 'webtransport' || h[':protocol'] === 'webtransport';
+  }
+  function refuseWebTransport(req, res) {
+    req.resume();
+    try { res.writeHead(501, { 'content-length': '0', 'cache-control': 'no-store' }); res.end(); } catch (e) {}
+  }
+
   function onRequest(req, res) {
+    if (isWebTransportRequest(req)) { refuseWebTransport(req, res); return; }
     if (req.earlyData === true) { earlyGate(req, res); return; }
     runHandler(req, res);
   }
@@ -683,7 +714,9 @@ function createServer(options, handler) {
 
   if (needsTcp) {
     var shared = {
-      shouldUpgradeCallback: shouldUpgradeCallback,
+      // An extended CONNECT for WebTransport over HTTP/2 is not taken up: it
+      // goes on as a request, and onRequest refuses it (above).
+      shouldUpgradeCallback: function (req) { return !isWebTransportRequest(req) && shouldUpgradeCallback(req); },
       // Not over cleartext: HTTP/3 is always TLS, and browsers take Alt-Svc
       // only from an https origin — on http:// it advertised a service that
       // could not exist there.
@@ -1007,6 +1040,16 @@ function createServer(options, handler) {
     setResetTokenSecret: function (secret) { h3srv.setResetTokenSecret(secret); },
 
     /**
+     * The secret HTTP/3 address-validation tokens — Retry's, and NEW_TOKEN's
+     * for a client's next connection — are sealed under: node:quic's
+     * tokenSecret, at least 16 bytes. Random unless given. Servers that share
+     * it open each other's tokens — several servers on one port (a thread
+     * each, SO_REUSEPORT), or one restarted.
+     */
+    getTokenSecret: function () { return h3srv.getTokenSecret(); },
+    setTokenSecret: function (secret) { h3srv.setTokenSecret(secret); },
+
+    /**
      * Carry another protocol over this server's TLS port, beside HTTP.
      *
      * A client that negotiates `name` by ALPN is handed to `handler(socket)`
@@ -1068,10 +1111,13 @@ function createServer(options, handler) {
       return h3srv.handlePacket(msg, rinfo);
     },
 
-    /** Returns true if the 5-tuple matches an active QUIC connection.
-     *  Used by demuxers for routing decisions on shared UDP ports. */
-    hasConnection: function (rinfo) {
-      return h3srv.hasConnection(rinfo);
+    /** hasConnection(rinfo): the address matches an active QUIC connection.
+     *  hasConnection(rinfo, msg): the datagram is addressed to one, by its
+     *  connection ID — for servers sharing a port across threads
+     *  (quic_server.js). Used by demuxers for routing decisions on shared
+     *  UDP ports. */
+    hasConnection: function (rinfo, msg) {
+      return h3srv.hasConnection(rinfo, msg);
     }
   };
 

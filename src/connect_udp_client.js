@@ -407,6 +407,15 @@ function ProxyH3Connection(key, proxy, o, ech) {
       // Each ticket the proxy sends: the agent's, and each tunnel's 'session'.
       onSocket: function (q) {
         self.quic = q;
+        // The connection is over the moment either side's CONNECTION_CLOSE is
+        // known ('closing'), not when its draining period (RFC 9000 §10.2,
+        // some 3 s) ends and 'close' comes: each tunnel on it is told at
+        // once, and the connection leaves the pool at once — a tunnel opened
+        // meanwhile joined a connection already closed, and failed. As the
+        // WebTransport client hears it (r69). Only once open: a handshake
+        // that ends is onError's to report — an ECH rejection is retried
+        // there with the server's new keys, not failed.
+        q.on('closing', function () { if (self.quic === q && self.state === 'open') self._gone(); });
         q.on('session', function (s) {
           self.sessions.keep(s);
           self.tunnels.forEach(function (t) { if (t.session) t.session(s); });

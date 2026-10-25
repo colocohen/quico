@@ -87,8 +87,12 @@ import {
 //  deliberately NOT part of this move.
 // ============================================================
 
+// One decoder for the module: decode() holds no state between calls (no
+// `stream` option), and constructing one per name and per value cost more
+// than the decoding itself.
+var _utf8Decoder = new TextDecoder();
 function _text(bytes) {
-  return new TextDecoder().decode(bytes);
+  return _utf8Decoder.decode(bytes);
 }
 
 // Every decodeStringLiteral() call below passes strict = true, enabling the
@@ -249,7 +253,10 @@ function parseQpackHeaderBlock(buf, dynamicTable, totalInserts, maxEntries, maxS
 
 
 // ============================================================
-//  H3 Frame build/parse
+//  H3 Frame build
+//
+//  Frames are read in place, from each stream's own buffer, as the bytes
+//  arrive: processBidiStream and processControlStream in H3Connection.
 // ============================================================
 
 function buildH3Frames(frames) {
@@ -261,43 +268,6 @@ function buildH3Frames(frames) {
   }
   return concatUint8Arrays(parts);
 }
-
-function extractH3Frames(chunks, fromOffset) {
-  if (!chunks || chunks.length === 0) return { frames: [], new_from_offset: fromOffset };
-
-  var buffers = [];
-  var acc = 0;
-  for (var i = 0; i < chunks.length; i++) {
-    var nextAcc = acc + chunks[i].length;
-    if (fromOffset < nextAcc) {
-      buffers.push(chunks[i].slice(fromOffset - acc));
-      for (var j = i + 1; j < chunks.length; j++) buffers.push(chunks[j]);
-      break;
-    }
-    acc = nextAcc;
-  }
-
-  if (buffers.length === 0) return { frames: [], new_from_offset: fromOffset };
-
-  var combined = concatUint8Arrays(buffers);
-  var offset = 0, frames = [];
-
-  while (offset < combined.length) {
-    var start = offset;
-    var ft = readVarInt(combined, offset);
-    if (!ft) break;
-    offset += ft.byteLength;
-    var len = readVarInt(combined, offset);
-    if (!len) { offset = start; break; }
-    offset += len.byteLength;
-    if (offset + len.value > combined.length) { offset = start; break; }
-    frames.push({ frame_type: ft.value, payload: combined.slice(offset, offset + len.value) });
-    offset += len.value;
-  }
-
-  return { frames: frames, new_from_offset: fromOffset + offset };
-}
-
 
 // ============================================================
 //  H3 Settings
@@ -369,24 +339,14 @@ function parseSettingsPayload(buf) {
 //  QPACK Encoder Instructions (from peer's encoder stream)
 // ============================================================
 
-function parseQpackEncoderInstructions(chunks, fromOffset, maxLiteral) {
-  if (!chunks || chunks.length === 0) return { instructions: [], new_from_offset: fromOffset, need: 0 };
+// Parse the encoder-stream instructions in `combined` — the stream's unparsed
+// bytes, from its read position. Returns the complete instructions, how many
+// bytes they took (consumed), and, when the last one is cut short, how many
+// bytes it needs (need). It used to take the stream's chunks and an offset
+// and join them itself; the one caller already hands it a single buffer.
+function parseQpackEncoderInstructions(combined, maxLiteral) {
+  if (!combined || combined.length === 0) return { instructions: [], consumed: 0, need: 0 };
   if (maxLiteral === undefined) maxLiteral = Infinity;
-
-  var buffers = [];
-  var acc = 0;
-  for (var i = 0; i < chunks.length; i++) {
-    var nextAcc = acc + chunks[i].length;
-    if (fromOffset < nextAcc) {
-      buffers.push(chunks[i].slice(fromOffset - acc));
-      for (var j = i + 1; j < chunks.length; j++) buffers.push(chunks[j]);
-      break;
-    }
-    acc = nextAcc;
-  }
-  if (buffers.length === 0) return { instructions: [], new_from_offset: fromOffset, need: 0 };
-
-  var combined = buffers.length === 1 ? buffers[0] : concatUint8Arrays(buffers);
   var pos = 0;
   var instructions = [];
   // When the last instruction is cut short: how many bytes, from its start,
@@ -457,7 +417,7 @@ function parseQpackEncoderInstructions(chunks, fromOffset, maxLiteral) {
     }
   }
 
-  return { instructions: instructions, new_from_offset: fromOffset + pos,
+  return { instructions: instructions, consumed: pos,
            need: needAbs > pos ? needAbs - pos : 0 };
 }
 
@@ -1700,7 +1660,7 @@ function H3Connection(options) {
       // Only the unparsed bytes are copied (once per completed instruction,
       // given `need`), and no literal larger than our table can hold is
       // waited for.
-      ext = parseQpackEncoderInstructions([copyBytes(s, s.buffered)], 0,
+      ext = parseQpackEncoderInstructions(copyBytes(s, s.buffered),
                                           context.local_qpack_max_table_capacity);
     } catch (err) {
       // RFC 9204 §4.2: a malformed encoder stream is QPACK_ENCODER_STREAM_ERROR,
@@ -1708,7 +1668,7 @@ function H3Connection(options) {
       err.h3ErrorCode = H3_ERR.QPACK_ENCODER_STREAM_ERROR;
       throw err;
     }
-    consumeBytes(s, ext.new_from_offset);
+    consumeBytes(s, ext.consumed);
     s.need = ext.need;
     if (ext.instructions.length === 0) return;
 
@@ -2000,6 +1960,11 @@ function H3Connection(options) {
       if (avail < headLen + len.value) break;
       // Waits for the encoder stream when it must (see sectionBlocked): the
       // frame stays in the buffer, read again once unblocked.
+      // Already waiting, and the inserts it needs are not here yet: nothing
+      // to do. The frame was copied and its prefix decoded again on every
+      // packet that arrived on the stream meanwhile.
+      if (_blocked.has(Number(streamId)) &&
+          _blocked.get(Number(streamId)) > context.remote_qpack_table_base_index) return;
       var whole = copyBytes(s, headLen + len.value);
       var payload = whole.subarray(headLen);
       if (sectionBlocked(Number(streamId), payload)) return;
@@ -2138,7 +2103,11 @@ function H3Connection(options) {
     var list = [];
     for (var hname in headers) {
       if (Object.prototype.hasOwnProperty.call(headers, hname)) {
-        list.push([hname, headers[hname]]);
+        // A list: one field line per value (Set-Cookie above all, which may
+        // not be combined), not String(list).
+        var hv = headers[hname];
+        if (Array.isArray(hv)) { for (var hi = 0; hi < hv.length; hi++) list.push([hname, String(hv[hi])]); }
+        else list.push([hname, hv]);
       }
     }
     var enc = qpackEncodeHeaderBlock(list, encoderTable, {
