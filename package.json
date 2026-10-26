@@ -1,6 +1,6 @@
 {
   "name": "quico",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A pure JavaScript implementation of QUIC, HTTP/3, QPACK, and WebTransport for Node.js",
   "type": "module",
   "main": "index.cjs",
@@ -12,7 +12,7 @@
     }
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=24.0.0"
   },
   "types": "index.d.ts",
   "files": [
@@ -37,6 +37,9 @@
     "http3-client",
     "h3-node",
     "webtransport",
+    "moqt",
+    "masque",
+    "connect-udp",
     "websocket",
     "datagram",
     "udp",
@@ -65,7 +68,7 @@
     "email": "support@quicojs.dev",
     "url": "https://github.com/colocohen/quico/issues"
   },
-  "homepage": "https://github.com/colocohen/quico#readme",
+  "homepage": "https://quicojs.dev",
   "funding": [
     {
       "type": "github",
@@ -78,6 +81,6 @@
   ],
   "dependencies": {
     "flat-ranges": "^2.2.0",
-    "lemon-tls": "^0.9.0"
+    "lemon-tls": "^0.10.0"
   }
 }

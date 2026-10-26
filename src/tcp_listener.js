@@ -67,6 +67,7 @@ function createTcpListener(options) {
   var order = [];           // registration order = ALPN preference order
   var sockets = new Set();
   var closing = false;
+  var refed = true;
 
   var tls = options.tls || null;
   var cachedContext = null;
@@ -134,6 +135,7 @@ function createTcpListener(options) {
     if (stats) stats.protocol(protocol);
 
     sockets.add(socket);
+    socket._quicoProtocol = protocol;
     socket.on('close', function () { sockets.delete(socket); });
     if (handlerOpts[protocol] && handlerOpts[protocol].paused) socket.pause();
     handler(socket, protocol);
@@ -501,6 +503,7 @@ function createTcpListener(options) {
     if (order.length === 0) throw new Error('no protocol handlers registered');
 
     server = net.createServer({ allowHalfOpen: false }, handleConnection);
+    if (!refed) server.unref();
     server.on('error', function (err) { ev.emit('error', err); });
     server.listen(port, host, function () {
       ev.emit('listening');
@@ -521,7 +524,12 @@ function createTcpListener(options) {
     // — sockets handed in through handleConnection — there is no net.Server
     // here to close, and returning early (as this did) left every one of
     // those connections open after shutdown.
+    // A protocol that closes its own connections (registered with
+    // managesClose: HTTP/1.1 and HTTP/2 finish what is in flight first) is
+    // left to it.
     for (var socket of sockets) {
+      var po = handlerOpts[socket._quicoProtocol];
+      if (po && po.managesClose) continue;
       if (!socket._quicoBusy) { try { socket.end(); } catch (e) {} }
     }
 
@@ -540,6 +548,9 @@ function createTcpListener(options) {
     off: function (n, f) { ev.off(n, f); return listener; },
     get protocols() { return order.slice(); },
     get connections() { return sockets.size; },
+    // node:net's: whether the process may exit while this listens.
+    ref: function () { refed = true; if (server && server.ref) server.ref(); return listener; },
+    unref: function () { refed = false; if (server && server.unref) server.unref(); return listener; },
 
     // The session ticket keys — tls.Server's names. A new key takes effect
     // for the next connection; tickets sealed with the one before no longer

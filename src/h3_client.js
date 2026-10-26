@@ -476,7 +476,11 @@ function request(options, callback) {
         return e;
       });
     });
-    conn.quic.on('close', function () {
+    // On 'closing' — the moment the connection is over (a CONNECTION_CLOSE
+    // either way, the idle timeout) — not only on 'close', which waits out
+    // the draining period (RFC 9000 §10.2, ~3 s): a response the server cut
+    // off hung that long before it failed.
+    function connectionOver() {
       failAll(0, function (sid) {
         var e = new Error('HTTP/3 connection closed before the response ended');
         e.code = 'ERR_HTTP3_CONNECTION_CLOSED';
@@ -484,7 +488,9 @@ function request(options, callback) {
         e.retryable = sid >= conn._goawayId;
         return e;
       });
-    });
+    }
+    conn.quic.on('closing', connectionOver);
+    conn.quic.on('close', connectionOver);
   }
 
 
@@ -662,17 +668,28 @@ function request(options, callback) {
     else if (reqBody.length) startStreaming();
   }
 
-  function requestHeaders() {
+  // contentLength: the body's size when it is known whole (ended before it
+  // went) — sent as h2_client and node:https send it, and as browsers do. A
+  // server that decides whether there is a body from the headers (Express's
+  // body-parser: content-length or transfer-encoding) saw none over HTTP/3,
+  // and req.body came out empty.
+  function requestHeaders(contentLength) {
     var h3Headers = {
       ':method': method,
       ':scheme': 'https',
       ':authority': hostname + (port !== 443 ? ':' + port : ''),
       ':path': path
     };
-    for (var name in headers) h3Headers[name.toLowerCase()] = String(headers[name]);
+    // A repeated field (an array) stays one line per value: String(list)
+    // made two cookies "a=1,b=2", which the server reads as one cookie.
+    for (var name in headers) {
+      var v = headers[name];
+      h3Headers[name.toLowerCase()] = Array.isArray(v) ? v.map(String) : String(v);
+    }
     if (!h3Headers['user-agent']) h3Headers['user-agent'] = 'quico/1.0';
     if (!h3Headers['accept']) h3Headers['accept'] = '*/*';
     if (!h3Headers['accept-encoding']) h3Headers['accept-encoding'] = 'identity';
+    if (contentLength != null && h3Headers['content-length'] === undefined) h3Headers['content-length'] = String(contentLength);
     return h3Headers;
   }
 
@@ -687,7 +704,9 @@ function request(options, callback) {
     // Early: kept, to go again if the server refuses it.
     if (earlyTried && !handshaken) earlyBody = { body: body.slice(), trailers: reqTrailers };
     if (body.length === 0 && !reqTrailers) { h3.sendHeaders(streamId, requestHeaders(), true); return; }
-    h3.sendHeaders(streamId, requestHeaders(), false);
+    var bodyLength = 0;
+    for (var bi = 0; bi < body.length; bi++) bodyLength += body[bi].byteLength;
+    h3.sendHeaders(streamId, requestHeaders(body.length ? bodyLength : null), false);
     for (var i = 0; i < body.length; i++) h3.sendBody(streamId, body[i], i === body.length - 1 && !reqTrailers);
     if (reqTrailers) h3.sendHeaders(streamId, reqTrailers, true);
   }

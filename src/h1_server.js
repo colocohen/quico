@@ -155,6 +155,8 @@ function createServer(options, handler) {
 
     socket.on('data', function (chunk) {
       if (destroyed) return;
+      // A request is arriving: not idle (closeIdleConnections, close()).
+      socket._quicoBusy = true;
 
       try {
         parser.execute(chunk);
@@ -231,6 +233,7 @@ function createServer(options, handler) {
     });
 
     parser.on('headers', function (info) {
+      socket._quicoBusy = true;
       clearTimer();
       setTimer(requestTimeout, 'request');
       served++;
@@ -359,6 +362,7 @@ function createServer(options, handler) {
         socket: socket
       });
       req.rawHeaders = info.rawHeaders;
+      req.upgrade = true;
       req._endData();
 
       // Hand the raw socket over, exactly as node:http does. `head` is the
@@ -452,7 +456,7 @@ function createServer(options, handler) {
         willClose = !keepAlive;
 
         if (keepAlive && info.httpVersion === '1.0') headers['keep-alive'] = 'timeout=5';
-        if (!('date' in headers)) headers['date'] = httpDate();
+        if (!('date' in headers) && res.sendDate !== false) headers['date'] = httpDate();
         // A function when the server was built before its port was known —
         // the unified server builds its layers at creation and learns the
         // port from listen(), or from options.port when fed from outside.
@@ -482,6 +486,13 @@ function createServer(options, handler) {
           catch (e) { ok = false; }
         }
         if (typeof callback === 'function') process.nextTick(callback);
+      };
+
+      // 102 Processing (node:http's writeProcessing): an interim response,
+      // as Early Hints are.
+      res.writeProcessing = function () {
+        if (res.headersSent || info.httpVersion === '1.0' || destroyed) return;
+        try { socket.write(buildResponseHead(102, null, {})); } catch (e) {}
       };
 
       res._write = function (chunk, encoding, callback) {
@@ -526,6 +537,7 @@ function createServer(options, handler) {
       function onResponseComplete() {
         clearTimer();
         current = null;
+        socket._quicoBusy = false;
         // Whatever of the body is still to come is dropped from here on (the
         // parser reads it, to find the next request): the reader no longer
         // holds the socket back.
@@ -573,7 +585,7 @@ function createServer(options, handler) {
       ca: options.ca,
       SNICallback: options.SNICallback
     });
-    tcpServer.register('http/1.1', handleConnection);
+    tcpServer.register('http/1.1', handleConnection, { managesClose: true });
     tcpServer.on('error', function (err) { ev.emit('error', err); });
     tcpServer.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
     tcpServer.on('tlsClientError', function (err, sock) { ev.emit('tlsClientError', err, sock); });
@@ -584,15 +596,40 @@ function createServer(options, handler) {
     return server;
   }
 
-  function close(callback) {
+  // ---- Closing, as node:http ----
+  //
+  // Idle: a connection between requests (or before its first) — no request
+  // arriving, no response being written. Closing one costs nothing.
+  function closeIdleConnections() {
+    for (var s of connections) if (!s._quicoBusy) { try { s.destroy(); } catch (e) {} }
+  }
+  // All, mid-request too. Not the sockets handed to 'upgrade' (a WebSocket):
+  // those left this server at the upgrade, as in node:http.
+  function closeAllConnections() {
+    for (var s of connections) { try { s.destroy(); } catch (e) {} }
+  }
+  // No new connections, the idle ones closed; each busy one closes as its
+  // response completes (onResponseComplete). It used to end every socket at
+  // once: a response being written was cut off.
+  function beginClose() {
     closing = true;
-    if (!tcpServer) {
-      // Sockets we were handed rather than accepted: still ours to close.
-      for (var s of connections) { try { s.end(); } catch (e) {} }
-      if (callback) callback();
-      return;
-    }
+    closeIdleConnections();
+  }
+
+  function close(callback) {
+    beginClose();
+    if (!tcpServer) { if (callback) callback(); return; }
     tcpServer.close(callback);
+  }
+
+  // node:http's timeouts and limits, changed while the server runs: from
+  // the next request (or connection) on.
+  function setLimits(o) {
+    if (o.headersTimeout !== undefined) headersTimeout = o.headersTimeout;
+    if (o.keepAliveTimeout !== undefined) keepAliveTimeout = o.keepAliveTimeout;
+    if (o.requestTimeout !== undefined) requestTimeout = o.requestTimeout;
+    if (o.maxHeaderCount !== undefined) maxHeaderCount = o.maxHeaderCount;
+    if (o.maxRequestsPerSocket !== undefined) maxRequests = maxRequestsPerSocket(o.maxRequestsPerSocket);
   }
 
   function address() {
@@ -610,6 +647,11 @@ function createServer(options, handler) {
     emit: function () { ev.emit.apply(ev, arguments); return server; },
     listenerCount: function (n) { return ev.listenerCount(n); },
     setTimeout: function (ms) { headersTimeout = ms; return server; },
+    closeIdleConnections: closeIdleConnections,
+    closeAllConnections: closeAllConnections,
+    beginClose: beginClose,
+    setLimits: setLimits,
+    get connectionCount() { return connections.size; },
 
     /** Attach an already-connected Duplex, bypassing the listener. Lets the
      *  unified server share one TCP port, and makes the whole stack testable

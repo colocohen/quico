@@ -59,6 +59,10 @@ class IncomingMessage extends Readable {
     // QUIC has no TCP socket — stub so libraries don't crash
     this.socket = options.socket || _makeSocketStub();
     this.connection = this.socket;
+    this.client = this.socket;      // node:http's older alias
+    // node:http's: true on a request handed to 'upgrade' (an HTTP/1.1
+    // Upgrade, an extended CONNECT over HTTP/2 and HTTP/3).
+    this.upgrade = false;
 
     // H3 stream id (internal)
     this._streamId = options.streamId != null ? options.streamId : null;
@@ -80,6 +84,12 @@ class IncomingMessage extends Readable {
       }
     }
   }
+
+  // node:http's headersDistinct / trailersDistinct: each name (lower case)
+  // with every value it came with, as an array, nothing joined — from the
+  // field lines as they arrived (rawHeaders, rawTrailers).
+  get headersDistinct() { return distinctFields(this.rawHeaders); }
+  get trailersDistinct() { return distinctFields(this.rawTrailers); }
 
   // Readable requires _read — data is pushed externally, so no-op.
   _read(_size) { /* no-op */ }
@@ -195,6 +205,11 @@ class ServerResponse extends Writable {
     this.finished = false;
     this._headers = {};
     this._headerNames = {};  // lowercase → original-case
+    // node:http's: a Date header unless false (RFC 9110 §6.6.1); and, when
+    // true, a body that does not match its Content-Length throws.
+    this.sendDate = true;
+    this.strictContentLength = false;
+    this._bodyBytes = 0;
 
     // H3 references (set by server when creating the response)
     this._streamId = options.streamId != null ? options.streamId : null;
@@ -221,6 +236,9 @@ class ServerResponse extends Writable {
     this.getHeaderNames = this.getHeaderNames.bind(this);
     this.hasHeader = this.hasHeader.bind(this);
     this.removeHeader = this.removeHeader.bind(this);
+    this.appendHeader = this.appendHeader.bind(this);
+    this.setHeaders = this.setHeaders.bind(this);
+    this.getRawHeaderNames = this.getRawHeaderNames.bind(this);
     this.writeHead = this.writeHead.bind(this);
     this.flushHeaders = this.flushHeaders.bind(this);
     this._flushHeaders = this._flushHeaders.bind(this);
@@ -281,14 +299,48 @@ class ServerResponse extends Writable {
     return this._headers[name.toLowerCase()];
   }
 
+  // An object with no prototype, as node:http's: a header named
+  // "constructor" or "__proto__" is a header, not a property it inherits.
   getHeaders() {
-    var out = {};
+    var out = Object.create(null);
     for (var k in this._headers) out[k] = this._headers[k];
     return out;
   }
 
   getHeaderNames() {
     return Object.keys(this._headers);
+  }
+
+  // node:http's: the names as they were set, in their case.
+  getRawHeaderNames() {
+    var out = [];
+    for (var k in this._headers) out.push(this._headerNames[k] || k);
+    return out;
+  }
+
+  // node:http's: a value added to a header's (both kept), not in its place.
+  appendHeader(name, value) {
+    if (this.headersSent) throw headersSentError('append', this.req && this.req.httpVersion);
+    return this._appendHeader(name, value);
+  }
+
+  // node:http's: several at once, from a Headers or a Map — each replacing
+  // that name's value (Set-Cookie: every one of a Headers' cookies).
+  setHeaders(headers) {
+    if (this.headersSent) throw headersSentError('set', this.req && this.req.httpVersion);
+    var isHeaders = typeof Headers !== 'undefined' && headers instanceof Headers;
+    if (!isHeaders && !(headers instanceof Map)) {
+      var e = new TypeError('The "headers" argument must be an instance of Headers or Map');
+      e.code = 'ERR_INVALID_ARG_TYPE';
+      throw e;
+    }
+    var self = this, cookies = null;
+    headers.forEach(function (value, name) {
+      if (isHeaders && String(name).toLowerCase() === 'set-cookie') { cookies = headers.getSetCookie(); return; }
+      self.setHeader(name, value);
+    });
+    if (cookies) this.setHeader('set-cookie', cookies);
+    return this;
   }
 
   hasHeader(name) {
@@ -300,6 +352,16 @@ class ServerResponse extends Writable {
     var lower = name.toLowerCase();
     delete this._headers[lower];
     delete this._headerNames[lower];
+    return this;
+  }
+
+  // A value added to what a name has (kept as a list), not in its place.
+  _appendHeader(name, value) {
+    var lower = String(name).toLowerCase();
+    if (!(lower in this._headers)) return this.setHeader(name, value);
+    validateHeaderName(name);
+    validateHeaderValue(name, value);
+    this._headers[lower] = [].concat(this._headers[lower], value);
     return this;
   }
 
@@ -336,7 +398,22 @@ class ServerResponse extends Writable {
     this.statusCode = statusCode;
     if (statusMessage !== undefined) this.statusMessage = String(statusMessage);
 
-    if (typeof headers === 'object' && headers !== null) {
+    // node:http's three forms: an object; a flat array [name, value, name,
+    // value]; an array of [name, value] pairs. The arrays may repeat a name
+    // and every value is kept (two Set-Cookie lines). An array went through
+    // for…in: headers named "0", "1", … — over HTTP/3 the response failed.
+    if (Array.isArray(headers)) {
+      var tuples = headers.length > 0 && Array.isArray(headers[0]);
+      if (!tuples && headers.length % 2 !== 0) {
+        var bad = new TypeError('The argument \'headers\' is invalid: an array of names and values must have an even length');
+        bad.code = 'ERR_INVALID_ARG_VALUE';
+        throw bad;
+      }
+      for (var i = 0; i < headers.length; i += tuples ? 1 : 2) {
+        var hn = tuples ? headers[i][0] : headers[i], hv = tuples ? headers[i][1] : headers[i + 1];
+        if (hn) this._appendHeader(hn, hv);
+      }
+    } else if (typeof headers === 'object' && headers !== null) {
       for (var name in headers) this.setHeader(name, headers[name]);
     }
 
@@ -383,12 +460,38 @@ class ServerResponse extends Writable {
   write(chunk, encoding, callback) {
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
     this._wrote = true;
+    this._countBody(chunk, encoding, false);
     return super.write(chunk, encoding, callback);
+  }
+
+  // strictContentLength (node:http's): the body may not go past its
+  // Content-Length, nor end short of it — ERR_HTTP_CONTENT_LENGTH_MISMATCH,
+  // thrown from the write() or end() that shows it.
+  // Counted only once checked: a write that threw sent nothing.
+  _countBody(chunk, encoding, ending) {
+    var total = this._bodyBytes;
+    if (chunk != null && !this.writableEnded) {
+      total += typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding) : (chunk.byteLength || 0);
+    }
+    var declared = this.strictContentLength ? this.getHeader('content-length') : undefined;
+    if (declared !== undefined && !Array.isArray(declared) && !(this.req && this.req.method === 'HEAD') && Number(declared) >= 0) {
+      declared = Number(declared);
+      if (total > declared || (ending && total !== declared)) {
+        var e = new Error('Response body\'s content-length of ' + total + ' byte(s) does not match the content-length of ' + declared + ' byte(s) set in header');
+        e.code = 'ERR_HTTP_CONTENT_LENGTH_MISMATCH';
+        throw e;
+      }
+    }
+    this._bodyBytes = total;
   }
 
   end(data, encoding, callback) {
     if (typeof data === 'function') { callback = data; data = undefined; encoding = undefined; }
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
+    if (!this.writableEnded) {
+      if (data != null) this._countBody(data, encoding, true);
+      else this._countBody(null, null, true);
+    }
     // The whole body, when nothing was written before it and the head has
     // not gone: its length, for HTTP/1.1 to send as Content-Length rather
     // than chunk it (node:http's end() does the same). HTTP/2 and HTTP/3
@@ -399,8 +502,22 @@ class ServerResponse extends Writable {
         : data.byteLength;
       if (typeof len === 'number') this._endLength = len;   // else write() rejects it
     }
-    if (data != null) this.write(data, encoding);
-    return super.end(callback);
+    if (data != null) this._writeCounted(data, encoding);
+    // The callback runs at 'finish', after the listeners already on it — as
+    // node:http's end(cb), a once('finish'). Given to Writable's end() it
+    // ran before them.
+    if (typeof callback === 'function') {
+      if (this.writableFinished) process.nextTick(callback);
+      else this.once('finish', callback);
+    }
+    super.end();
+    return this;
+  }
+
+  // The last write, its bytes already counted by end().
+  _writeCounted(data, encoding) {
+    this._wrote = true;
+    return super.write(data, encoding);
   }
 
   writeContinue() { /* HTTP/3 doesn't use 100-continue — stub */ }
@@ -415,6 +532,12 @@ class ServerResponse extends Writable {
   writeEarlyHints(hints, callback) {
     if (typeof callback === 'function') process.nextTick(callback);
   }
+
+  /**
+   * 102 Processing — node:http's response.writeProcessing(). Replaced by the
+   * layer that made the response, as writeEarlyHints is; here, nothing.
+   */
+  writeProcessing() {}
 
   /**
    * The response's priority, { urgency, incremental } (RFC 9218). HTTP/2 and
@@ -604,6 +727,21 @@ class ClientRequest extends Writable {
     if (Buffer.isBuffer(chunk)) {
       chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     }
+    if (this._sink && this._wholeBody) {
+      // end(data) with nothing written before it: the body whole, handed to
+      // the transport as its end — sent with a content-length, as node:http
+      // sends end(data). Written, then ended, a transport already able to
+      // send had begun streaming on the write: no length, and a server that
+      // goes by the headers (Express's body-parser) saw no body. It happened
+      // whenever the connection was ready at once — a pooled one.
+      this._wholeBody = false;
+      this._sinkEnded = true;
+      this._remember(chunk);
+      this._sink.end(chunk, this._trailers);
+      callback();
+      return;
+    }
+    this._wholeBody = false;
     if (this._sink) { this._toSink(chunk, callback); return; }
     // No transport yet (still connecting): held — and the writer told to wait
     // past the high-water mark, as a socket not yet connected would.
@@ -615,7 +753,7 @@ class ClientRequest extends Writable {
 
   _final(callback) {
     this.finished = true;
-    if (this._sink) this._sink.end(null, this._trailers);
+    if (this._sink && !this._sinkEnded) { this._sinkEnded = true; this._sink.end(null, this._trailers); }
     callback();
   }
 
@@ -658,12 +796,21 @@ class ClientRequest extends Writable {
     });
     var held = this._bodyChunks, more = true;
     this._bodyChunks = []; this._bodyBuffered = 0;
+    this._sinkEnded = false;
+    if (this.finished) {
+      // Ended before a transport took it: the body is known whole — one
+      // end(), so it goes with its length rather than streamed.
+      for (var j = 0; j < held.length; j++) this._remember(held[j]);
+      var whole = held.length === 0 ? null : held.length === 1 ? held[0] : Buffer.concat(held);
+      this._sinkEnded = true;
+      sink.end(whole, this._trailers);
+      return;
+    }
     for (var i = 0; i < held.length; i++) { this._remember(held[i]); more = sink.write(held[i]); }
     if (this._pendingWriteCb) {
       var cb = this._pendingWriteCb; this._pendingWriteCb = null;
       if (more) cb(); else this._sinkWaitCb = cb;
     }
-    if (this.finished) sink.end(null, this._trailers);
   }
 
   // The transport failed before the server processed the request: the body
@@ -695,13 +842,18 @@ class ClientRequest extends Writable {
 
   write(chunk, encoding, callback) {
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
+    this._wroteBody = true;
     return super.write(chunk, encoding, callback);
   }
 
   end(data, encoding, callback) {
     if (typeof data === 'function') { callback = data; data = undefined; encoding = undefined; }
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
-    if (data != null) this.write(data, encoding);
+    if (data != null) {
+      // Nothing written before: this chunk is the body whole (_write).
+      this._wholeBody = !this._wroteBody && !this.writableEnded;
+      this.write(data, encoding);
+    }
     return super.end(callback);
   }
 
@@ -787,6 +939,16 @@ function reparent(obj, Base) {
     top = Object.create(top, Object.getOwnPropertyDescriptors(between[i]));
   }
   Object.setPrototypeOf(obj, top);
+}
+
+// rawHeaders' pairs as node:http's headersDistinct: name → [values].
+function distinctFields(raw) {
+  var out = {};
+  for (var i = 0; raw && i + 1 < raw.length; i += 2) {
+    var n = String(raw[i]).toLowerCase();
+    (out[n] || (out[n] = [])).push(String(raw[i + 1]));
+  }
+  return out;
 }
 
 function _makeSocketStub() {

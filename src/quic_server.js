@@ -498,6 +498,7 @@ function createQuicServer(options) {
       // in length". Shorter ones would also be easy to guess and collide.
       if (firstPkt.dcid.byteLength < 8) return;
       if (connectionCount >= maxConnections) return;
+      if (!accepting) return;
 
       var retry = null, knownAddress = false;
       if (firstPkt.token && firstPkt.token.byteLength > 0) {
@@ -743,7 +744,7 @@ function createQuicServer(options) {
   var SERVER_RUNTIME = ['validateAddress', 'handshakeLoadThreshold', 'maxHandshakesPerAddress', 'earlyData', 'earlyDataMaxAge'];
   var ELSEWHERE = {
     key: 'setSecureContext()', cert: 'setSecureContext()', ca: 'setSecureContext()', pfx: 'setSecureContext()',
-    passphrase: 'setSecureContext()', SNICallback: 'setSecureContext()',
+    passphrase: 'setSecureContext()', SNICallback: 'addContext() or setSecureContext()',
     ticketKeys: 'setTicketKeys()', ech: 'setEchKeys()', resetTokenSecret: 'setResetTokenSecret()', tokenSecret: 'setTokenSecret()',
     transportParams: 'connectionOptions, per connection'
   };
@@ -846,6 +847,11 @@ function createQuicServer(options) {
   // timeout. close() waits for them — not long (SEND_DRAIN_MAX).
   var sendsPending = 0;
   var shutDown = false;
+  // stopAccepting(): no new connection (an Initial for an unknown one is
+  // dropped); those open go on — a graceful close, the layer above deciding
+  // when they end.
+  var accepting = true;
+  var refed = true;
   var closing = null;
   var SEND_DRAIN_MAX = 200;
 
@@ -856,6 +862,7 @@ function createQuicServer(options) {
 
   function listen(listenPort, host, callback) {
     shutDown = false;
+    accepting = true;
     if (typeof host === 'function') { callback = host; host = null; }
     // `|| 443` turned port 0 into 443 — and port 0 is not "no port": it is how
     // a caller asks the OS for a free one (server.js has the same fix).
@@ -939,6 +946,7 @@ function createQuicServer(options) {
       ev.emit('error', err);
     });
     var host4 = host.indexOf('.') !== -1 ? host : '0.0.0.0';
+    if (!refed) udp4.unref();
     udp4.bind(port, host4, function () { growBuffers(udp4); settle(null); });
 
     udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
@@ -951,6 +959,7 @@ function createQuicServer(options) {
       settle(err);
     });
     var host6 = host.indexOf(':') !== -1 ? host : '::';
+    if (!refed) udp6.unref();
     udp6.bind(port, host6, function () { growBuffers(udp6); settle(null); });
 
     startSweepTimer();
@@ -1075,6 +1084,11 @@ function createQuicServer(options) {
   return {
     listen: listen,
     close: close,
+    stopAccepting: function () { accepting = false; },
+    get connectionCount() { return connectionCount; },
+    // node:dgram's: whether the process may exit while this listens.
+    ref: function () { refed = true; if (udp4) udp4.ref(); if (udp6) udp6.ref(); },
+    unref: function () { refed = false; if (udp4) udp4.unref(); if (udp6) udp6.unref(); },
     on: function (name, fn) { ev.on(name, fn); },
 
     /** Feed an incoming UDP packet when running in external-socket mode.

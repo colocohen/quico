@@ -21,6 +21,7 @@ import { createServer as createH3Server } from './h3_server.js';
 import { createServer as createH2Server } from './h2_server.js';
 import { createServer as createH1Server } from './h1_server.js';
 import { createTcpListener } from './tcp_listener.js';
+import { createSecureContext } from './tls_bridge.js';
 import { IncomingMessage, ServerResponse, _makeSocketStub, adoptApp } from './streams.js';
 import { creditAsRead } from './utils.js';
 import { runEarlyDataFilter } from './http_common.js';
@@ -159,6 +160,9 @@ function createServer(options, handler) {
 
   var ev = new EventEmitter();
   var port = null;
+  var listening = false;    // node:net's server.listening
+  var closed = false;       // close() called (a second one is an error)
+  var ref = true;           // ref() / unref()
 
   // ---- TLS credentials ----
   var tlsKey = options.key || null;
@@ -197,6 +201,58 @@ function createServer(options, handler) {
   if (typeof tlsCert === 'string' && tlsCert.indexOf('-----') === -1) {
     tlsCert = fs.readFileSync(tlsCert);
   }
+
+  // ---- The certificate, chosen per connection — TCP and QUIC alike ----
+  //
+  // One resolver for both stacks, so that what node:tls's server offers to
+  // change while running applies to every version at once:
+  //   setSecureContext(options)   the default certificate
+  //   addContext(hostname, ctx)   a certificate for a name (SNI; *.x too)
+  // From the next handshake on; connections open keep what they have, as
+  // in Node. The application's SNICallback, if it gave one, decides first
+  // (Node ignores addContext then, as here); when it answers with nothing,
+  // the default is used.
+  var defaultContext = null;
+  var sniContexts = [];          // [regex, context], the latest added first matched
+  var userSni = typeof options.SNICallback === 'function' ? options.SNICallback : null;
+  function toContext(o, what) {
+    if (o && typeof o === 'object' && o.certificateChain && o.privateKey) return o;   // made already (quico.createSecureContext)
+    if (!o || typeof o !== 'object') throw new TypeError(what + ' takes { key, cert[, ca, passphrase] } or a context from quico.createSecureContext()');
+    var ctx = createSecureContext(Object.assign({ passphrase: options.passphrase }, o));
+    checkKeyMatches(ctx);
+    // Its chain compressed now, not in a client's handshake (RFC 8879).
+    if (typeof lemonTls.precompressCertificate === 'function' && !(Array.isArray(options.certificateCompression) && options.certificateCompression.length === 0)) {
+      try { lemonTls.precompressCertificate(ctx, options.certificateCompression || undefined); } catch (e) {}
+    }
+    return ctx;
+  }
+  // A certificate whose key is another's is refused here — before it
+  // replaces anything — not found out by every client's handshake failing.
+  function checkKeyMatches(ctx) {
+    if (!ctx.keyObj || !ctx.certObjs || !ctx.certObjs[0]) return;
+    var a = crypto.createPublicKey(ctx.keyObj).export({ type: 'spki', format: 'der' });
+    var b = ctx.certObjs[0].publicKey.export({ type: 'spki', format: 'der' });
+    if (Buffer.compare(Buffer.from(a), Buffer.from(b)) !== 0) {
+      var e = new Error('the private key does not match the certificate');
+      e.code = 'ERR_OSSL_X509_KEY_VALUES_MISMATCH';
+      throw e;
+    }
+  }
+  function contextFor(servername) {
+    var name = String(servername || '');
+    for (var i = sniContexts.length - 1; i >= 0; i--) if (sniContexts[i][0].test(name)) return sniContexts[i][1];
+    return defaultContext;
+  }
+  function serverSni(servername, cb, info) {
+    if (userSni) {
+      return userSni(servername, function (err, ctx) {
+        if (err) cb(err);
+        else cb(null, ctx || defaultContext);
+      }, info);
+    }
+    cb(null, contextFor(servername));
+  }
+  if (tlsKey && tlsCert) defaultContext = toContext({ key: tlsKey, cert: tlsCert, ca: tlsCa }, 'createServer');
 
 
   // ============================================================
@@ -309,7 +365,7 @@ function createServer(options, handler) {
     key: tlsKey,
     cert: tlsCert,
     ca: tlsCa,
-    SNICallback: options.SNICallback || null,
+    SNICallback: (tlsKey && tlsCert) || userSni ? serverSni : null,
     ticketKeys: ticketKeys,
     ticketData: ticketData,
     ech: ech,
@@ -542,6 +598,10 @@ function createServer(options, handler) {
       callback();
     };
 
+    // 102 Processing — the HTTP/3 one.
+    if (plainRes.writeProcessing) {
+      res.writeProcessing = function () { if (!res.headersSent) plainRes.writeProcessing(); };
+    }
     // 103 Early Hints — the HTTP/3 one, written on the same stream.
     if (plainRes.writeEarlyHints) {
       res.writeEarlyHints = function (hints, callback) {
@@ -754,7 +814,7 @@ function createServer(options, handler) {
       key: tlsKey,
       cert: tlsCert,
       ca: tlsCa,
-      SNICallback: options.SNICallback,
+      SNICallback: (tlsKey && tlsCert) || userSni ? serverSni : null,
       ticketKeys: ticketKeys,
       ticketData: ticketData,
       ech: ech,
@@ -806,8 +866,10 @@ function createServer(options, handler) {
     // are only meaningful with TLS: without it there is no ALPN to carry them.
     for (var a = 0; a < tcpAlpn.length; a++) {
       var proto = tcpAlpn[a];
-      if (proto === 'h2') tcpServer.register('h2', h2srv.handleConnection);
-      else if (proto === 'http/1.1') tcpServer.register('http/1.1', h1srv.handleConnection);
+      // managesClose: each closes its own connections (beginClose) — the
+      // ones in flight finish first.
+      if (proto === 'h2') tcpServer.register('h2', h2srv.handleConnection, { managesClose: true });
+      else if (proto === 'http/1.1') tcpServer.register('http/1.1', h1srv.handleConnection, { managesClose: true });
       else if (hasTlsCredentials) tcpServer.register(proto, closeAfterHandshake);
     }
 
@@ -880,6 +942,8 @@ function createServer(options, handler) {
       remaining--;
       if (remaining <= 0 && !called) {
         called = true;
+        listening = true;
+        closed = false;
         // After listen(0) the OS chose the port; Alt-Svc must name that one.
         if (port === 0 && tcpServer && tcpServer.address()) altSvcPort = tcpServer.address().port;
         ev.emit('listening');
@@ -891,27 +955,98 @@ function createServer(options, handler) {
     // asynchronously, like a real bind would.
     if (remaining === 0) { remaining = 1; setImmediate(done); return server; }
 
+    if (ref === false) { if (enableH3) h3srv.unref(); if (tcpServer) tcpServer.unref(); }
     if (bindUdp) h3srv.listen(port, host, done);
     if (needsTcp) tcpServer.listen(port, host || '0.0.0.0', done);
 
     return server;
   }
 
+  /**
+   * As node:http's close(): no new connections; the idle ones closed now;
+   * each with a request in flight closes once it is answered — HTTP/2 and
+   * HTTP/3 with GOAWAY (RFC 9113 §6.8, RFC 9114 §5.2), HTTP/1.1 at the end
+   * of its response. The callback, and 'close', when every connection is
+   * gone. It used to close every connection at once, on all three versions:
+   * a response being written was cut off (HTTP/1.1: ECONNRESET; HTTP/3: the
+   * client waited for the rest until a timeout). A second close(): the
+   * callback gets ERR_SERVER_NOT_RUNNING, as node:http's.
+   */
   function close(callback) {
+    if (closed) {
+      if (typeof callback === 'function') {
+        var e = new Error('Server is not running.'); e.code = 'ERR_SERVER_NOT_RUNNING';
+        process.nextTick(callback, e);
+      }
+      return server;
+    }
+    closed = true;
+    listening = false;
     // h3srv is closed whenever HTTP/3 is on, bound or not: in external mode it
     // still runs a sweep timer, started at creation.
     var remaining = (enableH3 ? 1 : 0) + (tcpServer ? 1 : 0);
 
     function onClose() {
       remaining--;
-      if (remaining <= 0 && typeof callback === 'function') callback();
+      if (remaining > 0) return;
+      ev.emit('close');
+      if (typeof callback === 'function') callback();
     }
 
-    if (remaining === 0) { if (typeof callback === 'function') callback(); return; }
+    if (remaining === 0) { remaining = 1; process.nextTick(onClose); return server; }
     if (enableH3) h3srv.close(onClose);
-    // tcp_listener.close() ends idle connections, including ones handed in
-    // through handleConnection, and closes its port only if it bound one.
-    if (tcpServer) { tcpServer.close(onClose); tcpServer = null; }
+    if (tcpServer) {
+      if (h1srv) h1srv.beginClose();
+      if (h2srv) h2srv.beginClose();
+      // The port, and what tcp_listener holds that HTTP did not claim.
+      // Its callback waits for every socket, as node:net's.
+      tcpServer.close(onClose);
+      tcpServer = null;
+    }
+    return server;
+  }
+
+  // node:http's: the connections with nothing in flight closed now (Node
+  // does this from close() too); all of them, in flight or not. A socket
+  // handed to 'upgrade' over HTTP/1.1 is not this server's any more and
+  // stays; HTTP/2 and HTTP/3 carry WebSockets and WebTransport on the
+  // connection itself, and close with it.
+  function closeIdleConnections() {
+    if (h1srv) h1srv.closeIdleConnections();
+    if (h2srv) h2srv.closeIdleConnections();
+    if (enableH3) h3srv.closeIdleConnections();
+  }
+  function closeAllConnections() {
+    if (h1srv) h1srv.closeAllConnections();
+    if (h2srv) h2srv.closeAllConnections();
+    if (enableH3) h3srv.closeAllConnections();
+  }
+
+  // node:net's getConnections(cb): TCP connections and QUIC ones.
+  function getConnections(cb) {
+    var n = (h1srv ? h1srv.connectionCount : 0) + (h2srv ? h2srv.connectionCount : 0) + (enableH3 ? h3srv.connectionCount : 0);
+    if (typeof cb === 'function') process.nextTick(cb, null, n);
+    return server;
+  }
+
+  // node:http's timeouts and limits, readable and settable while the server
+  // runs, as server.keepAliveTimeout = 5000. Each version takes what it has:
+  // keepAliveTimeout and maxHeadersCount are HTTP/1.1's; the rest all three.
+  var limits = {
+    headersTimeout: options.headersTimeout != null ? options.headersTimeout : 60000,
+    requestTimeout: options.requestTimeout != null ? options.requestTimeout : 300000,
+    keepAliveTimeout: options.keepAliveTimeout != null ? options.keepAliveTimeout : 5000,
+    maxHeadersCount: options.maxHeaderCount != null ? options.maxHeaderCount : 2000,
+    maxRequestsPerSocket: options.maxRequestsPerSocket != null ? options.maxRequestsPerSocket : 0
+  };
+  function setLimit(name, value) {
+    if (typeof value !== 'number' || !(value >= 0)) throw new RangeError('server.' + name + ' must be a non-negative number, got ' + value);
+    limits[name] = value;
+    var o = {};
+    o[name === 'maxHeadersCount' ? 'maxHeaderCount' : name] = value;
+    if (h1srv) h1srv.setLimits(o);
+    if (h2srv) h2srv.setLimits(o);
+    if (enableH3) h3srv.setLimits(o);
   }
 
   function address() {
@@ -948,11 +1083,28 @@ function createServer(options, handler) {
     });
   }
 
-  var server = {
+  var api = {
     listen: listen,
     close: close,
     address: address,
     handleConnection: handleConnection,
+    closeIdleConnections: closeIdleConnections,
+    closeAllConnections: closeAllConnections,
+    getConnections: getConnections,
+    get listening() { return listening; },
+    get headersTimeout() { return limits.headersTimeout; },
+    set headersTimeout(v) { setLimit('headersTimeout', v); },
+    get requestTimeout() { return limits.requestTimeout; },
+    set requestTimeout(v) { setLimit('requestTimeout', v); },
+    get keepAliveTimeout() { return limits.keepAliveTimeout; },
+    set keepAliveTimeout(v) { setLimit('keepAliveTimeout', v); },
+    get maxHeadersCount() { return limits.maxHeadersCount; },
+    set maxHeadersCount(v) { setLimit('maxHeadersCount', v); },
+    get maxRequestsPerSocket() { return limits.maxRequestsPerSocket; },
+    set maxRequestsPerSocket(v) { setLimit('maxRequestsPerSocket', v); },
+    // node:net's: unref() lets the process exit while the server listens.
+    ref: function () { ref = true; if (enableH3) h3srv.ref(); if (tcpServer) tcpServer.ref(); return server; },
+    unref: function () { ref = false; if (enableH3) h3srv.unref(); if (tcpServer) tcpServer.unref(); return server; },
 
     /**
      * The session ticket keys: 48 bytes, the key every ticket is sealed with
@@ -965,6 +1117,32 @@ function createServer(options, handler) {
      * open — each of those clients does one full handshake and gets a new
      * ticket, as after a restart with random keys.
      */
+    /**
+     * node:tls's server.setSecureContext(options): the certificate from the
+     * next handshake on — HTTP/1.1, HTTP/2 and HTTP/3 alike; connections open
+     * keep theirs. { key, cert[, ca, passphrase] } (files' contents or paths,
+     * as createServer takes them), or a quico.createSecureContext(). A bad
+     * one throws here, and the one in use stays. The way to renew a
+     * certificate (Let's Encrypt) without a restart.
+     */
+    setSecureContext: function (o) {
+      if (!hasTlsCredentials) throw new Error('setSecureContext: this server has no TLS (it was made without key/cert or SNICallback)');
+      var ctx = toContext(o, 'setSecureContext');
+      defaultContext = ctx;
+    },
+    /**
+     * node:tls's server.addContext(hostname, context): this certificate for
+     * that name (the client's SNI) — '*.example.com' covering one label —
+     * on every version, from the next handshake on. The latest added wins
+     * where two match. Not consulted when createServer had an SNICallback
+     * (as in Node).
+     */
+    addContext: function (hostname, ctx) {
+      if (typeof hostname !== 'string' || hostname === '') throw new TypeError('addContext: hostname must be a non-empty string');
+      if (!hasTlsCredentials) throw new Error('addContext: this server has no TLS (it was made without key/cert or SNICallback)');
+      var re = new RegExp('^' + hostname.replace(/([.^$+?\-\\[\]{}()|])/g, '\\$1').replace(/\*/g, '[^.]*') + '$', 'i');
+      sniContexts.push([re, toContext(ctx, 'addContext')]);
+    },
     getTicketKeys: function () { return ticketKeys; },
     setTicketKeys: function (keys) {
       if (!Buffer.isBuffer(keys) || keys.length !== 48) {
@@ -1089,12 +1267,6 @@ function createServer(options, handler) {
      */
     getStats: function () { return stats.snapshot(); },
 
-    // server.on('request', app) — the other way an app is attached.
-    on: function (name, fn) { if (name === 'request') adoptApp(fn); ev.on(name, fn); return server; },
-    once: function (name, fn) { if (name === 'request') adoptApp(fn); ev.once(name, fn); return server; },
-    off: function (name, fn) { ev.off(name, fn); return server; },
-    removeListener: function (name, fn) { ev.removeListener(name, fn); return server; },
-    emit: function () { ev.emit.apply(ev, arguments); return server; },
     setTimeout: function (msecs, callback) {
       if (typeof msecs === 'function') { callback = msecs; msecs = undefined; }
       if (msecs !== undefined) serverTimeout = Math.max(0, Number(msecs) || 0);
@@ -1120,6 +1292,32 @@ function createServer(options, handler) {
       return h3srv.hasConnection(rinfo, msg);
     }
   };
+
+  // The server IS an EventEmitter, as node:http's is (a net.Server): every
+  // method of one, and instanceof. It was a plain object passing five of
+  // them on to an emitter inside — socket.io, which takes the 'request'
+  // listeners off (listeners(), removeAllListeners()) to put its own first,
+  // failed at once.
+  var server = ev;
+  Object.defineProperties(server, Object.getOwnPropertyDescriptors(api));
+  // server.on('request', app) — the other way an app is attached: an Express
+  // app is adopted (adoptApp, streams.js), whichever method adds it.
+  ['on', 'addListener', 'once', 'prependListener', 'prependOnceListener'].forEach(function (m) {
+    var base = EventEmitter.prototype[m];
+    Object.defineProperty(server, m, {
+      configurable: true, writable: true,
+      value: function (name, fn) { if (name === 'request') adoptApp(fn); return base.call(this, name, fn); }
+    });
+  });
+  // node:net's: `await using server = createServer(...)` closes it.
+  if (typeof Symbol.asyncDispose === 'symbol') {
+    server[Symbol.asyncDispose] = function () {
+      return new Promise(function (resolve, reject) {
+        if (closed) { resolve(); return; }
+        close(function (err) { if (err) reject(err); else resolve(); });
+      });
+    };
+  }
 
   return server;
 }

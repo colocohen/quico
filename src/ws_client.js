@@ -17,8 +17,9 @@ import lemonTls from 'lemon-tls';
 import { globalAgent } from './agent.js';
 import {
   WSParser, encodeFrame, generateKey, acceptKey,
-  isValidUserCloseCode, OPCODE, CLOSE,
-  installEventSurfaces, emitBoth, nodeMessagePayload
+  OPCODE, CLOSE,
+  installEventSurfaces, emitBoth, nodeMessagePayload,
+  userCloseCode, closeReasonBytes, subprotocolList, sendInOrder, queueCloseFrame, isBadPort
 } from './ws.js';
 
 
@@ -78,6 +79,13 @@ class WebSocket extends EventTarget {
 
   constructor(url, protocols, options) {
     super();
+    if (arguments.length === 0) throw new TypeError('Failed to construct \'WebSocket\': 1 argument required, but only 0 present.');
+    // The second argument may be an options bag, { protocols } (WPT
+    // websockets/constructor/option-bag; WebSocketStream takes the same).
+    // The third is QUICO's: what a browser cannot express (headers, ca).
+    if (protocols !== null && typeof protocols === 'object' && typeof protocols[Symbol.iterator] !== 'function') {
+      protocols = protocols.protocols;
+    }
 
     // ---- URL parsing, per the spec's constructor steps ----
     var parsed;
@@ -97,36 +105,21 @@ class WebSocket extends EventTarget {
         'The URL\'s scheme must be either \'ws\' or \'wss\'. \'' +
         parsed.protocol.replace(':', '') + '\' is not allowed.', 'SyntaxError');
     }
-    if (parsed.hash) {
+    // A fragment, even an empty one ("…/#"), is a SyntaxError: parsed.hash
+    // is "" for both "no fragment" and "#", so it is read from the URL itself.
+    if (parsed.href.indexOf('#') >= 0) {
       throw new DOMException('The URL contains a fragment identifier (\'' +
         parsed.hash + '\'). Fragment identifiers are not allowed in WebSocket URLs.',
         'SyntaxError');
     }
 
-    // ---- Subprotocols ----
-    if (protocols === undefined) protocols = [];
-    else if (typeof protocols === 'string') protocols = [protocols];
-    else protocols = Array.from(protocols);
-
-    var seen = Object.create(null);
-    for (var i = 0; i < protocols.length; i++) {
-      var p = String(protocols[i]);
-      // Must be a valid HTTP token and must not repeat, or the
-      // Sec-WebSocket-Protocol header would be ambiguous.
-      if (p.length === 0 || /[^\x21\x23-\x27\x2a\x2b\x2d\x2e0-9\x41-\x5a\x5e-\x7a\x7c\x7e]/.test(p)) {
-        throw new DOMException('The subprotocol \'' + p + '\' is invalid.', 'SyntaxError');
-      }
-      if (seen[p]) {
-        throw new DOMException('The subprotocol \'' + p + '\' is duplicated.', 'SyntaxError');
-      }
-      seen[p] = true;
-      protocols[i] = p;
-    }
+    protocols = subprotocolList(protocols);
 
     options = options || {};
 
     // ---- Public state (spec attributes) ----
     this._url = parsed.href;
+    this._origin = parsed.origin;    // a message event's origin (the URL's, not the URL)
     this._readyState = CONNECTING;
     this._bufferedAmount = 0;
     this._binaryType = 'blob';       // the browser's default
@@ -233,48 +226,22 @@ class WebSocket extends EventTarget {
       // 'open' is a programming error, not a race the runtime can absorb.
       throw new DOMException('Still in CONNECTING state.', 'InvalidStateError');
     }
-    if (this._readyState !== OPEN) {
-      // After close() the spec says to discard silently — a message that
-      // arrives during teardown is not the caller's fault.
-      return;
-    }
-
-    var self = this;
     var forced = options && typeof options.binary === 'boolean' ? options.binary : null;
+    var opcode, payload;
+    if (typeof data === 'string') { opcode = forced === true ? OPCODE.BINARY : OPCODE.TEXT; payload = Buffer.from(data, 'utf8'); }
+    else if (data instanceof Blob) { opcode = forced === false ? OPCODE.TEXT : OPCODE.BINARY; payload = data; }
+    else if (ArrayBuffer.isView(data)) { opcode = forced === false ? OPCODE.TEXT : OPCODE.BINARY; payload = Buffer.from(data.buffer, data.byteOffset, data.byteLength); }
+    else if (data instanceof ArrayBuffer) { opcode = forced === false ? OPCODE.TEXT : OPCODE.BINARY; payload = Buffer.from(data); }
+    else { opcode = OPCODE.TEXT; payload = Buffer.from(String(data), 'utf8'); }   // stringified, as the browser does
 
-    if (typeof data === 'string') {
-      this._sendFrame(forced === true ? OPCODE.BINARY : OPCODE.TEXT,
-                      Buffer.from(data, 'utf8'));
+    if (this._readyState !== OPEN) {
+      // After close() the message is dropped, but bufferedAmount grows by it
+      // all the same — the spec's way of telling a sender that nothing goes.
+      this._bufferedAmount += payload instanceof Blob ? payload.size : payload.length;
       return;
     }
-    if (data instanceof Blob) {
-      // Asynchronous, but bufferedAmount must reflect the bytes immediately —
-      // the spec increments it at send() time, and code that polls it to
-      // throttle would otherwise never see the backlog.
-      this._bufferedAmount += data.size;
-      var pending = data.size;
-      data.arrayBuffer().then(function (ab) {
-        self._bufferedAmount -= pending;
-        if (self._readyState === OPEN) {
-          self._sendFrame(forced === false ? OPCODE.TEXT : OPCODE.BINARY, Buffer.from(ab));
-        }
-      }, function () {
-        self._bufferedAmount -= pending;
-      });
-      return;
-    }
-    if (ArrayBuffer.isView(data)) {
-      this._sendFrame(forced === false ? OPCODE.TEXT : OPCODE.BINARY,
-                      Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-      return;
-    }
-    if (data instanceof ArrayBuffer) {
-      this._sendFrame(forced === false ? OPCODE.TEXT : OPCODE.BINARY, Buffer.from(data));
-      return;
-    }
-
-    // Anything else is stringified, as the browser does.
-    this._sendFrame(OPCODE.TEXT, Buffer.from(String(data), 'utf8'));
+    // In the order sent, a Blob included (ws.js sendInOrder).
+    sendInOrder(this, opcode, payload);
   }
 
   /** Not in the browser: keepalive for a long-lived server-side connection. */
@@ -284,21 +251,25 @@ class WebSocket extends EventTarget {
                   : Buffer.isBuffer(data) ? data : Buffer.from(data));
   }
 
-  _sendFrame(opcode, payload) {
-    if (!this._socket || this._socket.destroyed) return;
+  // cb(err): once the frame is handed to the socket (WebSocketStream's
+  // write() resolves there: its backpressure), or err if it cannot be.
+  _sendFrame(opcode, payload, cb) {
+    if (!this._socket || this._socket.destroyed) { if (cb) cb(new Error('the WebSocket is closed')); return; }
     var frame;
     try {
       // mask: true — every client-to-server frame is masked (RFC 6455 §5.1).
       frame = encodeFrame(opcode, payload, { mask: true });
     } catch (e) {
+      if (cb) cb(e);
       this._fail(e);
       return;
     }
 
     var self = this;
     if (opcode < 0x8) this._bufferedAmount += payload.length;
-    this._socket.write(frame, function () {
+    this._socket.write(frame, function (err) {
       if (opcode < 0x8) self._bufferedAmount -= payload.length;
+      if (cb) cb(err || null);
     });
   }
 
@@ -308,32 +279,25 @@ class WebSocket extends EventTarget {
   // ============================================================
 
   close(code, reason) {
-    if (code !== undefined && code !== null) {
-      code = Number(code);
-      if (!isValidUserCloseCode(code)) {
-        throw new DOMException('The close code must be 1000 or between 3000 and 4999.',
-                               'InvalidAccessError');
-      }
-    }
-
-    var reasonBuf = Buffer.alloc(0);
-    if (reason !== undefined && reason !== null) {
-      reasonBuf = Buffer.from(String(reason), 'utf8');
-      // 125-byte control payload minus the 2-byte code.
-      if (reasonBuf.length > 123) {
-        throw new DOMException('The close reason must not be greater than 123 UTF-8 bytes.',
-                               'SyntaxError');
-      }
-    }
+    // As WebIDL takes them: a code given (null too) is clamped and checked,
+    // a reason is at most 123 bytes of UTF-8 (ws.js).
+    if (code !== undefined) code = userCloseCode(code);
+    var reasonBuf = reason !== undefined ? closeReasonBytes(reason) : Buffer.alloc(0);
 
     if (this._readyState === CLOSING || this._readyState === CLOSED) return;
 
     if (this._readyState === CONNECTING) {
-      // Nothing was ever established, so there is no handshake to complete.
+      // The spec: "fail the WebSocket connection". Nothing was established,
+      // so there is no closing handshake: the attempt is abandoned, and —
+      // in a task of its own, after close() has returned — 'error', then
+      // 'close' with 1006, not clean. They used to fire inside close(), so a
+      // listener added on the next line missed them, and 'error' never came.
       this._readyState = CLOSING;
-      this._closeCode = code || CLOSE.ABNORMAL;
-      this._closeReason = reason ? String(reason) : '';
-      this._teardown(false);
+      this._closeCode = CLOSE.ABNORMAL;
+      this._closeReason = '';
+      if (this._req) { try { this._req.destroy(); } catch (e) {} }
+      var failing = this;
+      setImmediate(function () { failing._fail(new Error('WebSocket closed before the connection was established')); });
       return;
     }
 
@@ -349,7 +313,9 @@ class WebSocket extends EventTarget {
     if (this._closeTimer.unref) this._closeTimer.unref();
   }
 
-  _sendCloseFrame(code, reasonBuf) {
+  // `now`: answering the peer's close (what is still queued is dropped).
+  // Otherwise behind the messages sent before close() — see ws_server.js.
+  _sendCloseFrame(code, reasonBuf, now) {
     if (this._closeSent) return;
     this._closeSent = true;
 
@@ -361,6 +327,7 @@ class WebSocket extends EventTarget {
       payload.writeUInt16BE(code, 0);
       if (reasonBuf && reasonBuf.length) reasonBuf.copy(payload, 2);
     }
+    if (queueCloseFrame(this, payload, now)) return;
 
     if (this._socket && !this._socket.destroyed) {
       try { this._socket.write(encodeFrame(OPCODE.CLOSE, payload, { mask: true })); } catch (e) {}
@@ -378,6 +345,9 @@ class WebSocket extends EventTarget {
     var self = this;
     var secure = parsed.protocol === 'wss:';
     var port = parsed.port ? parseInt(parsed.port, 10) : (secure ? 443 : 80);
+    // A port the browser will not connect to (ws.js isBadPort): the
+    // connection fails — 'error', then 'close' — without being attempted.
+    if (isBadPort(port)) { this._fail(new Error('WebSocket connection to port ' + port + ' is not allowed (a blocked port)')); return; }
     var key = generateKey();
 
     var headers = {
@@ -392,8 +362,18 @@ class WebSocket extends EventTarget {
     // The browser sends Origin automatically; here it is the caller's choice,
     // because a server-side client has no origin to speak of.
     if (this._options.origin) headers['Origin'] = this._options.origin;
+    // A user name and password in the URL (wss://user:pass@host/) go as
+    // HTTP Basic authentication, as the browser sends them; they were
+    // dropped. An Authorization the caller set wins.
+    if (parsed.username || parsed.password) {
+      headers['Authorization'] = 'Basic ' + Buffer.from(decodeURIComponent(parsed.username) + ':' +
+                                                       decodeURIComponent(parsed.password), 'utf8').toString('base64');
+    }
     if (this._options.headers) {
-      for (var h in this._options.headers) headers[h] = this._options.headers[h];
+      for (var h in this._options.headers) {
+        if (h.toLowerCase() === 'authorization') delete headers['Authorization'];
+        headers[h] = this._options.headers[h];
+      }
     }
 
     // TLS session resumption, as quico.request has it: a session from the
@@ -518,7 +498,7 @@ class WebSocket extends EventTarget {
       emitBoth(self, 'message',
         new MessageEvent('message', {
           data: isBinary ? self._toBinary(data) : data,
-          origin: self._url
+          origin: self._origin
         }),
         // Raw payload for the ws surface: `ws` has no binaryType and always
         // hands its listeners a Buffer.
@@ -550,7 +530,7 @@ class WebSocket extends EventTarget {
         // the peer reports what comes back in its own close event.
         self._readyState = CLOSING;
         self._sendCloseFrame(code === CLOSE.NO_STATUS ? undefined : code,
-                             Buffer.from(reason || '', 'utf8'));
+                             Buffer.from(reason || '', 'utf8'), true);
       }
       self._teardown(true);
     });

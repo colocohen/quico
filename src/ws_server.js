@@ -13,8 +13,9 @@ import { Blob } from 'node:buffer';
 
 import {
   WSParser, encodeFrame, acceptKey,
-  isValidUserCloseCode, OPCODE, CLOSE,
-  installEventSurfaces, emitBoth, nodeMessagePayload
+  OPCODE, CLOSE,
+  installEventSurfaces, emitBoth, nodeMessagePayload,
+  userCloseCode, closeReasonBytes, sendInOrder, queueCloseFrame
 } from './ws.js';
 import { isToken, STATUS_TEXT } from './http_common.js';
 
@@ -79,6 +80,7 @@ class ServerWebSocket extends EventTarget {
     this._protocol = options.protocol || '';
     this._extensions = '';
     this._url = options.url || '';
+    try { this._origin = new URL(this._url).origin; } catch (e) { this._origin = ''; }
 
     this._closeSent = false;
     this._closeReceived = false;
@@ -105,7 +107,8 @@ class ServerWebSocket extends EventTarget {
       emitBoth(self, 'message',
         new MessageEvent('message', {
           data: isBinary ? self._toBinary(data) : data,
-          origin: self._url
+          // The URL's origin, as the client's (not the whole URL).
+          origin: self._origin
         }),
         // The ws surface gets the raw payload, NOT self._toBinary(data): `ws`
         // has no binaryType and its handlers always receive a Buffer.
@@ -141,7 +144,7 @@ class ServerWebSocket extends EventTarget {
         // with an empty reason silently erases the reason the peer just gave).
         self._readyState = CLOSING;
         self._sendCloseFrame(code === CLOSE.NO_STATUS ? undefined : code,
-                             Buffer.from(reason || '', 'utf8'));
+                             Buffer.from(reason || '', 'utf8'), true);
       }
       self._teardown(true);
     });
@@ -237,37 +240,20 @@ class ServerWebSocket extends EventTarget {
     if (this._readyState === CONNECTING) {
       throw new DOMException('Still in CONNECTING state.', 'InvalidStateError');
     }
-    if (this._readyState !== OPEN) return;
-
-    var self = this;
     var forced = options && typeof options.binary === 'boolean' ? options.binary : null;
-
-    if (typeof data === 'string') {
-      this._sendFrame(forced === true ? OPCODE.BINARY : OPCODE.TEXT,
-                      Buffer.from(data, 'utf8'));
+    var opcode, payload;
+    if (typeof data === 'string') { opcode = forced === true ? OPCODE.BINARY : OPCODE.TEXT; payload = Buffer.from(data, 'utf8'); }
+    else if (data instanceof Blob) { opcode = forced === false ? OPCODE.TEXT : OPCODE.BINARY; payload = data; }
+    else if (ArrayBuffer.isView(data)) { opcode = forced === false ? OPCODE.TEXT : OPCODE.BINARY; payload = Buffer.from(data.buffer, data.byteOffset, data.byteLength); }
+    else if (data instanceof ArrayBuffer) { opcode = forced === false ? OPCODE.TEXT : OPCODE.BINARY; payload = Buffer.from(data); }
+    else { opcode = OPCODE.TEXT; payload = Buffer.from(String(data), 'utf8'); }
+    if (this._readyState !== OPEN) {
+      this._bufferedAmount += payload instanceof Blob ? payload.size : payload.length;   // as the client's
       return;
     }
-    if (data instanceof Blob) {
-      this._bufferedAmount += data.size;
-      var pending = data.size;
-      data.arrayBuffer().then(function (ab) {
-        self._bufferedAmount -= pending;
-        if (self._readyState === OPEN) {
-          self._sendFrame(forced === false ? OPCODE.TEXT : OPCODE.BINARY, Buffer.from(ab));
-        }
-      }, function () { self._bufferedAmount -= pending; });
-      return;
-    }
-    if (ArrayBuffer.isView(data)) {
-      this._sendFrame(forced === false ? OPCODE.TEXT : OPCODE.BINARY,
-                      Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-      return;
-    }
-    if (data instanceof ArrayBuffer) {
-      this._sendFrame(forced === false ? OPCODE.TEXT : OPCODE.BINARY, Buffer.from(data));
-      return;
-    }
-    this._sendFrame(OPCODE.TEXT, Buffer.from(String(data), 'utf8'));
+    // In the order sent, a Blob included (ws.js sendInOrder): a Blob was
+    // sent whenever it had been read, after messages sent later.
+    sendInOrder(this, opcode, payload);
   }
 
   /**
@@ -286,43 +272,33 @@ class ServerWebSocket extends EventTarget {
                   : Buffer.isBuffer(data) ? data : Buffer.from(data));
   }
 
-  _sendFrame(opcode, payload) {
-    if (!this._socket || this._socket.destroyed) return;
+  _sendFrame(opcode, payload, cb) {
+    if (!this._socket || this._socket.destroyed) { if (cb) cb(new Error('the WebSocket is closed')); return; }
     var frame;
     // mask: false — a SERVER must never mask (RFC 6455 §5.1). This is the one
     // line that differs from the client, and a client will close the
     // connection with 1002 if it is wrong.
     try { frame = encodeFrame(opcode, payload, { mask: false }); }
-    catch (e) { this._fail(e); return; }
+    catch (e) { if (cb) cb(e); this._fail(e); return; }
 
     var self = this;
     if (opcode < 0x8) this._bufferedAmount += payload.length;
-    this._socket.write(frame, function () {
+    this._socket.write(frame, function (err) {
       if (opcode < 0x8) self._bufferedAmount -= payload.length;
+      if (cb) cb(err || null);
     });
   }
 
   close(code, reason) {
-    if (code !== undefined && code !== null) {
-      code = Number(code);
-      if (!isValidUserCloseCode(code)) {
-        throw new DOMException('The close code must be 1000 or between 3000 and 4999.',
-                               'InvalidAccessError');
-      }
-    }
-    var reasonBuf = Buffer.alloc(0);
-    if (reason !== undefined && reason !== null) {
-      reasonBuf = Buffer.from(String(reason), 'utf8');
-      if (reasonBuf.length > 123) {
-        throw new DOMException('The close reason must not be greater than 123 UTF-8 bytes.',
-                               'SyntaxError');
-      }
-    }
+    // As the client's (ws.js): a code given, null too, is clamped and checked.
+    if (code !== undefined) code = userCloseCode(code);
+    var reasonBuf = reason !== undefined ? closeReasonBytes(reason) : Buffer.alloc(0);
     if (this._readyState === CLOSING || this._readyState === CLOSED) return;
 
     this._readyState = CLOSING;
     this._closeCode = code === undefined ? CLOSE.NORMAL : code;
-    this._closeReason = reason ? String(reason) : '';
+    // As it goes on the wire: a lone surrogate is U+FFFD there (USVString).
+    this._closeReason = reasonBuf.toString('utf8');
     this._sendCloseFrame(code === undefined ? undefined : code, reasonBuf);
 
     var self = this;
@@ -330,7 +306,12 @@ class ServerWebSocket extends EventTarget {
     if (this._closeTimer.unref) this._closeTimer.unref();
   }
 
-  _sendCloseFrame(code, reasonBuf) {
+  // `now`: answering the peer's close — what is still queued (a Blob being
+  // read) is dropped, the connection is over. Otherwise the close frame goes
+  // after the messages sent before close(), never ahead of them: a Blob still
+  // being read went out after the close frame, which a peer takes as a
+  // protocol error.
+  _sendCloseFrame(code, reasonBuf, now) {
     if (this._closeSent) return;
     this._closeSent = true;
     var payload;
@@ -340,6 +321,7 @@ class ServerWebSocket extends EventTarget {
       payload.writeUInt16BE(code, 0);
       if (reasonBuf && reasonBuf.length) reasonBuf.copy(payload, 2);
     }
+    if (queueCloseFrame(this, payload, now)) return;
     if (this._socket && !this._socket.destroyed) {
       try { this._socket.write(encodeFrame(OPCODE.CLOSE, payload, { mask: false })); } catch (e) {}
     }

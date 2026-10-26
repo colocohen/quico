@@ -606,7 +606,127 @@ function nodeMessagePayload(data, isBinary) {
 }
 
 
+// ============================================================
+//  What the browser's WebSocket and WebSocketStream share
+// ============================================================
+
+// close(code)'s code, as WebIDL's [Clamp] unsigned short takes it — a number
+// (NaN, a string, null: 0), clamped to 0..65535, rounded half to even — then
+// 1000 or 3000..4999, or an InvalidAccessError. null was passed over as if
+// no code had been given; the browser throws.
+function userCloseCode(code) {
+  var n = Number(code);
+  if (isNaN(n)) n = 0;
+  n = Math.min(Math.max(n, 0), 65535);
+  var f = Math.floor(n), d = n - f;
+  n = d > 0.5 || (d === 0.5 && f % 2 === 1) ? f + 1 : f;
+  if (!isValidUserCloseCode(n)) {
+    throw new DOMException('The close code must be 1000 or between 3000 and 4999.', 'InvalidAccessError');
+  }
+  return n;
+}
+
+// A close reason, as the browser checks it: at most 123 bytes of UTF-8 (a
+// close frame's 125, less the code), or a SyntaxError. Lone surrogates become
+// U+FFFD, as USVString has them.
+function closeReasonBytes(reason) {
+  var buf = Buffer.from(String(reason), 'utf8');
+  if (buf.length > 123) {
+    throw new DOMException('The close reason must not be greater than 123 UTF-8 bytes.', 'SyntaxError');
+  }
+  return buf;
+}
+
+// The subprotocols a client offers, as the browser checks them: a string or
+// a list of them (WebSocketStream: a list only — a string is a TypeError);
+// each an HTTP token, none twice — compared without regard to case, as the
+// header's values are — or a SyntaxError.
+function subprotocolList(protocols, listOnly) {
+  if (protocols === undefined || protocols === null && listOnly) return [];
+  if (typeof protocols === 'string') {
+    if (listOnly) throw new TypeError('protocols must be a sequence of strings');
+    protocols = [protocols];
+  } else if (protocols === null || typeof protocols !== 'object' || typeof protocols[Symbol.iterator] !== 'function') {
+    if (listOnly) throw new TypeError('protocols must be a sequence of strings');
+    protocols = [String(protocols)];   // WebIDL: (DOMString or sequence<DOMString>)
+  } else {
+    protocols = Array.from(protocols, String);
+  }
+  var seen = Object.create(null);
+  for (var i = 0; i < protocols.length; i++) {
+    var p = protocols[i];
+    if (p.length === 0 || /[^\x21\x23-\x27\x2a\x2b\x2d\x2e0-9\x41-\x5a\x5e-\x7a\x7c\x7e]/.test(p)) {
+      throw new DOMException('The subprotocol \'' + p + '\' is invalid.', 'SyntaxError');
+    }
+    var k = p.toLowerCase();
+    if (seen[k]) throw new DOMException('The subprotocol \'' + p + '\' is duplicated.', 'SyntaxError');
+    seen[k] = true;
+  }
+  return protocols;
+}
+
+// Messages leave in the order they were sent. A Blob has to be read first,
+// asynchronously, and was sent whenever that finished: send(blob) and then
+// send('x') put 'x' first. Each send now joins the socket's queue; one behind
+// a Blob still being read waits for it. bufferedAmount counts a message from
+// send() on, as the spec does, until it is handed to the socket.
+//   ws._sendFrame(opcode, payload, cb) writes one frame.
+function sendInOrder(ws, opcode, data, cb) {
+  var q = ws._sendQueue || (ws._sendQueue = []);
+  var item = { opcode: opcode, data: data, cb: cb || null, size: data instanceof Blob ? data.size : data.length };
+  ws._bufferedAmount += item.size;
+  q.push(item);
+  if (q.length === 1) drainSendQueue(ws);
+}
+function drainSendQueue(ws) {
+  var q = ws._sendQueue;
+  while (q.length > 0) {
+    var it = q[0];
+    if (it.data instanceof Blob) {
+      if (it.reading) return;
+      it.reading = true;
+      it.data.arrayBuffer().then(function (ab) { it.data = Buffer.from(ab); it.reading = false; drainSendQueue(ws); },
+                                 function () { q.shift(); ws._bufferedAmount -= it.size; drainSendQueue(ws); });
+      return;
+    }
+    q.shift();
+    ws._bufferedAmount -= it.size;   // _sendFrame counts it again until written
+    ws._sendFrame(it.opcode, it.data, it.cb);
+  }
+}
+
+// The close frame, when messages sent before it are still queued (a Blob
+// being read): it waits its turn, so it is the last frame out. With `now` (the
+// peer closed first) the queue is dropped instead, and the caller writes it.
+// true: queued, the caller writes nothing.
+function queueCloseFrame(ws, payload, now) {
+  var q = ws._sendQueue;
+  if (!q || q.length === 0) return false;
+  if (now) {
+    for (var i = 0; i < q.length; i++) { ws._bufferedAmount -= q[i].size; if (q[i].cb) q[i].cb(new Error('the WebSocket is closed')); }
+    q.length = 0;
+    return false;
+  }
+  q.push({ opcode: OPCODE.CLOSE, data: payload, cb: null, size: 0 });
+  return true;
+}
+
+// Ports the browser will not connect to (Fetch, "bad port"): services where a
+// request someone else's page made could be taken for that protocol's commands
+// — SMTP, IRC, SSH. Node's fetch refuses them as well.
+var BAD_PORTS = new Set([0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
+  101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512,
+  513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720,
+  1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080]);
+function isBadPort(port) { return BAD_PORTS.has(Number(port)); }
+
 export {
+  userCloseCode,
+  subprotocolList,
+  closeReasonBytes,
+  sendInOrder,
+  queueCloseFrame,
+  isBadPort,
   WSParser,
   encodeFrame,
   applyMask,

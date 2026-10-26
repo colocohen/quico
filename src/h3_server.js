@@ -647,7 +647,7 @@ function createServer(options, handler) {
           }
           // Date (RFC 9110 §6.6.1), as HTTP/2 and HTTP/1.1 send it — HTTP/3's
           // responses had none.
-          if (!('date' in h3Headers) && statusCode >= 200) h3Headers['date'] = httpDate();
+          if (!('date' in h3Headers) && statusCode >= 200 && !(res._wrapper && res._wrapper.sendDate === false)) h3Headers['date'] = httpDate();
 
           if (conn.h3) {
             // Send headers WITHOUT FIN for WT (session stays open)
@@ -708,6 +708,12 @@ function createServer(options, handler) {
             try { conn.h3.sendHeaders(streamId, h, false); } catch (e) { /* stream gone */ }
           }
           if (typeof callback === 'function') process.nextTick(callback);
+        },
+
+        // 102 Processing (node:http's writeProcessing): as Early Hints go.
+        writeProcessing: function () {
+          if (res.headersSent || res._finished || !conn.h3) return;
+          try { conn.h3.sendHeaders(streamId, { ':status': '102' }, false); } catch (e) { /* stream gone */ }
         },
 
         write: function (chunk) {
@@ -947,6 +953,13 @@ function createServer(options, handler) {
         for (var name in params.request_headers) {
           stream.req.headers[name] = params.request_headers[name];
         }
+        // The field lines as they came (validateFieldSection), which the
+        // copy above leaves behind — not enumerable: req.rawHeaders and
+        // headersDistinct are built from them. Without it they were rebuilt
+        // from the joined values, two x-a lines one "1, 2".
+        if (params.request_headers._rawHeaders && !stream.req.headers._rawHeaders) {
+          Object.defineProperty(stream.req.headers, '_rawHeaders', { value: params.request_headers._rawHeaders, enumerable: false });
+        }
 
         // Extract :method and :path
         if (stream.req.method === null && ':method' in stream.req.headers) {
@@ -1041,6 +1054,7 @@ function createServer(options, handler) {
           releaseHttpStream(conn, streamId, false);
           return;
         }
+        stream.req.upgrade = true;
         ev.emit('upgrade', stream.req, duplex, Buffer.alloc(0));
         return;
       }
@@ -1206,6 +1220,10 @@ function createServer(options, handler) {
     return sock;
   }
 
+  // Every connection, for closing them (closeIdleConnections, close()).
+  var conns = new Set();
+  var closingServer = null;     // close()'s callback, once every connection is gone
+
   qserver.on('connection', function (quic, peer) {
     var conn = { quic: quic, h3: null, http_streams: {}, _wtStreamObjects: {}, served: 0,
                  headerDeadlines: {},   // request streams whose HEADERS is still arriving
@@ -1226,7 +1244,12 @@ function createServer(options, handler) {
     // 'aborted' on the request and 'close' on the response, a tunnel
     // destroyed, a session closed with its streams. Requests that had
     // finished in both directions are already gone (releaseIfDone).
+    conns.add(conn);
+    // Over for the application ('closing'), or its draining done ('close').
+    var gone = function () { if (conns.delete(conn)) connGone(); };
+    quic.on('closing', gone);
     quic.on('close', function () {
+      gone();
       for (var hid in conn.headerDeadlines) clearHeadersDeadline(conn, hid);
       for (var sid in conn.http_streams) releaseHttpStream(conn, sid, true);
       for (var wid in conn._wtStreamObjects) releaseHttpStream(conn, wid, true);
@@ -1633,9 +1656,61 @@ function createServer(options, handler) {
   //  server. This layer adds HTTP/3 request events on top.
   // ============================================================
 
+  // ---- Closing, as node:http (see h1_server) ----
+  //
+  // Idle: no request open on it — before its handshake too, as node:http
+  // counts a connection that has not sent a request. GOAWAY, and closed at
+  // once (closeAfterGoaway: nothing to wait for); before the handshake,
+  // refused (goaway() does that).
+  function isIdle(conn) { return Object.keys(conn.http_streams).length === 0; }
+  // GOAWAY and CONNECTION_CLOSE together (§5.2 allows closing at once when
+  // nothing is in flight): waiting for the GOAWAY's acknowledgement, a
+  // client that had gone held the close until its idle timeout.
+  function closeIdle(conn) {
+    if (!conn.handle) return;
+    conn.handle.goaway();
+    conn.handle.destroy();
+  }
+  function closeIdleConnections() {
+    for (var conn of conns) if (isIdle(conn)) closeIdle(conn);
+  }
+  function closeAllConnections() {
+    for (var conn of conns) if (conn.handle) conn.handle.destroy();
+  }
+  // No new connections; GOAWAY on each — the requests in flight finish, then
+  // the connection closes (closeAfterGoaway) — and once none is left, the
+  // UDP sockets. It closed every connection on the spot: a response being
+  // sent was cut off, and its client waited for the rest until a timeout.
+  function close(callback) {
+    qserver.stopAccepting();
+    closingServer = typeof callback === 'function' ? callback : function () {};
+    for (var conn of conns) {
+      if (isIdle(conn)) closeIdle(conn);
+      else if (conn.handle) conn.handle.goaway();
+    }
+    connGone();
+  }
+  function connGone() {
+    if (!closingServer || conns.size > 0) return;
+    var cb = closingServer;
+    closingServer = null;
+    qserver.close(cb);
+  }
+  function setLimits(o) {
+    if (o.headersTimeout !== undefined) headersTimeout = o.headersTimeout;
+    if (o.requestTimeout !== undefined) requestTimeout = o.requestTimeout;
+    if (o.maxRequestsPerSocket !== undefined) maxRequests = maxRequestsPerSocket(o.maxRequestsPerSocket);
+  }
+
   return {
-    listen: qserver.listen,
-    close: qserver.close,
+    listen: function (p, h, cb) { closingServer = null; return qserver.listen(p, h, cb); },
+    close: close,
+    closeIdleConnections: closeIdleConnections,
+    closeAllConnections: closeAllConnections,
+    setLimits: setLimits,
+    get connectionCount() { return conns.size; },
+    ref: qserver.ref,
+    unref: qserver.unref,
     on: function (name, fn) { if (name === 'upgrade') upgradeListeners++; ev.on(name, fn); },
     setTimeout: function () { /* TODO */ },
 

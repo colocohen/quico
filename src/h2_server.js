@@ -255,6 +255,20 @@ function createServer(options, handler) {
     });
 
     connections.add(socket);
+    socket._quicoH2 = {
+      idle: function () { return h2.activeStreams === 0; },
+      drain: function () {
+        if (destroyed || draining) return;
+        draining = true;
+        try { h2.sendGoaway(F.ERROR.NO_ERROR); } catch (e) {}
+        finishIfDone();
+      },
+      destroy: function () {
+        if (destroyed) return;
+        try { h2.sendGoaway(F.ERROR.NO_ERROR); } catch (e) {}
+        destroy(null, true);
+      }
+    };
 
     // `linger`: end the socket rather than destroy it — what was written last
     // (the GOAWAY saying why) leaves first — and destroy it if the peer has
@@ -340,8 +354,12 @@ function createServer(options, handler) {
     // only (HTTP/1.1 ends its socket with the client's, as node:http does).
     socket.allowHalfOpen = true;
     var peerEnded = false;
+    // Closing (server.close(), closeIdleConnections): GOAWAY sent — no new
+    // streams — and the connection ends with its last stream, as when the
+    // peer half-closes.
+    var draining = false;
     function finishIfDone() {
-      if (destroyed || !peerEnded || h2.activeStreams > 0) return;
+      if (destroyed || !(peerEnded || draining) || h2.activeStreams > 0) return;
       try { h2.sendGoaway(F.ERROR.NO_ERROR); } catch (e) {}
       destroy(null, true);
     }
@@ -375,7 +393,7 @@ function createServer(options, handler) {
       // a long-lived connection kept every WebSocket it ever carried).
       var st = streams[id];
       if (st && st.duplex) delete streams[id];
-      if (peerEnded) process.nextTick(finishIfDone);
+      if (peerEnded || draining) process.nextTick(finishIfDone);
     });
     // A response that waits for the client to open a window, from a client
     // that has half-closed: it sends nothing more — no WINDOW_UPDATE either —
@@ -435,6 +453,7 @@ function createServer(options, handler) {
           delete streams[streamId];
           return;
         }
+        creq.upgrade = true;
         ev.emit('upgrade', creq, stream, Buffer.alloc(0));
         return;
       }
@@ -686,7 +705,7 @@ function createServer(options, handler) {
 
         bodyAllowed = !statusHasNoBody(code) && req.method !== 'HEAD';
 
-        if (!('date' in headers)) headers['date'] = httpDate();
+        if (!('date' in headers) && res.sendDate !== false) headers['date'] = httpDate();
         // A function when the server was built before its port was known —
         // the unified server builds its layers at creation and learns the
         // port from listen(), or from options.port when fed from outside.
@@ -767,6 +786,12 @@ function createServer(options, handler) {
         if (typeof callback === 'function') process.nextTick(callback);
       };
 
+      // 102 Processing (node:http's writeProcessing), as Early Hints go.
+      res.writeProcessing = function () {
+        if (res.headersSent || res._aborted || destroyed) return;
+        try { h2.sendHeaders(streamId, buildResponsePseudoHeaders(102, {}), false); } catch (e) {}
+      };
+
       /**
        * The response's priority, as the server decides it: { urgency (0..7,
        * 0 first), incremental } — RFC 9218, as h3_server's. It replaces what
@@ -821,7 +846,7 @@ function createServer(options, handler) {
       ca: options.ca,
       SNICallback: options.SNICallback
     });
-    listener.register('h2', handleConnection);
+    listener.register('h2', handleConnection, { managesClose: true });
     listener.on('error', function (err) { ev.emit('error', err); });
     listener.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
     listener.on('tlsClientError', function (err, sock) { ev.emit('tlsClientError', err, sock); });
@@ -832,14 +857,33 @@ function createServer(options, handler) {
     return server;
   }
 
-  function close(callback) {
+  // ---- Closing, as node:http (see h1_server) ----
+  // Idle: no stream open. Closed with GOAWAY first, so the client knows
+  // nothing it sent was lost.
+  function closeIdleConnections() {
+    for (var s of connections) if (s._quicoH2 && s._quicoH2.idle()) s._quicoH2.drain();
+  }
+  function closeAllConnections() {
+    for (var s of connections) if (s._quicoH2) s._quicoH2.destroy();
+  }
+  // GOAWAY on every connection: those idle end now, the others when their
+  // last stream does. It used to end every socket at once — responses in
+  // progress were cut off.
+  function beginClose() {
     closing = true;
-    if (!listener) {
-      for (var s of connections) { try { s.end(); } catch (e) {} }
-      if (callback) callback();
-      return;
-    }
+    for (var s of connections) if (s._quicoH2) s._quicoH2.drain();
+  }
+
+  function close(callback) {
+    beginClose();
+    if (!listener) { if (callback) callback(); return; }
     listener.close(callback);
+  }
+
+  function setLimits(o) {
+    if (o.headersTimeout !== undefined) headersTimeout = o.headersTimeout;
+    if (o.requestTimeout !== undefined) requestTimeout = o.requestTimeout;
+    if (o.maxRequestsPerSocket !== undefined) maxRequests = maxRequestsPerSocket(o.maxRequestsPerSocket);
   }
 
 
@@ -852,7 +896,12 @@ function createServer(options, handler) {
     once: function (n, f) { ev.once(n, f); return server; },
     off: function (n, f) { ev.off(n, f); return server; },
     emit: function () { ev.emit.apply(ev, arguments); return server; },
-    listenerCount: function (n) { return ev.listenerCount(n); }
+    listenerCount: function (n) { return ev.listenerCount(n); },
+    closeIdleConnections: closeIdleConnections,
+    closeAllConnections: closeAllConnections,
+    beginClose: beginClose,
+    setLimits: setLimits,
+    get connectionCount() { return connections.size; }
   };
 
   return server;

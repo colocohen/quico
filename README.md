@@ -294,8 +294,9 @@ QUICO takes from Node is `node:net` (TCP), `node:dgram` (UDP) and `node:crypto`
 ### WebSocket
 - Server over all three versions: HTTP/1.1 Upgrade, HTTP/2 extended CONNECT
   (RFC 8441) and HTTP/3 extended CONNECT (RFC 9220) — one `'upgrade'` event for all
-- `WebSocketServer` in the shape of the `ws` package, and a WHATWG-style
-  `WebSocket` client (HTTP/1.1)
+- `WebSocketServer` in the shape of the `ws` package, and the browser's
+  `WebSocket` client (HTTP/1.1), checked against the WPT `websockets/` tests
+- `WebSocketStream` (experimental): the streams version, with backpressure both ways
 
 ### CONNECT-UDP
 - A UDP proxy (RFC 9298, MASQUE) over HTTP/3 — QUIC datagrams — and HTTP/2 and
@@ -1090,7 +1091,33 @@ HTTP/1.1 and h2c.
 - `server.listen(port[, host][, callback])` — start listening. Binds UDP (unless
   `http3: false` or external sockets were given) and TCP (unless both fallbacks are
   disabled). Port `0` picks a free port.
-- `server.close([callback])` — stop listening and close all connections.
+- `server.close([callback])` — as `node:http`'s: no new connections, the idle ones
+  closed at once, and each with a request in flight closed once it is answered — HTTP/2
+  and HTTP/3 with `GOAWAY`, HTTP/1.1 at the end of its response. Then `'close'` and the
+  callback. A second `close()`: the callback gets `ERR_SERVER_NOT_RUNNING`.
+- `server.closeIdleConnections()` / `server.closeAllConnections()` — as `node:http`'s,
+  on all three versions: the connections with no request in flight (HTTP/2 and HTTP/3
+  are sent `GOAWAY` first), or every one. An HTTP/1.1 socket handed to `'upgrade'` is not
+  the server's any more and stays, as in Node; over HTTP/2 and HTTP/3 a WebSocket or
+  WebTransport session lives on the connection, and closes with it.
+- `server.getConnections(cb)`, `server.listening`, `server.ref()` / `server.unref()`,
+  `await using server = …` (`Symbol.asyncDispose`) — as `node:net`'s; the count is TCP
+  and QUIC connections.
+- `server.headersTimeout`, `server.requestTimeout`, `server.maxRequestsPerSocket` (all
+  versions), `server.keepAliveTimeout`, `server.maxHeadersCount` (HTTP/1.1) — readable
+  and settable while the server runs, from the next request or connection on.
+- The server is an `EventEmitter`, as `node:http`'s: every method (`listeners`,
+  `removeAllListeners`, `prependListener`, …), and `instanceof EventEmitter`.
+- `server.setSecureContext({ key, cert[, ca, passphrase] })` — as `node:tls`'s: the
+  certificate from the next handshake on, over HTTP/1.1, HTTP/2 and HTTP/3 alike;
+  connections already open keep theirs. How a renewed certificate (Let's Encrypt) is taken
+  without a restart. A key that does not match its certificate, or a missing one, throws —
+  and the certificate in use stays.
+- `server.addContext(hostname, context)` — as `node:tls`'s: a certificate for one name, by
+  the client's SNI (`'*.example.com'` covers one label; the latest added wins), on all
+  three versions. `context`: `{ key, cert }` or `quico.createSecureContext()`. With an
+  `SNICallback` given to `createServer`, it decides instead (as in Node); when it answers
+  with nothing, the `setSecureContext()` certificate is used.
 - `server.address()`
 - `server.handleConnection(socket)` — serve a TCP socket accepted elsewhere.
 - `server.setTimeout([msecs][, callback])` / `server.timeout` — as in `node:http`:
@@ -1522,7 +1549,7 @@ Call `agent.destroy()` to close everything it pools.
 
 ### `quico.createSecureContext(options)`
 
-Creates a TLS context for use with `SNICallback`. Accepts `key`, `cert` and `ca`.
+Creates a TLS context for `SNICallback`, `server.setSecureContext()` and `server.addContext()`. Accepts `key`, `cert`, `ca` and `passphrase`.
 Re-exported from LemonTLS.
 
 ---
@@ -1736,7 +1763,15 @@ quico.createServer({ key: KEY, cert: CERT }, app).listen(4433);
 // → { "protocol": "3.0" }
 ```
 
-Express, Fastify and Koa are all supported this way.
+Express (4 and 5), Fastify (`serverFactory`), Koa and socket.io (`new Server(server)`,
+polling and WebSocket) run on it unchanged, over all three versions — checked against
+their npm releases.
+
+`req` and `res` are `node:http`'s, down to the details frameworks rely on:
+`res.writeHead(status, [name, value, …])` and `[[name, value], …]`, `appendHeader`,
+`setHeaders(Headers | Map)`, `getRawHeaderNames`, `getHeaders()` (no prototype),
+`sendDate`, `strictContentLength`, `writeProcessing()` (102), `end(cb)` after the
+`'finish'` listeners; `req.headersDistinct`, `req.trailersDistinct`, `req.upgrade`.
 
 Multi-domain setups use `SNICallback`, exactly as in `node:https`:
 
@@ -2148,7 +2183,58 @@ The client connects over HTTP/1.1. Options beyond the WHATWG constructor: `origi
 `headers`, `ca`, `rejectUnauthorized`, `maxPayload`, `agent` (whose TLS sessions a
 `wss://` connection resumes with and keeps — `globalAgent` by default) and `session` (one
 to resume with, from an earlier `'session'`). `ws.on('session', buf)`: each one the server
-sends.
+sends. The second argument may also be the browser's options bag: `new WebSocket(url, { protocols: ['chat'] })`.
+
+It behaves as a browser's does (WHATWG, WPT `websockets/`):
+
+- Messages go in the order `send()` was called — a `Blob` included, which is read first.
+- `close(code, reason)` checks as the browser: `null` is 0 and a code is clamped to 16 bits, so
+  anything but 1000 or 3000–4999 is an `InvalidAccessError`; a reason over 123 bytes, a
+  `SyntaxError`. `close()` while connecting abandons the handshake: `'error'`, then `'close'`
+  1006, both on a later turn.
+- A URL with a fragment (even an empty `#`), or protocols repeated in another case
+  (`['chat', 'CHAT']`): `SyntaxError`.
+- A port browsers refuse (Fetch's bad ports: 22, 25, 6000, …): never connected — `'error'`,
+  then `'close'` 1006.
+- User and password in the URL (`wss://user:pass@host/`): sent as `Authorization: Basic`,
+  unless `headers` has one.
+- `MessageEvent.origin` is the URL's origin; `send()` after close adds to `bufferedAmount`.
+
+#### WebSocketStream (experimental)
+
+The browser's streams-based WebSocket ([explainer](https://github.com/ricea/websocketstream-explainer);
+Chrome ships it, not yet a standard — the API may still change). The same connection, but a
+`ReadableStream` and a `WritableStream` in place of events, so both directions have backpressure:
+
+```js
+import { WebSocketStream, WebSocketError } from 'quico';
+
+const wss = new WebSocketStream('wss://localhost:4433/chat',
+                                { protocols: ['chat'], signal: AbortSignal.timeout(5000), rejectUnauthorized: false });
+const { readable, writable, protocol } = await wss.opened;
+
+const writer = writable.getWriter();
+await writer.write('hello');                    // resolves once the frame is sent
+for await (const message of readable) {         // a string, or a Uint8Array
+  console.log(message);
+}
+const { closeCode, reason } = await wss.closed;
+```
+
+- **Receiving.** A message nobody has read holds the socket: it is paused, TCP fills up, and the
+  server's sends wait. With `WebSocket`, every message arrives as an event, however fast, into memory.
+- **Sending.** `write()` resolves when the frame has gone to the socket — a writer that awaits it
+  goes as fast as the connection, with nothing piling up. `WebSocket`'s `send()` returns at once.
+- `close({ closeCode, reason })` — the checks of `WebSocket.close()`; a reason with no code is 1000.
+  `closed` resolves with the code and reason the peer closed with.
+- A connection lost, or a close that left writes unsent: `closed` rejects with a `WebSocketError`
+  (a `DOMException` with `closeCode` — 1006 when there was no closing handshake — and `reason`),
+  and the readable and writable error with it.
+- `readable.cancel(err)` / `writable.abort(err)` close with the code and reason of a `WebSocketError`
+  given: `new WebSocketError('', { closeCode: 4000, reason: 'bye' })`.
+- `signal` aborted before the connection is open: it is abandoned, `opened` and `closed` reject with
+  the signal's reason; once open, it does nothing.
+- Options besides `protocols` and `signal` are `WebSocket`'s (`origin`, `headers`, `ca`, …).
 
 ---
 
@@ -2597,6 +2683,7 @@ quico/
     ├── ws.js                — WebSocket framing, and the WHATWG and ws-style event surfaces
     ├── ws_server.js         — WebSocketServer, upgradeWebSocket
     ├── ws_client.js         — WebSocket client
+    ├── ws_stream.js         — WebSocketStream, WebSocketError (experimental)
     │
     ├── ja4h.js              — JA4H request fingerprint
     ├── h2_fingerprint.js    — HTTP/2 and HTTP/3 fingerprints
@@ -2722,9 +2809,9 @@ with the error the RFC names, not left to grow.
   parameters, packet headers, HTTP/1.1, WebSocket, HPACK and HTTP/2 connections, QPACK,
   capsules — and HTTP/3 and QUIC frames on live connections, with mutated valid input and
   noise; none ends in an exception of its own, a hang, or an internal-error close.
-- **Closing says so**: `server.close()` sends every connection its `CONNECTION_CLOSE`
-  and closes the socket only once those have left, so clients learn at once rather than
-  by their idle timeout.
+- **Closing says so**: `server.close()` lets requests in flight finish, then sends each
+  connection its `CONNECTION_CLOSE` and closes the socket only once those have left, so
+  clients learn at once rather than by their idle timeout.
 
 To report a vulnerability, please see [SECURITY.md](./SECURITY.md) — or write to
 **support@quicojs.dev** — rather than opening a public issue.
