@@ -307,8 +307,17 @@ function parseSettingsPayload(buf) {
   var list = [];
   var seen = {};
   while (offset < buf.length) {
-    var id = readVarInt(buf, offset); if (!id) break; offset += id.byteLength;
-    var val = readVarInt(buf, offset); if (!val) break; offset += val.byteLength;
+    // A payload that ends inside an identifier or before its value is
+    // H3_FRAME_ERROR (RFC 9114 §7.1). It was cut short silently: the setting
+    // dropped, the connection on.
+    var id = readVarInt(buf, offset);
+    var val = id ? readVarInt(buf, offset + id.byteLength) : null;
+    if (!id || !val) {
+      var te = new Error('SETTINGS payload ends inside a setting (' + (buf.length - offset) + ' byte(s) left)');
+      te.h3ErrorCode = 0x0106;
+      throw te;
+    }
+    offset += id.byteLength + val.byteLength;
     // RFC 9114 §7.2.4: an identifier twice, or one of HTTP/2's that HTTP/3
     // reserves (0x02-0x05), is H3_SETTINGS_ERROR.
     if (seen[id.value] || (id.value >= 0x02 && id.value <= 0x05)) {
@@ -646,6 +655,11 @@ function H3Connection(options) {
   var decoderStreamId = null;
   var qpackKnownReceived = 0;               // insertions the peer has acknowledged
   var qpackPendingAcks = 0;                 // insertions of THEIRS we owe an ack for
+  // Field sections we sent with a non-zero Required Insert Count, not yet
+  // acknowledged: stream id → [RIC, …] in the order sent (RFC 9204 §2.1.1).
+  // The decoder acknowledges each (Section Acknowledgment), or cancels the
+  // stream's; an acknowledgment for none is an error (§4.4.1).
+  var qpackUnacked = new Map();
 
   // ---- SETTINGS remembered for 0-RTT (RFC 9114 §7.2.4.2) ----
   //
@@ -744,9 +758,10 @@ function H3Connection(options) {
    * reference — and until an entry is below it, we send a literal instead.
    * That single number is what makes this encoder non-blocking.
    *
-   * Section acknowledgements and stream cancellations are parsed and skipped:
-   * they drive eviction accounting in an encoder that references
-   * unacknowledged entries, which this one never does.
+   * Each instruction is held to what we actually sent (RFC 9204 §4.4): a
+   * Section Acknowledgment for a section we have outstanding on that stream,
+   * an Insert Count Increment of at least 1 that does not pass the entries we
+   * inserted. Anything else is QPACK_DECODER_STREAM_ERROR.
    */
   function processQpackDecoderStream(s) {
     if (s.buffered === 0) return;
@@ -755,12 +770,39 @@ function H3Connection(options) {
     var buf = Buffer.from(copyBytes(s, s.buffered));
 
     var r = qpackParseDecoderInstructions(buf, 0);
-    if (r.increments > 0) {
-      qpackKnownReceived += r.increments;
-      if (DEBUG) console.log('[h3] qpack acked ' + r.increments +
-                             ' (known=' + qpackKnownReceived + ')');
+    for (var k = 0; k < r.instructions.length; k++) {
+      var ins = r.instructions[k];
+      if (ins.type === 'section_ack') {
+        var pend = qpackUnacked.get(ins.value);
+        if (!pend || pend.length === 0) {
+          throw qpackDecoderStreamError('Section Acknowledgment for stream ' + ins.value +
+                                        ', which has no field section awaiting one');
+        }
+        var ric = pend.shift();
+        if (pend.length === 0) qpackUnacked.delete(ins.value);
+        // §4.4.1: the acknowledged section's entries are now known received.
+        if (ric > qpackKnownReceived) qpackKnownReceived = ric;
+      } else if (ins.type === 'stream_cancel') {
+        qpackUnacked.delete(ins.value);
+      } else {
+        // §4.4.3: zero, or past what was inserted, is an error.
+        if (ins.value === 0) throw qpackDecoderStreamError('Insert Count Increment of 0');
+        if (qpackKnownReceived + ins.value > encoderTable.insertCount) {
+          throw qpackDecoderStreamError('Insert Count Increment to ' + (qpackKnownReceived + ins.value) +
+                                        ', beyond the ' + encoderTable.insertCount + ' entries inserted');
+        }
+        qpackKnownReceived += ins.value;
+      }
     }
+    if (DEBUG && r.instructions.length) console.log('[h3] qpack decoder instructions ' + r.instructions.length +
+                                                    ' (known=' + qpackKnownReceived + ')');
     consumeBytes(s, r.consumed);
+  }
+
+  function qpackDecoderStreamError(msg) {
+    var err = new Error('QPACK decoder stream: ' + msg);
+    err.h3ErrorCode = H3_ERR.QPACK_DECODER_STREAM_ERROR;
+    return err;
   }
 
   function evictQpackTable(limit) {
@@ -847,7 +889,15 @@ function H3Connection(options) {
     if (context.control_streams_sent) return;
     context.control_streams_sent = true;
 
-    var settings = buildSettingsPayload(localSettings(context));
+    // A reserved identifier among them, of a random N (RFC 9114 §7.2.4.1,
+    // 0x1f·N + 0x21): peers must ignore it — sending one keeps them honest.
+    // Not part of localSettings: 0-RTT's context (settingsContext) holds the
+    // ones that mean something, and this one changes every connection.
+    var greaseId = 0x1f * Math.floor(Math.random() * 0x10000) + 0x21;
+    var settings = concatUint8Arrays([
+      buildSettingsPayload(localSettings(context)),
+      writeVarInt(greaseId), writeVarInt(Math.floor(Math.random() * 64))
+    ]);
 
     var controlFrame = buildH3Frames([{ frame_type: 0x04, payload: settings }]);
 
@@ -877,6 +927,11 @@ function H3Connection(options) {
     decoderStreamId = decId;
   }
 
+
+  // Our control and QPACK streams (sendControlStreams).
+  function isOwnCriticalStream(sid) {
+    return sid === (context.isServer ? 3 : 2) || sid === encoderStreamId || sid === decoderStreamId;
+  }
 
   // ---- Graceful shutdown: GOAWAY (RFC 9114 §5.2) ----
 
@@ -1155,6 +1210,15 @@ function H3Connection(options) {
   // a WT stream, so it can be routed to its session.
   listenQuic('stream_reset', function (streamId, code) {
     var sid = Number(streamId);
+    // The peer's control or QPACK stream, reset: closed, which RFC 9114
+    // §6.2.1 and RFC 9204 §4.2 make a connection error however it happens.
+    // Only a FIN was caught (processStream); a RESET_STREAM left the
+    // connection serving on without them.
+    var crit = context.streams[sid];
+    if (crit && (crit.type === 'control' || crit.type === 'qpack_enc' || crit.type === 'qpack_dec')) {
+      connectionError(H3_ERR.H3_CLOSED_CRITICAL_STREAM, 'the peer reset its ' + crit.type + ' stream');
+      return;
+    }
     var wt = _wtStreams[sid];
     var wasParsing = sid in context.streams;
     // A client's request stream reset before its HEADERS came: there is no
@@ -1179,6 +1243,13 @@ function H3Connection(options) {
   // whole cancellation.
   listenQuic('stop_sending', function (streamId, code) {
     var sid = Number(streamId);
+    // Asked to stop one of OUR critical streams: QUIC has answered with
+    // RESET_STREAM, so it is closed — the same connection error (§6.2.1:
+    // "A receiver MUST NOT request that the sender close the control stream").
+    if (context.control_streams_sent && isOwnCriticalStream(sid)) {
+      connectionError(H3_ERR.H3_CLOSED_CRITICAL_STREAM, 'the peer stopped our ' + (sid === encoderStreamId ? 'QPACK encoder' : sid === decoderStreamId ? 'QPACK decoder' : 'control') + ' stream');
+      return;
+    }
     if (_abortedHere.has(sid)) return;
     ev.emit('stop_sending', sid, code);
   });
@@ -2124,6 +2195,11 @@ function H3Connection(options) {
     // Insertions FIRST, on their own stream: they are for the next request,
     // not this one.
     flushQpackInserts(enc.inserts);
+    if (enc.requiredInsertCount > 0) {
+      var pend = qpackUnacked.get(streamId);
+      if (pend) pend.push(enc.requiredInsertCount);
+      else qpackUnacked.set(streamId, [enc.requiredInsertCount]);
+    }
 
     var frame = buildH3Frames([{ frame_type: 1, payload: new Uint8Array(enc.block) }]);
     if (DEBUG) console.log('[h3] sendHeaders stream=' + streamId + ' len=' + frame.byteLength + ' fin=' + !!fin);

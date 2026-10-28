@@ -299,6 +299,7 @@ function QUICConnection(options) {
     // complete"), issues no connection IDs and sends no HANDSHAKE_DONE.
     peer_finished: false,
     handshake_done_sent: false,
+    new_token_for: null,                  // the address:port the last NEW_TOKEN was for (issueNewToken)
 
     // Connection close (RFC 9000 §10.2)
     close_frame: null,         // the CONNECTION_CLOSE frame to (re)send while closing
@@ -703,13 +704,18 @@ function QUICConnection(options) {
 
     max_packets_per_burst: 20,          // fixed cap — not CC-controlled, no current_/init_
 
-    // packet payload (MTU). current_ is the size actually used; max_ is the ceiling
-    // DPLPMTUD must not probe past; init_/floor is QUIC's guaranteed 1200-byte minimum.
+    // packet size (MTU). Datagram sizes are WHOLE UDP payloads: max_ is the
+    // ceiling DPLPMTUD must not probe past; init_ is QUIC's 1200 — RFC 9000
+    // §14: no datagram larger until a path has shown it carries one; current_
+    // is the size in use. current_limit_packet_payload is what a packet has
+    // for FRAMES: that datagram, within the peer's max_udp_payload_size, less
+    // the packet's header and AEAD tag (syncPacketPayload).
     max_limit_packet_payload:     connOpts.maxUdpPayloadSize,   // ceiling, maxUdpPayloadSize: 1452 (IPv6-safe Ethernet: 1500 − 48 hdr) —
                                               // a whole UDP datagram: what DPLPMTUD probes up to
-    init_limit_packet_payload:    1200,       // QUIC guaranteed floor — where we start
-    current_limit_packet_payload: 1200,       // = init_; DPLPMTUD raises it: the frames a packet
-                                              // carries, the datagram it confirmed less its header
+    init_limit_datagram:          1200,       // QUIC's guaranteed floor — where we start
+    current_limit_datagram:       1200,       // = init_; DPLPMTUD raises it
+    current_limit_packet_payload: 1200 - 69,  // frames; set by syncPacketPayload — until then,
+                                              // 1200 less the largest header (a 0-RTT packet, 20-byte CIDs)
     pmtu: null,                               // DPLPMTUD's state (pmtuReset)
     peer_max_udp_payload: 65527,              // its max_udp_payload_size (RFC 9000 §18.2)
 
@@ -1461,7 +1467,7 @@ function QUICConnection(options) {
   // the search may go there.
   function setMaxUdpPayload(v) {
     context.max_limit_packet_payload = v;
-    var now = context.current_limit_packet_payload + shortHeaderOverhead();
+    var now = context.current_limit_datagram;
     var m = context.pmtu;
     if (now > v) pmtuApply(v);
     if (m) {
@@ -1923,6 +1929,7 @@ function QUICConnection(options) {
       // a bound on what DPLPMTUD probes. "Values below 1200 are invalid."
       if (typeof p.max_udp_payload_size === 'number') {
         context.peer_max_udp_payload = p.max_udp_payload_size;
+        syncPacketPayload();
       }
       // Stream-count limits the peer grants us (localStreamPermitted holds
       // back a stream past them). Seeded directly, not through set_context:
@@ -2063,10 +2070,7 @@ function QUICConnection(options) {
           queueControl('hd');     // retransmitted until acknowledged (§13.3)
           // A token for the client's next connection (NEW_TOKEN, §8.1.3):
           // it will need no proof of address then.
-          if (typeof options.newToken === 'function') {
-            var nt = options.newToken(peerPath().address, context.version);
-            if (nt && nt.byteLength > 0) queueControl('nt', { type: 'new_token', token: nt });
-          }
+          issueNewToken(peerPath());
         }
         discardSpace('handshake');
         crStart();
@@ -5376,7 +5380,8 @@ function QUICConnection(options) {
     var sent = { initial: 0, handshake: 0 };
     if (context.state === 'draining' || context.state === 'closed' || context.state === 'closing') return sent;
     var path = context.path;
-    var cap = Math.max(1200, context.current_limit_packet_payload);
+    // A whole datagram: the size in use, within what the peer takes.
+    var cap = Math.min(context.current_limit_datagram, context.peer_max_udp_payload);
     var plan = [], planBytes = 0;
     var nextPn = { initial: context.send_pn.initial, handshake: context.send_pn.handshake };
     var planned = { initial: [], handshake: [] };
@@ -5813,10 +5818,27 @@ function QUICConnection(options) {
     return (prev && prev.validated) ? prev : context.path;
   }
 
+  // Server: a NEW_TOKEN for the address the client is at (§8.1.3) — after
+  // the handshake, and again each time the client turns up at a new address
+  // and proves it (§9.3: a migration, a NAT rebinding), since the client's
+  // next connection comes from there. The newest replaces one not yet sent.
+  function issueNewToken(path) {
+    if (!context.isServer || typeof options.newToken !== 'function' || !context.handshake_done_sent) return;
+    var at = path.address + ':' + path.port;
+    if (context.new_token_for === at) return;
+    var nt = options.newToken(path.address, context.version);
+    if (!nt || nt.byteLength === 0) return;
+    context.new_token_for = at;
+    queueControl('nt', { type: 'new_token', token: nt });
+  }
+
   function markValidated(path) {
     if (path.validated) return;
     path.validated = true;
-    if (path === context.path) ev.emit('path_validated', path.address, path.port);
+    if (path === context.path) {
+      ev.emit('path_validated', path.address, path.port);
+      issueNewToken(path);
+    }
     if (DEBUG) console.log('[quic] path ' + path.address + ':' + path.port + ' validated (received ' + path.received + 'B, sent ' + path.sent + 'B before)');
     if (path.queue.length > 0) releaseAmpQueue(path);
   }
@@ -5824,8 +5846,8 @@ function QUICConnection(options) {
   // ============================================================
   //  Path MTU discovery — DPLPMTUD (RFC 8899; RFC 9000 §14.3)
   //
-  //  Packets start at what every QUIC path carries (current_limit_packet_
-  //  payload, 1200 bytes of frames). Most paths carry more — ~1450 on
+  //  Packets start at what every QUIC path carries (current_limit_datagram:
+  //  datagrams of 1200 bytes, header and all). Most paths carry more — ~1450 on
   //  Ethernet — and every byte more in a packet is a packet less: an
   //  encryption, a system call, the per-packet bookkeeping, which is where a
   //  JavaScript sender spends its time. So once the handshake is confirmed,
@@ -5885,14 +5907,30 @@ function QUICConnection(options) {
   function shortHeaderOverhead() {
     return 1 + destinationCid('1rtt', context.path).byteLength + 4 + 16;
   }
-  // The datagram every packet up to the floor's frames fits in.
-  function pmtuFloor() { return context.init_limit_packet_payload + shortHeaderOverhead(); }
+  // The header and AEAD tag of the packets app data goes in now: 0-RTT's
+  // long header until 1-RTT keys, a short header after.
+  function appPacketOverhead() {
+    if (!context.app_write && zeroRttSending()) {
+      return 1 + 4 + 1 + destinationCid('0rtt', context.path).byteLength + 1 +
+             (context.my_cids[0] ? context.my_cids[0].byteLength : 0) + 2 + 4 + 16;
+    }
+    return shortHeaderOverhead();
+  }
+  // The frames a packet takes: the datagram in use — never past the peer's
+  // max_udp_payload_size (§18.2) — less its header. Again whenever either, or
+  // the connection ID, may have changed.
+  function syncPacketPayload() {
+    var d = Math.min(context.current_limit_datagram, context.peer_max_udp_payload);
+    context.current_limit_packet_payload = Math.max(64, d - appPacketOverhead());
+  }
+  // The floor: a datagram of 1200 bytes, header included.
+  function pmtuFloor() { return context.init_limit_datagram; }
   function pmtuCeiling() { return Math.min(context.max_limit_packet_payload, context.peer_max_udp_payload); }
 
-  // Packets carry the frames a `size` datagram has room for — never fewer
-  // than the floor's.
+  // Packets fill `size`-byte datagrams — never smaller than the floor.
   function pmtuApply(size) {
-    context.current_limit_packet_payload = Math.max(context.init_limit_packet_payload, size - shortHeaderOverhead());
+    context.current_limit_datagram = Math.max(context.init_limit_datagram, size);
+    syncPacketPayload();
     if (DEBUG) console.log('[quic] PMTU ' + size + ' — packets of ' + context.current_limit_packet_payload + ' bytes of frames');
   }
 
@@ -5981,7 +6019,7 @@ function QUICConnection(options) {
       m.confirming = false;
       m.lo = 0; m.fail = p.size; m.size = 0; m.tries = 0;
       m.bigLost = 0;
-      context.current_limit_packet_payload = context.init_limit_packet_payload;
+      pmtuApply(context.init_limit_datagram);
       m.nextAt = Date.now() + PMTU_RAISE_MS;
       return;
     }
@@ -6113,8 +6151,9 @@ function QUICConnection(options) {
     if (path !== context.path) return;
 
     // A path already validated, failing only the expanded re-check (§8.2.3).
-    // Every packet quico sends fits in 1200 bytes, so a path that has carried
-    // them is carrying what this connection needs; it goes on.
+    // On a new path packets are back at the floor — datagrams of 1200 bytes
+    // at most (pmtuApply) — so a path that has carried them is carrying what
+    // this connection needs; it goes on.
     if (path.validated) return;
 
     // §9.3.2: "an endpoint MUST revert to using the last validated peer
@@ -6137,6 +6176,7 @@ function QUICConnection(options) {
     if (context.candidate_path === path) context.candidate_path = null;
     if (DEBUG) console.log('[quic] now sending to ' + path.address + ':' + path.port + (path.validated ? '' : ' (unvalidated)'));
     ev.emit('path', path.address, path.port);
+    if (path.validated) issueNewToken(path);
   }
 
   // ── Connection IDs: issuing ours, keeping the peer's (RFC 9000 §5.1) ──
@@ -6341,7 +6381,7 @@ function QUICConnection(options) {
     context.current_limit_bytes_in_flight = context.init_limit_bytes_in_flight;
     context.current_limit_packets_per_sec = context.init_limit_packets_per_sec;
     context.current_limit_bytes_per_sec = context.init_limit_bytes_per_sec;
-    context.current_limit_packet_payload = context.init_limit_packet_payload;
+    pmtuApply(context.init_limit_datagram);
     context.srtt = null;
     context.rttvar = null;
     context.min_rtt = null;
@@ -7541,6 +7581,7 @@ function QUICConnection(options) {
 
   function plan_quic_burst() {
     context.send_scheduled = false;   // this pass takes what writes left waiting
+    syncPacketPayload();              // 0-RTT → 1-RTT, a new connection ID
     if (!zeroRttSending()) {
       if (!context.app_write) return;
       if (context.state !== 'connected') return;

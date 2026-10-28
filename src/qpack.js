@@ -270,6 +270,9 @@ var DECODER_INSERT_COUNT  = 0x00;   // 00xxxxxx
 function parseDecoderInstructions(buf, offset) {
   var increments = 0;
   var i = offset || 0;
+  // Each instruction in order, for the encoder to check (RFC 9204 §4.4):
+  // { type: 'section_ack' | 'stream_cancel' | 'increment', value }.
+  var instructions = [];
 
   // readPrefixedInt(buf, prefixBits, pos) — prefix width SECOND, position
   // THIRD, and it returns { value, next } rather than a byte length. Getting
@@ -284,19 +287,22 @@ function parseDecoderInstructions(buf, offset) {
       r = readPrefixedInt(buf, 7, i);
       if (!r) break;
       i = r.next;
+      instructions.push({ type: 'section_ack', value: r.value });
     } else if (b & DECODER_STREAM_CANCEL) {
       r = readPrefixedInt(buf, 6, i);
       if (!r) break;
       i = r.next;
+      instructions.push({ type: 'stream_cancel', value: r.value });
     } else {
       r = readPrefixedInt(buf, 6, i);
       if (!r) break;
       increments += r.value;
       i = r.next;
+      instructions.push({ type: 'increment', value: r.value });
     }
   }
 
-  return { increments: increments, consumed: i - (offset || 0) };
+  return { increments: increments, consumed: i - (offset || 0), instructions: instructions };
 }
 
 
@@ -439,7 +445,10 @@ function encodeHeaderBlock(headerList, table, options) {
 
   return {
     block: Buffer.from(prefix.concat(out)),
-    inserts: inserts
+    inserts: inserts,
+    // The section's Required Insert Count: non-zero, the peer acknowledges
+    // the section (Section Acknowledgment), which the encoder holds it to.
+    requiredInsertCount: maxRef
   };
 }
 
