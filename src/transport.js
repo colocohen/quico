@@ -734,7 +734,9 @@ function parse_quic_frames(buf) {
       frames.push({ type: 'max_stream_data', id: id.value, max: max.value });
 
     } else if (type === 0x12 || type === 0x13) {
-      var max = safeReadVarInt(); if (!max) break;
+      // A count past 2^60 is not one (RFC 9000 §19.11): FRAME_ENCODING_ERROR.
+      var at = offset;
+      var max = safeReadVarInt(); if (!max || streamCountTooLarge(buf.subarray(at, offset))) break;
       frames.push({ type: type === 0x12 ? 'max_streams_bidi' : 'max_streams_uni', max: max.value });
 
     } else if (type === 0x14) {
@@ -747,7 +749,9 @@ function parse_quic_frames(buf) {
       frames.push({ type: 'stream_data_blocked', id: id.value, limit: limit.value });
 
     } else if (type === 0x16 || type === 0x17) {
-      var limit = safeReadVarInt(); if (!limit) break;
+      // Likewise (§19.14: STREAM_LIMIT_ERROR or FRAME_ENCODING_ERROR).
+      var at = offset;
+      var limit = safeReadVarInt(); if (!limit || streamCountTooLarge(buf.subarray(at, offset))) break;
       frames.push({ type: type === 0x16 ? 'streams_blocked_bidi' : 'streams_blocked_uni', limit: limit.value });
 
     } else if (type === 0x18) {

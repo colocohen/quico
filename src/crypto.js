@@ -607,6 +607,12 @@ function decrypt_quic_packet(array, readKey, readIv, readHp, ownCid, largestPn, 
   return {
     packet_number: packetNumber,
     key_phase: keyPhase,
+    // The first byte with header protection removed: its reserved bits are
+    // the caller's to check — only once the AEAD has passed the packet
+    // (RFC 9000 §17.2, §17.3.1), since before that anyone could set them.
+    first_byte: array[0],
+    // null: the AEAD refused the packet. An empty Uint8Array: it passed, and
+    // there was nothing in it — a different thing (RFC 9000 §12.4).
     plaintext: plaintext
   };
 }

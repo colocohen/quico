@@ -1804,6 +1804,8 @@ function QUICConnection(options) {
     // as a CRYPTO_ERROR (0x100 + alert code, RFC 9001 §4.8) — the peer learns
     // why, and this side reports the close now rather than at a timeout.
     tls.on('alert', function (code) { close(0x100 + code, 'TLS alert ' + code); });
+    // The peer's quic_transport_parameters that cannot be read at all.
+    tls.on('transportParamsError', function (why) { close(0x08, why); });
     // The reason for that alert. During the handshake it is the connection's
     // failure, reported like the handshake timeout: 'error', then 'close'.
     // The alert has already closed the connection, so nothing else to do.
@@ -2085,9 +2087,10 @@ function QUICConnection(options) {
       }
     });
 
-    // Note: QUIC handles key updates via key_phase bit, not TLS KeyUpdate message.
-    // RFC 9001 §6: "endpoints MUST treat the receipt of a TLS KeyUpdate message
-    // as a connection error of type 0x010a" — but we silently ignore it.
+    // QUIC updates keys with the Key Phase bit, never a TLS KeyUpdate (RFC
+    // 9001 §6): one received, in any space, closes the connection with 0x010a
+    // (TLS_RECEIVABLE, in processCryptoFrame); one TLS would send is not sent
+    // (tls_bridge).
   }
 
 
@@ -2369,12 +2372,21 @@ function QUICConnection(options) {
       );
     }
 
-    if (!decrypted || !decrypted.plaintext || decrypted.plaintext.byteLength === 0) {
+    if (!decrypted || !decrypted.plaintext) {
       if (DEBUG) console.log('[quic] decrypt failed: ' + space + ' raw_len=' + pkt.raw.byteLength + ' first20=' + Array.from(pkt.raw.slice(0, 20)).map(function(b){ return b.toString(16).padStart(2,'0'); }).join(' ') + ' recv_cid_len=' + (recvCid ? recvCid.byteLength : 'null') + ' has_keys=' + !!readKeys + ' largest_pn=' + context.recv_pn_largest[space]);
       return;
     }
 
     if (DEBUG) console.log('[quic] decrypted ' + space + ' pn=' + decrypted.packet_number + ' len=' + decrypted.plaintext.byteLength);
+
+    // The reserved bits, now that the packet is authenticated: set, it is a
+    // PROTOCOL_VIOLATION (RFC 9000 §17.2: 0x0c of a long header; §17.3.1:
+    // 0x18 of a short one). An empty payload goes on to the frames, where a
+    // packet with none is one too (§12.4).
+    if (decrypted.first_byte & ((decrypted.first_byte & 0x80) ? 0x0c : 0x18)) {
+      close(0x0a, 'reserved header bits set in a ' + space + ' packet');
+      return;
+    }
 
     // RFC 9000 §8.1: "A server might wish to validate the client address
     // before starting the cryptographic handshake. [...] the server MAY
@@ -2682,10 +2694,15 @@ function QUICConnection(options) {
       } else if (frame.type === 'streams_blocked_bidi' || frame.type === 'streams_blocked_uni') {
         // The peer has used every stream we granted. Ack-eliciting like any
         // frame but ACK/PADDING/CONNECTION_CLOSE (it used to fall through
-        // unacknowledged); answered with our current limit, which also
-        // recovers a lost MAX_STREAMS, as DATA_BLOCKED does for MAX_DATA.
+        // unacknowledged). Blocked below our current limit, it missed a
+        // MAX_STREAMS: sent again — as DATA_BLOCKED recovers MAX_DATA. At it,
+        // the peer has our limit already, and a MAX_STREAMS for each such
+        // frame would be one frame of ours for every one of its.
         ackEliciting = true;
-        queueControl(frame.type === 'streams_blocked_bidi' ? 'ms_bidi' : 'ms_uni');
+        var sbBidi = frame.type === 'streams_blocked_bidi';
+        if (frame.limit < (sbBidi ? context.local_max_streams_bidi : context.local_max_streams_uni)) {
+          queueControl(sbBidi ? 'ms_bidi' : 'ms_uni');
+        }
       } else if (frame.type === 'data_blocked') {
         // The peer is stalled on our connection window. Our MAX_DATA may have
         // been lost (window updates are sent once, unrecovered) — re-send the
@@ -2955,6 +2972,21 @@ function QUICConnection(options) {
   // which rides in the ticket, never came back to it.
   var NEW_SESSION_TICKET = 0x04;
 
+  // Which TLS messages each side may receive, in which space (RFC 9001 §4,
+  // Table 1; RFC 8446 §4). TLS itself does not know the spaces — they are
+  // QUIC's encryption levels — so they are held to here, for every message,
+  // before TLS sees it. Never in any space: KeyUpdate (§6 — QUIC updates its
+  // keys itself), EndOfEarlyData (§8.3), anything a client sends to a client
+  // or a server to a server. Any other: unexpected_message (§4.8, §6).
+  //   1 ClientHello · 2 ServerHello (a HelloRetryRequest included) ·
+  //   4 NewSessionTicket · 8 EncryptedExtensions · 11 Certificate ·
+  //   13 CertificateRequest · 15 CertificateVerify · 20 Finished ·
+  //   25 CompressedCertificate (RFC 8879)
+  var TLS_RECEIVABLE = {
+    server: { initial: [1], handshake: [11, 15, 20, 25], app: [] },
+    client: { initial: [2], handshake: [8, 11, 13, 15, 20, 25], app: [NEW_SESSION_TICKET] }
+  };
+
   // Reassembly, per space. In order: `q`, the bytes received and not yet
   // read as TLS messages (pieces, `qlen` of them in all), up to `end`.
   // Ahead of a gap: `ahead`, pieces sorted by offset that never overlap
@@ -3065,15 +3097,21 @@ function QUICConnection(options) {
     if (messages.length === 0) return;
     if (!tls) { if (DEBUG) console.log('[quic] initializing TLS bridge'); initTLS(); }
 
+    // Every message of the batch checked before TLS sees any: a Finished
+    // followed by a KeyUpdate closes the connection without the Finished
+    // answered first (a ticket, HANDSHAKE_DONE) — not after it.
+    var receivable = TLS_RECEIVABLE[context.isServer ? 'server' : 'client'][space];
+    for (var ci = 0; ci < messages.length; ci++) {
+      if (receivable.indexOf(messages[ci][0]) < 0) {
+        // TLS's unexpected_message as a CRYPTO_ERROR (RFC 9001 §4.8); a
+        // KeyUpdate is named as one (§6).
+        close(0x100 + 10, 'TLS message ' + messages[ci][0] + ' in the ' + space + ' space');
+        return;
+      }
+    }
     for (var mi = 0; mi < messages.length; mi++) {
       var msg = messages[mi];
       var msgType = msg[0];
-      if (space === 'app' && (context.isServer || msgType !== NEW_SESSION_TICKET)) {
-        // TLS's unexpected_message as a CRYPTO_ERROR (RFC 9001 §4.8); a
-        // KeyUpdate is named as one (§6).
-        close(0x100 + 10, 'TLS message ' + msgType + ' after the handshake');
-        return;
-      }
       // Closed by what an earlier message brought: the rest is not read.
       if (context.state === 'closing' || context.state === 'draining' || context.state === 'closed') return;
       if (DEBUG) console.log('[quic] → TLS msg #' + mi + ' type=0x' + msgType.toString(16) + ' len=' + msg.length);

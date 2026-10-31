@@ -159,6 +159,16 @@ function TLSBridge(options) {
   var handshakeSecretsEmitted = false;
   var appSecretsEmitted = false;
   var helloHandled = false;
+  // A handshake refused here, for what QUIC asks of TLS (RFC 9001): the
+  // alert closes the connection; nothing more is answered or sent.
+  var refused = false;
+  function refuse(alert, why) {
+    if (refused) return;
+    refused = true;
+    if (DEBUG) console.log('[tls] refused: ' + why);
+    ev.emit('alert', alert);
+    ev.emit('error', Object.assign(new Error(why), { code: 'ERR_QUIC_TLS' }));
+  }
   // A client's: what it keeps with each session it saves — the server's
   // transport parameters (tp), and the application's own (app: HTTP/3's
   // SETTINGS) once it has them — for 0-RTT next time.
@@ -363,31 +373,44 @@ function TLSBridge(options) {
     // 'handshakeMessage' with the parsed extensions, so we extract the 0x39 data,
     // parse it, and hand the params to the QUIC layer (which seeds remote_max_data,
     // max_ack_delay, ack_delay_exponent, etc. — previously hardcoded defaults).
+    //
+    // The extension is required (RFC 9001 §8.2): a ClientHello — every one, a
+    // second after a HelloRetryRequest included — or EncryptedExtensions
+    // without it is refused with missing_extension, before anything is
+    // answered. TLS itself has no reason to require it; QUIC does, so here.
     var peerParamsEmitted = false;
     session.on('handshakeMessage', function (type, data, message) {
-      if (peerParamsEmitted || !message || !Array.isArray(message.extensions)) return;
-      for (var i = 0; i < message.extensions.length; i++) {
-        var e = message.extensions[i];
-        if (e && (e.type === 0x39 || e.type === 57) && e.data) {
-          try {
-            var parsed = parse_transport_params(e.data, 0);
-            peerParamsEmitted = true;
-            if (DEBUG) console.log('[tls] peer transport params parsed (' + e.data.length + 'B)');
-            // A client keeps, with the sessions this connection saves, the
-            // server's parameters that 0-RTT must stay within (RFC 9000
-            // §7.4.1) — given back with the early secret next time.
-            if (!isServer) keepAppData('tp', rememberedParams(parsed));
-            ev.emit('peerTransportParams', parsed);
-          } catch (err) {
-            if (DEBUG) console.log('[tls] peer transport params parse failed: ' + err.message);
-          }
-          break;
-        }
+      var carrier = isServer ? 'client_hello' : 'encrypted_extensions';
+      if (type !== carrier || refused) return;
+      var ext = null;
+      var list = (message && Array.isArray(message.extensions)) ? message.extensions : [];
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i];
+        if (e && (e.type === 0x39 || e.type === 57) && e.data) { ext = e; break; }
       }
+      if (!ext) { refuse(109, 'no quic_transport_parameters in the ' + type); return; }
+      if (peerParamsEmitted) return;
+      var parsed;
+      try {
+        parsed = parse_transport_params(ext.data, 0);
+      } catch (err) {
+        // RFC 9000 §7.4: TRANSPORT_PARAMETER_ERROR, not a connection that
+        // goes on with the defaults.
+        refused = true;
+        ev.emit('transportParamsError', 'quic_transport_parameters: ' + err.message);
+        return;
+      }
+      peerParamsEmitted = true;
+      if (DEBUG) console.log('[tls] peer transport params parsed (' + ext.data.length + 'B)');
+      // A client keeps, with the sessions this connection saves, the
+      // server's parameters that 0-RTT must stay within (RFC 9000
+      // §7.4.1) — given back with the early secret next time.
+      if (!isServer) keepAppData('tp', rememberedParams(parsed));
+      ev.emit('peerTransportParams', parsed);
     });
 
     session.on('hello', function () {
-      if (helloHandled) return; // prevent double-fire
+      if (helloHandled || refused) return; // prevent double-fire
       helloHandled = true;
       if (DEBUG) console.log('[tls] hello — configuring TLS');
 
@@ -433,6 +456,15 @@ function TLSBridge(options) {
       // open until the handshake timeout with nothing reported.
       if (type === 'alert') {
         if (data && data.length >= 2 && data[0] === 2) ev.emit('alert', data[1]);
+        return;
+      }
+      // Refused above: nothing more of this handshake goes out.
+      if (refused) return;
+      // Never sent over QUIC (RFC 9001 §6, §8.3), whatever TLS would do over
+      // TCP: a KeyUpdate (QUIC has its own), an EndOfEarlyData. Should TLS
+      // make one, the connection ends — internal_error — rather than send it.
+      if (type === 'key_update' || type === 'end_of_early_data') {
+        refuse(80, 'TLS produced a ' + type + ', which QUIC never sends');
         return;
       }
       var quicEpoch;
@@ -525,7 +557,6 @@ function TLSBridge(options) {
     on: function (name, fn) { ev.on(name, fn); },
     off: function (name, fn) { ev.off(name, fn); },
     feedMessage: feedMessage,
-    requestKeyUpdate: function () { if (session) session.requestKeyUpdate(true); },
     getHandshakeSecrets: function () {
       if (!session) return null;
       var hs = session.getHandshakeSecrets();
