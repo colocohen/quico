@@ -5019,6 +5019,20 @@ function QUICConnection(options) {
         // and pacing to ~0.1 Mbps, just as the page's subresources were
         // requested. Measured in Chrome: 1.5 MB of subresources took 1.6-2.4 s
         // on the first page of a connection, against ~0.1 s over HTTP/2.
+        //
+        // In Startup with no estimate yet, any sample raises it (BBR's max_bw
+        // filter starts at 0, draft-ietf-ccwg-bbr §5.2.1). A connection whose
+        // rounds are all app-limited from the start (media sent at its own
+        // pace, below the link's rate) otherwise never gets one: startupCap()
+        // stays Infinity, each ACK of new data grows the window, and once the
+        // media outgrows the link the window no longer limits it. A low first
+        // sample does not bring back the 2-packet window above: in Startup
+        // the round end below sets the window to cwnd_gain × BDP, never below
+        // the initial window (BBR's SetCwnd grows it there only while it is
+        // below that target, draft-ietf-ccwg-bbr §5.6.4.6). Only in Startup:
+        // later the estimate is null again once a quiet connection's samples
+        // age out of the 10-round filter below, and there nothing keeps a
+        // sparse update's rate from setting the window to its floor.
         var roundAppLimited = context.bbr_round_app_limited;
         context.bbr_round_app_limited = false;
         // Careful Resume's Safe Retreat: the window and the rate stay where
@@ -5027,7 +5041,8 @@ function QUICConnection(options) {
         var crRetreat = !!(context.cr && context.cr.phase === 'safe_retreat');
         if (!crRetreat && roundDur >= 1 && roundDelivered > 0) {
           var roundRate = (roundDelivered * 1000) / roundDur;
-          if (!roundAppLimited || (context.bbr_btlbw !== null && roundRate > context.bbr_btlbw)) {
+          if (!roundAppLimited || (context.bbr_btlbw !== null && roundRate > context.bbr_btlbw) ||
+              (context.bbr_btlbw === null && context.bbr_state === 'startup')) {
             context.bbr_btlbw_samples.push({ round: context.bbr_round_count, rate: roundRate });
           }
         }
