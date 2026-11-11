@@ -13,6 +13,8 @@
  */
 
 import dgram from 'node:dgram';
+import dns from 'node:dns';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import { DEBUG, Emitter } from './utils.js';
 import {
@@ -930,9 +932,10 @@ function createQuicServer(options) {
     //
     // A failure on one family is also not fatal on its own. Only if BOTH fail
     // is there nothing to listen on, and that is reported as an error.
-    var pending = 2;
+    var pending = 0;
     var bound = 0;
     var lastErr = null;
+    var err4 = null;
 
     function settle(err) {
       if (err) lastErr = err;
@@ -942,49 +945,84 @@ function createQuicServer(options) {
         ev.emit('error', lastErr || new Error('failed to bind UDP on port ' + port));
         return;
       }
+      // IPv4 failing while IPv6 serves is still the application's to know; a
+      // total failure is reported once, just above.
+      if (err4) ev.emit('error', err4);
+      // Its handler may have closed the server: then nothing is listening.
+      if (shutDown) return;
       if (typeof callback === 'function') callback();
     }
 
-    udp4 = dgram.createSocket('udp4');
-    udp4.on('message', onUdpMessage);
-    var bound4 = false;
-    udp4.on('error', function (err) {
-      // A bind failure arrives before we are listening; anything later is a
-      // runtime socket error and belongs to the consumer, and the socket goes
-      // on serving.
-      if (bound4) {
-        if (!isDepartedPeer(err)) ev.emit('error', err);
-        return;
-      }
-      // Node keeps a socket's handle open after a failed bind: close it here.
-      udp4.close();
-      udp4 = null;
-      settle(err);
-      ev.emit('error', err);
-    });
-    var host4 = host.indexOf('.') !== -1 ? host : '0.0.0.0';
-    if (!refed) udp4.unref();
-    udp4.bind(port, host4, function () { bound4 = true; growBuffers(udp4); settle(null); });
+    // An address binds its own family alone: listen(port, '127.0.0.1') must
+    // not open '::' on every interface too. A wildcard binds both, and a
+    // hostname is looked up once: each family it has binds its first address,
+    // so 'localhost' stays on loopback.
+    if (host === '::' || host === '0.0.0.0') bindFamilies('0.0.0.0', '::');
+    else if (net.isIP(host) === 4) bindFamilies(host, null);
+    else if (net.isIP(host) === 6) bindFamilies(null, host);
+    else {
+      dns.lookup(host, { all: true }, function (err, addresses) {
+        if (shutDown) return;
+        if (err) { ev.emit('error', err); return; }
+        bindFamilies(firstOf(addresses, 4), firstOf(addresses, 6));
+      });
+    }
 
-    udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
-    udp6.on('message', onUdpMessage);
-    var bound6 = false;
-    udp6.on('error', function (err) {
-      // A runtime error, as on udp4.
-      if (bound6) {
-        if (!isDepartedPeer(err)) ev.emit('error', err);
-        return;
+    function firstOf(addresses, family) {
+      for (var i = 0; i < addresses.length; i++) {
+        if (addresses[i].family === family) return addresses[i].address;
       }
-      udp6.close();
-      udp6 = null;
-      // No IPv6 on this host is ordinary, not an error the application needs
-      // to see — the v4 socket is serving. Only a total failure is emitted,
-      // from settle() above.
-      settle(err);
-    });
-    var host6 = host.indexOf(':') !== -1 ? host : '::';
-    if (!refed) udp6.unref();
-    udp6.bind(port, host6, function () { bound6 = true; growBuffers(udp6); settle(null); });
+      return null;
+    }
+
+    function bindFamilies(host4, host6) {
+      pending = (host4 ? 1 : 0) + (host6 ? 1 : 0);
+      if (host4) bind4(host4);
+      if (host6) bind6(host6);
+    }
+
+    function bind4(host4) {
+      udp4 = dgram.createSocket('udp4');
+      udp4.on('message', onUdpMessage);
+      var bound4 = false;
+      udp4.on('error', function (err) {
+        // A bind failure arrives before we are listening; anything later is a
+        // runtime socket error and belongs to the consumer, and the socket goes
+        // on serving.
+        if (bound4) {
+          if (!isDepartedPeer(err)) ev.emit('error', err);
+          return;
+        }
+        // Node keeps a socket's handle open after a failed bind: close it here.
+        udp4.close();
+        udp4 = null;
+        err4 = err;
+        settle(err);
+      });
+      if (!refed) udp4.unref();
+      udp4.bind(port, host4, function () { bound4 = true; growBuffers(udp4); settle(null); });
+    }
+
+    function bind6(host6) {
+      udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
+      udp6.on('message', onUdpMessage);
+      var bound6 = false;
+      udp6.on('error', function (err) {
+        // A runtime error, as on udp4.
+        if (bound6) {
+          if (!isDepartedPeer(err)) ev.emit('error', err);
+          return;
+        }
+        udp6.close();
+        udp6 = null;
+        // No IPv6 on this host is ordinary, not an error the application needs
+        // to see — the v4 socket is serving. Only a total failure is emitted,
+        // from settle() above.
+        settle(err);
+      });
+      if (!refed) udp6.unref();
+      udp6.bind(port, host6, function () { bound6 = true; growBuffers(udp6); settle(null); });
+    }
 
     startSweepTimer();
   }
