@@ -956,6 +956,8 @@ function createQuicServer(options) {
         if (!isDepartedPeer(err)) ev.emit('error', err);
         return;
       }
+      // Node keeps a socket's handle open after a failed bind: close it here.
+      udp4.close();
       udp4 = null;
       settle(err);
       ev.emit('error', err);
@@ -973,6 +975,7 @@ function createQuicServer(options) {
         if (!isDepartedPeer(err)) ev.emit('error', err);
         return;
       }
+      udp6.close();
       udp6 = null;
       // No IPv6 on this host is ordinary, not an error the application needs
       // to see — the v4 socket is serving. Only a total failure is emitted,
