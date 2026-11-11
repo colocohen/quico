@@ -1704,6 +1704,7 @@ function createServer(options, handler) {
 
   return {
     listen: function (p, h, cb) { closingServer = null; return qserver.listen(p, h, cb); },
+    address: qserver.address,
     close: close,
     closeIdleConnections: closeIdleConnections,
     closeAllConnections: closeAllConnections,

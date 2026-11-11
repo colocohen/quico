@@ -946,6 +946,7 @@ function createServer(options, handler) {
         closed = false;
         // After listen(0) the OS chose the port; Alt-Svc must name that one.
         if (port === 0 && tcpServer && tcpServer.address()) altSvcPort = tcpServer.address().port;
+        else if (port === 0 && bindUdp) altSvcPort = h3srv.address().port;
         ev.emit('listening');
         if (typeof callback === 'function') callback();
       }
@@ -956,6 +957,15 @@ function createServer(options, handler) {
     if (remaining === 0) { remaining = 1; setImmediate(done); return server; }
 
     if (ref === false) { if (enableH3) h3srv.unref(); if (tcpServer) tcpServer.unref(); }
+    // After listen(0), QUIC takes the port the OS gave TCP: the port Alt-Svc
+    // names and address() reports.
+    if (bindUdp && needsTcp && port === 0) {
+      tcpServer.listen(0, host || '0.0.0.0', function () {
+        h3srv.listen(tcpServer.address().port, host, done);
+        done();
+      });
+      return server;
+    }
     if (bindUdp) h3srv.listen(port, host, done);
     if (needsTcp) tcpServer.listen(port, host || '0.0.0.0', done);
 

@@ -977,11 +977,13 @@ function createQuicServer(options) {
 
     function bindFamilies(host4, host6) {
       pending = (host4 ? 1 : 0) + (host6 ? 1 : 0);
-      if (host4) bind4(host4);
-      if (host6) bind6(host6);
+      // IPv6 binds once IPv4 has: after listen(0) it takes the port the OS
+      // gave IPv4, one server, one port.
+      if (host4) bind4(host4, function () { if (host6) bind6(host6); });
+      else bind6(host6);
     }
 
-    function bind4(host4) {
+    function bind4(host4, then) {
       udp4 = dgram.createSocket('udp4');
       udp4.on('message', onUdpMessage);
       var bound4 = false;
@@ -998,9 +1000,16 @@ function createQuicServer(options) {
         udp4 = null;
         err4 = err;
         settle(err);
+        then();
       });
       if (!refed) udp4.unref();
-      udp4.bind(port, host4, function () { bound4 = true; growBuffers(udp4); settle(null); });
+      udp4.bind(port, host4, function () {
+        bound4 = true;
+        port = this.address().port;
+        growBuffers(this);
+        settle(null);
+        then();
+      });
     }
 
     function bind6(host6) {
@@ -1021,7 +1030,12 @@ function createQuicServer(options) {
         settle(err);
       });
       if (!refed) udp6.unref();
-      udp6.bind(port, host6, function () { bound6 = true; growBuffers(udp6); settle(null); });
+      udp6.bind(port, host6, function () {
+        bound6 = true;
+        port = this.address().port;
+        growBuffers(this);
+        settle(null);
+      });
     }
 
     startSweepTimer();
@@ -1146,6 +1160,8 @@ function createQuicServer(options) {
   return {
     listen: listen,
     close: close,
+    // node:dgram's, of the socket listening: the port listen(0) was given.
+    address: function () { var s = udp4 || udp6; return s ? s.address() : null; },
     stopAccepting: function () { accepting = false; },
     get connectionCount() { return connectionCount; },
     // node:dgram's: whether the process may exit while this listens.
