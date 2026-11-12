@@ -2461,7 +2461,7 @@ For non-HTTP protocols over QUIC, or full control of the connection.
 | `tokenSecret` | `Buffer` (≥ 16 bytes) | random | Address-validation token secret (Retry, NEW_TOKEN), as `createServer` |
 | `socket` / `socket6` | `dgram.Socket` | `null` | External, already-bound UDP sockets |
 
-Returns `{ listen, close, on, handlePacket, hasConnection }` plus the runtime getters and
+Returns `{ listen, address, close, on, handlePacket, hasConnection }` plus the runtime getters and
 setters for ticket keys, address validation, the reset secret and the token secret. The `'connection'`
 event fires with `(quicConnection, peer)`.
 
