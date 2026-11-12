@@ -395,6 +395,7 @@ function ProxyH3Connection(key, proxy, o, ech) {
     if (self.state !== 'connecting') return;
     self.udp = createQuicClientSocket({
       remoteIp: ip, remotePort: proxy.port, hostname: o.servername || proxy.hostname,
+      socketBufferSize: o.socketBufferSize,
       rejectUnauthorized: o.rejectUnauthorized !== false, ca: o.ca || null,
       key: o.key || null, cert: o.cert || null, passphrase: o.passphrase,
       quicVersions: o.quicVersions,

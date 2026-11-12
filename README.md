@@ -155,7 +155,7 @@ stack trace ends in code you can open, not in a `.node` binary.
 |---|---|
 | **Node.js 18+** | ESM only (`import`). Tested on 18, 20 and 22. |
 | **No compiler** | Pure JavaScript — no native addons. |
-| **Dependencies** | [`lemon-tls`](https://github.com/colocohen/lemon-tls) (TLS 1.3) and [`flat-ranges`](https://www.npmjs.com/package/flat-ranges) (range arithmetic). Nothing else. |
+| **Dependencies** | [`lemon-tls`](https://github.com/colocohen/lemon-tls) (TLS 1.3), [`flat-ranges`](https://www.npmjs.com/package/flat-ranges) (range arithmetic), and `cryptographic-formats` (certificate formats — the dates WebTransport's `serverCertificateHashes` checks; lemon-tls reads certificates with it too). Nothing else. |
 
 ```bash
 npm install quico
@@ -2461,7 +2461,7 @@ For non-HTTP protocols over QUIC, or full control of the connection.
 | `tokenSecret` | `Buffer` (≥ 16 bytes) | random | Address-validation token secret (Retry, NEW_TOKEN), as `createServer` |
 | `socket` / `socket6` | `dgram.Socket` | `null` | External, already-bound UDP sockets |
 
-Returns `{ listen, address, close, on, handlePacket, hasConnection }` plus the runtime getters and
+Returns `{ listen, close, on, handlePacket, hasConnection }` plus the runtime getters and
 setters for ticket keys, address validation, the reset secret and the token secret. The `'connection'`
 event fires with `(quicConnection, peer)`.
 
@@ -2507,7 +2507,7 @@ and you route datagrams yourself.
 | `quic.earlyDataStatus` | 0-RTT: `null` (none), `'offered'` (a client's, undecided), `'accepted'`, `'rejected'` |
 | `quic.isEarlyStream(id)` | Server: whether the stream was opened by 0-RTT data |
 | `quic.whenConfirmed(cb)` | `cb()` once the handshake is confirmed (RFC 9001 §4.1.2), at once if it is |
-| `quic.alpnProtocol`, `servername`, `getCertificate()`, `getTicketInfo()`, `isSessionReused()` | What the handshake decided, with `TLSSocket`'s names |
+| `quic.alpnProtocol`, `servername`, `getCertificate()`, `getTicketInfo()`, `isSessionReused()` | What the handshake decided, with `TLSSocket`'s names — `getCertificate()` in its shape too (`subject` and `issuer` as objects, `{ CN, O, … }`), lemon-tls's `certificateObject` |
 | `quic.on(event, fn)` / `off` | Event subscription |
 
 **Events:** `'connect'`, `'stream'` (`id, data, fin`), `'stream_reset'` (`id, code,

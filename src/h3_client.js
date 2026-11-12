@@ -248,6 +248,7 @@ function request(options, callback) {
     udpSocket = createQuicClientSocket({
       remoteIp: remoteIp,
       remotePort: remotePort,
+      socketBufferSize: options.socketBufferSize,
       // SNI and the name the certificate is checked for: tls.connect's
       // servername where given.
       hostname: options.servername || hostname,

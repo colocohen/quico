@@ -17,7 +17,6 @@ import {
   createSecureContext as _lemonCreateSecureContext,
   certificateObject
 } from 'lemon-tls';
-import { X509Certificate } from 'node:crypto';
 import { DEBUG, Emitter } from './utils.js';
 import { rootCertificates as lemonRoots, parseEcdhCurve as lemonParseEcdhCurve, DEFAULT_SERVER_GROUPS as lemonServerGroups,
          DEFAULT_SIGNATURE_SCHEMES as lemonSigSchemes } from 'lemon-tls';
@@ -693,27 +692,17 @@ function TLSBridge(options) {
      * fingerprint, fingerprint256, serialNumber, raw }, or {} when none. On a
      * server, the one the SNI lookup chose; on a resumed connection, the one
      * the lookup chose again for the same name.
+     *
+     * lemon-tls's certificateObject: the one implementation, the one its
+     * TLSSocket and getPeerCertificate use. This built it apiece, with
+     * subject and issuer as OpenSSL's text ('CN=a\nO=b') where node:tls
+     * gives objects ({ CN: 'a', O: 'b' }).
      */
     getCertificate: function () {
       var chain = session && session.getCertificate ? session.getCertificate() : null;
       if (!chain || chain.length === 0) return {};
-      try {
-        var der = chain[0].cert || chain[0];
-        var x509 = new X509Certificate(Buffer.isBuffer(der) ? der : Buffer.from(der));
-        return {
-          subject: x509.subject,
-          issuer: x509.issuer,
-          subjectaltname: x509.subjectAltName,
-          valid_from: x509.validFrom,
-          valid_to: x509.validTo,
-          fingerprint: x509.fingerprint,
-          fingerprint256: x509.fingerprint256,
-          serialNumber: x509.serialNumber,
-          raw: der
-        };
-      } catch (e) {
-        return {};
-      }
+      var der = chain[0].cert || chain[0];
+      return certificateObject(Buffer.isBuffer(der) ? der : Buffer.from(der)) || {};
     },
 
     close: function () { if (session && session.close) session.close(); }

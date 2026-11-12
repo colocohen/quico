@@ -744,7 +744,7 @@ function QUICConnection(options) {
     current_limit_packets_per_sec:   12000,   // = init_; BBR rewrites at round-end
     max_limit_bytes_per_sec:         14000000, // ceiling ~14 MB/s — coherent ↑
     min_limit_bytes_per_sec:         12000,   // floor ~96 kbps — avoid 0/deadlock
-    init_limit_bytes_per_sec:        14000000,
+    init_limit_bytes_per_sec:        14000000, // until the first RTT sample (bbrInitPacingRate)
     current_limit_bytes_per_sec:     14000000, // = init_; BBR rewrites at round-end
 
     burst_timer: null,
@@ -931,6 +931,10 @@ function QUICConnection(options) {
     // a round says how much the APPLICATION produced, not what the path can
     // carry — see the sample filter at round end.
     bbr_round_app_limited: false,
+    // The most bytes in flight in this round and in the last — whether the
+    // window is in use, for Startup's growth (growStartupWindow).
+    bbr_peak_inflight: 0,
+    bbr_prev_peak_inflight: 0,
     bbr_full_bw: 0,             // highest BtlBw seen — Startup plateau detector
     bbr_full_bw_count: 0,       // consecutive rounds without ≥25% BtlBw growth
     // ACK aggregation (BBR's extra_acked): how far ACKs ran ahead of what
@@ -4244,6 +4248,7 @@ function QUICConnection(options) {
     if (context.srtt === null) {
       context.srtt = adjusted;
       context.rttvar = adjusted / 2;
+      bbrInitPacingRate();
     } else {
       context.rttvar = 0.75 * context.rttvar + 0.25 * Math.abs(context.srtt - adjusted);
       context.srtt = 0.875 * context.srtt + 0.125 * adjusted;
@@ -4360,10 +4365,23 @@ function QUICConnection(options) {
     if (extra > context.bbr_ea_round_max) context.bbr_ea_round_max = extra;
   }
 
+  // Whether a window of w bytes is in use: in flight reached half of it,
+  // this round or the last — slow start's test for being limited by the
+  // window (Linux tcp_is_cwnd_limited; RFC 9002 §7.8).
+  function windowInUse(w) {
+    return 2 * Math.max(context.bbr_peak_inflight, context.bbr_prev_peak_inflight) >= w;
+  }
+
   function growStartupWindow(newlyAckedBytes) {
     if (context.bbr_state !== 'startup' || !(newlyAckedBytes > 0)) return;
     var cap = startupCap(), cur = context.current_limit_bytes_in_flight;
     if (cur >= cap) return;
+    // Only a window in use grows (windowInUse). A sender with less to send
+    // than the window — media below the path's rate — grew it by every byte
+    // acknowledged, without end (1.2 Mbit/s for 3 s: 25 KB → 496 KB), a
+    // window nothing had measured, and the next burst (a keyframe) went out
+    // in it at once, into the bottleneck's queue.
+    if (!windowInUse(cur)) return;
     context.current_limit_bytes_in_flight = Math.min(context.max_limit_bytes_in_flight, cap,
       cur + newlyAckedBytes);
     context.current_limit_packets_in_flight = Math.min(context.max_limit_packets_in_flight,
@@ -4424,6 +4442,24 @@ function QUICConnection(options) {
       Math.max(context.min_limit_packets_in_flight,
         Math.round(context.current_limit_bytes_in_flight / context.current_limit_packet_payload)));
   }
+  // Startup's first pacing rate, from the first RTT sample: the initial
+  // window over the round trip, at Startup's gain (BBR's BBRInitPacingRate,
+  // §5.6.2; quiche the same). It was the ceiling, 14 MB/s — and Startup only
+  // raises the rate, so it stayed there: Startup was not paced at all, the
+  // window left at once at ~112 Mbit/s, into the queue of any slower path.
+  // A media sender rarely leaves Startup, and every keyframe went so (a
+  // 90 KB one, a 20 Mbit/s link with a 64 KB queue: ~20 drops a keyframe);
+  // on a long path the first rounds' bursts were dropped, Startup ended on
+  // those losses with ~14 of 20 Mbit/s measured, and a 4 MB transfer took
+  // 3.7-3.9 s instead of 2.6 (150 ms). The cost: the initial window takes
+  // RTT/2.89 to leave — a first page's body ~27 ms later at 150 ms, within
+  // noise at 40. A new path starts here again (resetPathEstimates: the rate
+  // back to init_, srtt null until its first sample).
+  function bbrInitPacingRate() {
+    if (context.bbr_state !== 'startup') return;
+    setPacingRate(BBR_STARTUP_GAIN * context.init_limit_bytes_in_flight / (Math.max(context.srtt, 1) / 1000));
+  }
+
   function setPacingRate(bps) {
     context.current_limit_bytes_per_sec = Math.max(context.min_limit_bytes_per_sec,
       Math.min(context.max_limit_bytes_per_sec, bps));
@@ -5010,7 +5046,10 @@ function QUICConnection(options) {
         var roundDelivered = context.delivered - context.bbr_round_start_delivered;
         // An app-limited sample is kept only if it RAISES the estimate
         // (BBR delivery-rate sampling: such a sample can show the path is at
-        // least that fast, never that it is slower).
+        // least that fast, never that it is slower). With no estimate yet,
+        // any sample raises it — BBR's max_bw starts at 0 (§5.2.1): a
+        // connection that never filled the pipe (media below the path's
+        // rate) had no estimate at all, estimatedSendRate null throughout.
         //
         // Without this, the first round of every connection — which carries
         // only a small HTML response and some ACK-only packets — measured a
@@ -5019,20 +5058,6 @@ function QUICConnection(options) {
         // and pacing to ~0.1 Mbps, just as the page's subresources were
         // requested. Measured in Chrome: 1.5 MB of subresources took 1.6-2.4 s
         // on the first page of a connection, against ~0.1 s over HTTP/2.
-        //
-        // In Startup with no estimate yet, any sample raises it (BBR's max_bw
-        // filter starts at 0, draft-ietf-ccwg-bbr §5.2.1). A connection whose
-        // rounds are all app-limited from the start (media sent at its own
-        // pace, below the link's rate) otherwise never gets one: startupCap()
-        // stays Infinity, each ACK of new data grows the window, and once the
-        // media outgrows the link the window no longer limits it. A low first
-        // sample does not bring back the 2-packet window above: in Startup
-        // the round end below sets the window to cwnd_gain × BDP, never below
-        // the initial window (BBR's SetCwnd grows it there only while it is
-        // below that target, draft-ietf-ccwg-bbr §5.6.4.6). Only in Startup:
-        // later the estimate is null again once a quiet connection's samples
-        // age out of the 10-round filter below, and there nothing keeps a
-        // sparse update's rate from setting the window to its floor.
         var roundAppLimited = context.bbr_round_app_limited;
         context.bbr_round_app_limited = false;
         // Careful Resume's Safe Retreat: the window and the rate stay where
@@ -5041,8 +5066,7 @@ function QUICConnection(options) {
         var crRetreat = !!(context.cr && context.cr.phase === 'safe_retreat');
         if (!crRetreat && roundDur >= 1 && roundDelivered > 0) {
           var roundRate = (roundDelivered * 1000) / roundDur;
-          if (!roundAppLimited || (context.bbr_btlbw !== null && roundRate > context.bbr_btlbw) ||
-              (context.bbr_btlbw === null && context.bbr_state === 'startup')) {
+          if (!roundAppLimited || roundRate > (context.bbr_btlbw || 0)) {
             context.bbr_btlbw_samples.push({ round: context.bbr_round_count, rate: roundRate });
           }
         }
@@ -5061,6 +5085,8 @@ function QUICConnection(options) {
         context.bbr_round_start_pn = context.send_pn.app; // next PN must be acked for the next round
         context.bbr_round_start_delivered = context.delivered;
         context.bbr_round_start_time = ackNow;
+        context.bbr_prev_peak_inflight = context.bbr_peak_inflight;
+        context.bbr_peak_inflight = context.app_bytes_in_flight;
 
         var BBR_BTLBW_WINDOW = 10; // rounds
         var cutoff = context.bbr_round_count - BBR_BTLBW_WINDOW;
@@ -5073,7 +5099,11 @@ function QUICConnection(options) {
           }
         }
         context.bbr_btlbw_samples = kept;
-        context.bbr_btlbw = maxRate;
+        // No sample left in the window — every round since app-limited and
+        // below the estimate: the estimate stands (BBR's max filter changes
+        // only on a sample it takes). It went back to null after ten such
+        // rounds, and the state machine below with it, mid-connection.
+        if (kept.length > 0) context.bbr_btlbw = maxRate;
 
         // Derived in-flight target. Uses bbr_min_rtt (RTprop, windowed) in seconds.
         if (!crRetreat && context.bbr_btlbw !== null && context.bbr_min_rtt !== null) {
@@ -5154,6 +5184,9 @@ function QUICConnection(options) {
           // ── Write the controls, clamped to [min,max] (the hard safety net). ──
           var clamp = function (v, lo, hi) { return Math.max(lo, Math.min(hi, v)); };
 
+          // The window as the ACKs left it — Startup's floor, below; read
+          // before it is written.
+          var ackGrown = context.current_limit_bytes_in_flight;
           var targetInflight = clamp(cwnd_gain * context.bbr_bdp,
             context.min_limit_bytes_in_flight, context.max_limit_bytes_in_flight);
           context.current_limit_bytes_in_flight = targetInflight;
@@ -5172,8 +5205,18 @@ function QUICConnection(options) {
           if (context.bbr_state === 'startup') {
             // …within startupCap, which may now be lower than what ACKs grew
             // the window to (the BDP of this round is the measured one).
+            // The window before the write above: compared with what was
+            // just written, the max was of a value with itself, and every
+            // round end set the window to max(IW, 2·BDP) — what the ACKs
+            // had grown it by, gone. Kept while it is in use; a window the
+            // last rounds did not fill — a burst (a keyframe) grew it, then
+            // the sender went quiet — goes back to the BDP's: the next burst
+            // left in all of it at Startup's rate, into the bottleneck's
+            // queue (RFC 7661: a window not in use is not validated). Not
+            // while Careful Resume's jump is out: that window is its own.
+            var floor = crJumpOut() || windowInUse(ackGrown) ? ackGrown : 0;
             targetInflight = Math.max(context.init_limit_bytes_in_flight,
-              Math.min(Math.max(targetInflight, context.current_limit_bytes_in_flight), startupCap()));
+              Math.min(Math.max(targetInflight, floor), startupCap()));
             context.current_limit_bytes_in_flight = targetInflight;
             context.current_limit_packets_in_flight = clamp(
               Math.round(targetInflight / context.current_limit_packet_payload),
@@ -6453,6 +6496,7 @@ function QUICConnection(options) {
     context.bbr_bdp = null;
     context.bbr_state = 'startup';
     context.bbr_round_app_limited = false;
+    context.bbr_peak_inflight = 0; context.bbr_prev_peak_inflight = 0;
     context.bbr_full_bw = 0;
     context.bbr_full_bw_count = 0;
     context.bbr_ea_start = 0; context.bbr_ea_delivered = 0; context.bbr_ea_round_max = 0;
@@ -6671,6 +6715,7 @@ function QUICConnection(options) {
           context.pkt_in_flight.set(pn, { bytes: encrypted.length, t: Date.now() });
           if (context.tlp_at === 0 || context.tlp_timer === null) tlpRearm(); else context.tlp_at = Date.now() + tlpDelay();
           context.app_bytes_in_flight += encrypted.length;
+          if (context.app_bytes_in_flight > context.bbr_peak_inflight) context.bbr_peak_inflight = context.app_bytes_in_flight;
         }
         // In flight = carrying STREAM data, which expireInFlight finds and
         // retires through its stream. 1-RTT CRYPTO is the control queue's to

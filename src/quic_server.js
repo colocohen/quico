@@ -16,7 +16,7 @@ import dgram from 'node:dgram';
 import dns from 'node:dns';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { DEBUG, Emitter } from './utils.js';
+import { DEBUG, Emitter, checkedSocketBufferSize, setSocketBuffers } from './utils.js';
 import {
   parse_quic_datagram,
   build_version_negotiation
@@ -120,6 +120,10 @@ function createQuicServer(options) {
   // When socket/socket6 are provided, the UDP layer is owned externally.
   // The caller demuxes packets and feeds them via handlePacket(msg, rinfo).
   // See RFC 9443 for the shared-port multiplexing scheme.
+  // The UDP sockets' buffers (utils.js): 4 MB by default — external ones
+  // too, as before (the demultiplexer that owns them may not have, and
+  // asking twice costs nothing); 0 or false leaves them all at the OS's.
+  var socketBufferSize = checkedSocketBufferSize(options.socketBufferSize, 'socketBufferSize');
   var externalSocket4 = options.socket  || null;
   var externalSocket6 = options.socket6 || null;
 
@@ -829,12 +833,14 @@ function createQuicServer(options) {
   // ============================================================
 
   // A client that has gone away: its port answers our datagrams with ICMP
-  // "port unreachable", which Bun reports as ECONNREFUSED (Node does not),
-  // on the socket or on a send's callback. It concerns that client alone
-  // (its connection ends at its idle timeout); the socket goes on serving
-  // the others.
+  // "port unreachable". Node does not report that on an unconnected UDP
+  // socket; Bun does, as ECONNREFUSED — an 'error' on the socket, or on a
+  // send's callback. It concerns that client alone (its connection ends at
+  // its idle timeout, as any silent peer's), not the socket: taken for a
+  // socket error it closed the server's socket, and with it every other
+  // client of that family (quico PR #12).
   function isDepartedPeer(err) {
-    return err.code === 'ECONNREFUSED';
+    return !!err && err.code === 'ECONNREFUSED';
   }
 
   function sendUdp(toIp, toPort, data) {
@@ -893,14 +899,8 @@ function createQuicServer(options) {
       // decrypted a second time and dropped as a duplicate, and every non-QUIC
       // packet — media included, on the hottest path there is — went through
       // the QUIC parser before being discarded.
-      if (externalSocket4) {
-        try { externalSocket4.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
-        try { externalSocket4.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
-      }
-      if (externalSocket6) {
-        try { externalSocket6.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
-        try { externalSocket6.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
-      }
+      if (externalSocket4) setSocketBuffers(externalSocket4, socketBufferSize);
+      if (externalSocket6) setSocketBuffers(externalSocket6, socketBufferSize);
       startSweepTimer();
       if (typeof callback === 'function') setImmediate(callback);
       return;
@@ -913,128 +913,106 @@ function createQuicServer(options) {
     // recovery engages and throughput collapses. See LOSS_PTO_PLAN 7.4: this
     // is what defeated the third pacer-calibration attempt.
     //
-    // try/catch because some platforms cap the value and throw; not being
-    // able to enlarge the buffer must not stop the server from listening.
-    function growBuffers(sock) {
-      try { sock.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
-      try { sock.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
-    }
+    // Not being able to enlarge the buffer must not stop the server from
+    // listening (setSocketBuffers).
+    function growBuffers(sock) { setSocketBuffers(sock, socketBufferSize); }
 
-    // Both sockets are attempted, and listening succeeds if EITHER binds.
-    //
-    // The callback used to hang off udp6.bind alone. On a host without IPv6 —
-    // a container, a CI runner, plenty of cloud instances — that bind fails
-    // with EAFNOSUPPORT and the callback is never called: listen() returns, the
-    // v4 socket is up and working, and the caller waits forever for a
-    // 'listening' that cannot arrive. Nothing logs, because the error goes to
-    // the 'error' event that a caller waiting on the callback has not reached
-    // yet.
-    //
-    // A failure on one family is also not fatal on its own. Only if BOTH fail
-    // is there nothing to listen on, and that is reported as an error.
-    var pending = 0;
-    var bound = 0;
-    var lastErr = null;
-    var err4 = null;
-
-    function settle(err) {
-      if (err) lastErr = err;
-      else bound++;
-      if (--pending > 0) return;
-      if (bound === 0) {
-        ev.emit('error', lastErr || new Error('failed to bind UDP on port ' + port));
-        return;
-      }
-      // IPv4 failing while IPv6 serves is still the application's to know; a
-      // total failure is reported once, just above.
-      if (err4) ev.emit('error', err4);
-      // Its handler may have closed the server: then nothing is listening.
-      if (shutDown) return;
-      if (typeof callback === 'function') callback();
-    }
-
-    // An address binds its own family alone: listen(port, '127.0.0.1') must
-    // not open '::' on every interface too. A wildcard binds both, and a
-    // hostname is looked up once: each family it has binds its first address,
-    // so 'localhost' stays on loopback.
-    if (host === '::' || host === '0.0.0.0') bindFamilies('0.0.0.0', '::');
+    // Which addresses: as node:net. An address binds its own family alone —
+    // '127.0.0.1' and '0.0.0.0' IPv4, '::1' IPv6; '::' (and no host) both;
+    // a hostname is looked up once, and each family it has binds its first
+    // address ('localhost': loopback, both families). Every address used to
+    // bind '::' unless it held a ':', and '0.0.0.0' unless it held a '.':
+    // listen(p, '127.0.0.1') answered on every IPv6 interface too, and
+    // listen(p, 'localhost') on every interface of both.
+    if (host === '::') bindFamilies('0.0.0.0', '::');
     else if (net.isIP(host) === 4) bindFamilies(host, null);
     else if (net.isIP(host) === 6) bindFamilies(null, host);
     else {
-      dns.lookup(host, { all: true }, function (err, addresses) {
+      dns.lookup(host, { all: true }, function (err, list) {
         if (shutDown) return;
         if (err) { ev.emit('error', err); return; }
-        bindFamilies(firstOf(addresses, 4), firstOf(addresses, 6));
+        bindFamilies(firstOf(list, 4), firstOf(list, 6));
       });
     }
 
-    function firstOf(addresses, family) {
-      for (var i = 0; i < addresses.length; i++) {
-        if (addresses[i].family === family) return addresses[i].address;
-      }
+    function firstOf(list, family) {
+      for (var i = 0; i < list.length; i++) if (list[i].family === family) return list[i].address;
       return null;
     }
 
-    function bindFamilies(host4, host6) {
-      pending = (host4 ? 1 : 0) + (host6 ? 1 : 0);
-      // IPv6 binds once IPv4 has: after listen(0) it takes the port the OS
-      // gave IPv4, one server, one port.
-      if (host4) bind4(host4, function () { if (host6) bind6(host6); });
-      else bind6(host6);
+    // The families one after the other, IPv4 first: after listen(0) IPv6
+    // takes the port the OS gave IPv4 — one server, one port, the one
+    // address() and Alt-Svc name. Each took a port of its own.
+    //
+    // Listening succeeds when every family binds, but for one the host does
+    // not have (familyMissing: no IPv6 in a container) while another did.
+    // Any other failure fails the listen() — the sockets that bound are
+    // closed, and one 'error' says why. Before, either family binding was
+    // enough: with IPv4's port taken (another server already on it) this
+    // one served IPv6 alone, and nothing said so.
+    function bindFamilies(addr4, addr6) {
+      var steps = [];
+      if (addr4) steps.push([false, addr4]);
+      if (addr6) steps.push([true, addr6]);
+      var errs = [], bound = 0;
+      (function next(i) {
+        if (shutDown) return;
+        if (i === steps.length) { settle(errs, bound); return; }
+        bindOne(steps[i][0], steps[i][1], function (err) {
+          if (!err) bound++;
+          else { errs.push(err); if (!familyMissing(err)) { settle(errs, bound); return; } }
+          next(i + 1);
+        });
+      })(0);
     }
 
-    function bind4(host4, then) {
-      udp4 = dgram.createSocket('udp4');
-      udp4.on('message', onUdpMessage);
-      var bound4 = false;
-      udp4.on('error', function (err) {
-        // A bind failure arrives before we are listening; anything later is a
-        // runtime socket error and belongs to the consumer, and the socket goes
-        // on serving.
-        if (bound4) {
-          if (!isDepartedPeer(err)) ev.emit('error', err);
-          return;
-        }
-        // Node keeps a socket's handle open after a failed bind: close it here.
-        udp4.close();
-        udp4 = null;
-        err4 = err;
-        settle(err);
-        then();
-      });
-      if (!refed) udp4.unref();
-      udp4.bind(port, host4, function () {
-        bound4 = true;
-        port = this.address().port;
-        growBuffers(this);
-        settle(null);
-        then();
-      });
+    function familyMissing(err) { return err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL'; }
+
+    // The callback used to hang off udp6.bind alone: on a host without IPv6
+    // it was never called, while the IPv4 socket served. It is called once
+    // the families are settled, whichever bound.
+    function settle(errs, bound) {
+      var fatal = null;
+      for (var i = 0; i < errs.length && !fatal; i++) if (!familyMissing(errs[i])) fatal = errs[i];
+      if (!fatal && bound === 0) fatal = errs[0] || new Error('failed to bind UDP on port ' + port);
+      if (fatal) {
+        if (udp4) { try { udp4.close(); } catch (e) {} udp4 = null; }
+        if (udp6) { try { udp6.close(); } catch (e) {} udp6 = null; }
+        ev.emit('error', fatal);
+        return;
+      }
+      if (typeof callback === 'function') callback();
     }
 
-    function bind6(host6) {
-      udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
-      udp6.on('message', onUdpMessage);
-      var bound6 = false;
-      udp6.on('error', function (err) {
-        // A runtime error, as on udp4.
-        if (bound6) {
-          if (!isDepartedPeer(err)) ev.emit('error', err);
-          return;
-        }
-        udp6.close();
-        udp6 = null;
-        // No IPv6 on this host is ordinary, not an error the application needs
-        // to see — the v4 socket is serving. Only a total failure is emitted,
-        // from settle() above.
-        settle(err);
+    // A socket whose bind fails is closed, not only dropped: it stayed open
+    // (no IPv6 on the host, the port taken), an object nothing could close
+    // once `udp4` / `udp6` no longer named it. The failure goes to settle()
+    // alone, which reports one error; it was also emitted here, so a
+    // listen() that failed emitted 'error' twice.
+    //
+    // An error after the bind is a runtime socket error: it belongs to the
+    // consumer, and the socket goes on serving — it is not closed. It was:
+    // the close ran for every error, so on Bun one departed client's
+    // ECONNREFUSED (isDepartedPeer, not reported at all) closed the socket,
+    // and the server answered no one of that family again. And `on`, not
+    // `once`: a second error with no listener left would throw.
+    function bindOne(v6, addr, done) {
+      var sock = dgram.createSocket(v6 ? { type: 'udp6', ipv6Only: true } : 'udp4'), isBound = false;
+      if (v6) udp6 = sock; else udp4 = sock;
+      sock.on('message', onUdpMessage);
+      sock.on('error', function (err) {
+        if (isBound) { if (!isDepartedPeer(err)) ev.emit('error', err); return; }
+        try { sock.close(); } catch (e) {}
+        if (udp4 === sock) udp4 = null;
+        if (udp6 === sock) udp6 = null;
+        done(err);
       });
-      if (!refed) udp6.unref();
-      udp6.bind(port, host6, function () {
-        bound6 = true;
-        port = this.address().port;
-        growBuffers(this);
-        settle(null);
+      if (!refed) sock.unref();
+      sock.bind(port, addr, function () {
+        isBound = true;
+        growBuffers(sock);
+        if (port === 0) port = sock.address().port;
+        done(null);
       });
     }
 
@@ -1160,8 +1138,12 @@ function createQuicServer(options) {
   return {
     listen: listen,
     close: close,
-    // node:dgram's, of the socket listening: the port listen(0) was given.
-    address: function () { var s = udp4 || udp6; return s ? s.address() : null; },
+    // node:dgram's address() of the socket listening — after listen(0), the
+    // port the OS gave (both families have it); null when not listening.
+    address: function () {
+      var s = udp4 || udp6 || externalSocket4 || externalSocket6;
+      try { return s ? s.address() : null; } catch (e) { return null; }
+    },
     stopAccepting: function () { accepting = false; },
     get connectionCount() { return connectionCount; },
     // node:dgram's: whether the process may exit while this listens.

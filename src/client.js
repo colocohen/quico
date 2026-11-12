@@ -479,6 +479,7 @@ function request(url, options, callback) {
         startupCap: options.startupCap, pmtuDiscovery: options.pmtuDiscovery,
         maxUdpPayloadSize: options.maxUdpPayloadSize, initialRtt: options.initialRtt,
         reorderWindow: options.reorderWindow, initialCongestionWindow: options.initialCongestionWindow,
+        socketBufferSize: options.socketBufferSize,   // the UDP socket's buffers (utils.js)
         // 0-RTT with the saved session (below), off unless asked for.
         earlyData: options.earlyData === true
       };

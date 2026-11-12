@@ -17,7 +17,8 @@ import dns from 'node:dns';
 import { H3Connection, wtCloseCapsule, createCapsuleReader } from './h3.js';
 import { createQuicClientSocket } from './quic_socket.js';
 import lemonTls from 'lemon-tls';
-import { createHash, X509Certificate } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { x509 } from 'cryptographic-formats';
 import { readVarInt, wt_datagram_payload } from './utils.js';
 import { createWtStream, openWtStream, createSendGroup, wtScheduling, createDatagrams, sessionStats, setErrorCode,
          exporterArgs, exportSessionKeyingMaterial,
@@ -425,6 +426,7 @@ class WebTransport extends EventEmitter {
     this._udpSocket = createQuicClientSocket({
       remoteIp: remoteIp,
       remotePort: remotePort,
+      socketBufferSize: this._options.socketBufferSize,
       hostname: this._hostname,
       // serverCertificateHashes pins the certificate instead of a CA (checked
       // in onConnect, before anything is sent on the connection).
@@ -693,8 +695,11 @@ class WebTransport extends EventEmitter {
       return v.length === digest.length && v.equals(digest);
     });
     if (!match) return new Error('serverCertificateHashes: the certificate matches none of them');
-    var cert = new X509Certificate(der), now = Date.now();
-    var from = Date.parse(cert.validFrom), to = Date.parse(cert.validTo);
+    // Its dates, read by cryptographic-formats
+    var cert;
+    try { cert = x509.from_der(der); } catch (e) { return new Error('serverCertificateHashes: the certificate does not parse: ' + e.message); }
+    var now = Date.now();
+    var from = cert.validity.not_before.date.getTime(), to = cert.validity.not_after.date.getTime();
     if (!(now >= from && now <= to)) return new Error('serverCertificateHashes: the certificate is not valid now');
     if (to - from > 14 * 24 * 3600 * 1000) return new Error('serverCertificateHashes: the certificate is valid for more than 14 days');
     return null;

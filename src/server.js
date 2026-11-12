@@ -218,25 +218,15 @@ function createServer(options, handler) {
   function toContext(o, what) {
     if (o && typeof o === 'object' && o.certificateChain && o.privateKey) return o;   // made already (quico.createSecureContext)
     if (!o || typeof o !== 'object') throw new TypeError(what + ' takes { key, cert[, ca, passphrase] } or a context from quico.createSecureContext()');
+    // createSecureContext (lemon-tls's) refuses a key that is not the
+    // certificate's (ERR_OSSL_X509_KEY_VALUES_MISMATCH) - before it replaces
+    // anything, not found out by every client's handshake failing.
     var ctx = createSecureContext(Object.assign({ passphrase: options.passphrase }, o));
-    checkKeyMatches(ctx);
     // Its chain compressed now, not in a client's handshake (RFC 8879).
     if (typeof lemonTls.precompressCertificate === 'function' && !(Array.isArray(options.certificateCompression) && options.certificateCompression.length === 0)) {
       try { lemonTls.precompressCertificate(ctx, options.certificateCompression || undefined); } catch (e) {}
     }
     return ctx;
-  }
-  // A certificate whose key is another's is refused here — before it
-  // replaces anything — not found out by every client's handshake failing.
-  function checkKeyMatches(ctx) {
-    if (!ctx.keyObj || !ctx.certObjs || !ctx.certObjs[0]) return;
-    var a = crypto.createPublicKey(ctx.keyObj).export({ type: 'spki', format: 'der' });
-    var b = ctx.certObjs[0].publicKey.export({ type: 'spki', format: 'der' });
-    if (Buffer.compare(Buffer.from(a), Buffer.from(b)) !== 0) {
-      var e = new Error('the private key does not match the certificate');
-      e.code = 'ERR_OSSL_X509_KEY_VALUES_MISMATCH';
-      throw e;
-    }
   }
   function contextFor(servername) {
     var name = String(servername || '');
@@ -412,6 +402,8 @@ function createServer(options, handler) {
     maxUdpPayloadSize: options.maxUdpPayloadSize,
     initialRtt: options.initialRtt,
     reorderWindow: options.reorderWindow,
+    // The UDP sockets' buffers, bytes: 4 MB by default; 0, the OS's (utils.js).
+    socketBufferSize: options.socketBufferSize,
     // Per QUIC connection, asked once its ClientHello is in: (info, callback)
     // → { transportParams, initialCongestionWindow, carefulResume, startupCap,
     //     pmtuDiscovery, maxUdpPayloadSize, initialRtt, reorderWindow }.
@@ -945,8 +937,7 @@ function createServer(options, handler) {
         listening = true;
         closed = false;
         // After listen(0) the OS chose the port; Alt-Svc must name that one.
-        if (port === 0 && tcpServer && tcpServer.address()) altSvcPort = tcpServer.address().port;
-        else if (port === 0 && bindUdp) altSvcPort = h3srv.address().port;
+        if (port === 0) { var a = address(); if (a && a.port) altSvcPort = a.port; }
         ev.emit('listening');
         if (typeof callback === 'function') callback();
       }
@@ -957,17 +948,22 @@ function createServer(options, handler) {
     if (remaining === 0) { remaining = 1; setImmediate(done); return server; }
 
     if (ref === false) { if (enableH3) h3srv.unref(); if (tcpServer) tcpServer.unref(); }
-    // After listen(0), QUIC takes the port the OS gave TCP: the port Alt-Svc
-    // names and address() reports.
+    // No host: TCP as node:net, '::' where the host has IPv6 (both
+    // families), else '0.0.0.0' — as UDP. It was '0.0.0.0': HTTP/1.1 and
+    // HTTP/2 on IPv4 alone, HTTP/3 on both.
+    var tcpHost = host || undefined;
+    // listen(0): TCP first, then UDP on the port the OS gave TCP — the port
+    // Alt-Svc names and address() reports. Each took a port of its own, and
+    // Alt-Svc named TCP's: a browser never reached HTTP/3.
     if (bindUdp && needsTcp && port === 0) {
-      tcpServer.listen(0, host || '0.0.0.0', function () {
-        h3srv.listen(tcpServer.address().port, host, done);
+      tcpServer.listen(0, tcpHost, function () {
         done();
+        h3srv.listen(tcpServer.address().port, host, done);
       });
       return server;
     }
     if (bindUdp) h3srv.listen(port, host, done);
-    if (needsTcp) tcpServer.listen(port, host || '0.0.0.0', done);
+    if (needsTcp) tcpServer.listen(port, tcpHost, done);
 
     return server;
   }
@@ -1066,6 +1062,9 @@ function createServer(options, handler) {
       var addr = tcpServer.address();
       if (addr) return addr;
     }
+    // HTTP/3 alone: the UDP socket's (the same port, when both listen).
+    var a3 = enableH3 && h3srv.address ? h3srv.address() : null;
+    if (a3) return a3;
     return { address: '0.0.0.0', family: 'IPv4', port: altSvcPort };
   }
 

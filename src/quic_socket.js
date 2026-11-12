@@ -16,6 +16,7 @@ import dgram from 'node:dgram';
 import { QUICConnection } from './quic_connection.js';
 import lemonTls from 'lemon-tls';
 import { SUPPORTED_VERSIONS, parseVersionList, versionName } from './quic_version.js';
+import { checkedSocketBufferSize, setSocketBuffers } from './utils.js';
 
 
 /**
@@ -67,6 +68,7 @@ function createQuicClientSocket(opts) {
   // lemon-tls's list. A name it does not know throws here.
   var sigalgs = lemonTls.parseSigalgs(opts.sigalgs);
   var isIPv6 = opts.remoteIp.indexOf(':') >= 0;
+  var socketBufferSize = checkedSocketBufferSize(opts.socketBufferSize, 'socketBufferSize');
   var udpSocket = dgram.createSocket(isIPv6 ? 'udp6' : 'udp4');
   var quic = null;
 
@@ -88,11 +90,9 @@ function createQuicClientSocket(opts) {
     // pacer-calibration attempt (see LOSS_PTO_PLAN 7.4): larger bursts spilled
     // over the buffer and turned a lossless link into a slow one.
     //
-    // Wrapped in try/catch because the call can throw on platforms that cap
-    // the size; failing to enlarge the buffer is not a reason to fail the
-    // connection.
-    try { udpSocket.setSendBufferSize(2 * 1024 * 1024); } catch (e) {}
-    try { udpSocket.setRecvBufferSize(2 * 1024 * 1024); } catch (e) {}
+    // 4 MB by default (utils.js), socketBufferSize where given; failing to
+    // enlarge the buffer is not a reason to fail the connection.
+    setSocketBuffers(udpSocket, socketBufferSize);
 
     // One attempt; after a Version Negotiation, a second in a version the
     // server offered (RFC 9000 §6.2) — once.

@@ -153,6 +153,7 @@ function createServer(options, handler) {
     maxUdpPayloadSize: options.maxUdpPayloadSize,
     initialRtt: options.initialRtt,
     reorderWindow: options.reorderWindow,
+    socketBufferSize: options.socketBufferSize,
     connectionOptions: options.connectionOptions,
     quicVersions: options.quicVersions,
     socket: options.socket || null,
@@ -1704,7 +1705,8 @@ function createServer(options, handler) {
 
   return {
     listen: function (p, h, cb) { closingServer = null; return qserver.listen(p, h, cb); },
-    address: qserver.address,
+    // The UDP socket's address — after listen(0), the port the OS gave.
+    address: function () { return qserver.address(); },
     close: close,
     closeIdleConnections: closeIdleConnections,
     closeAllConnections: closeAllConnections,

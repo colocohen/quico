@@ -410,7 +410,43 @@ function creditAsRead(readable, credit) {
   return function (n) { received += n; };
 }
 
+// ── UDP socket buffers ──
+//
+// The kernel's receive buffer is where datagrams wait for the event loop.
+// The OS default (208 KB on Linux) holds some 180 of them: a burst larger
+// than one turn drains is dropped there, silently — loss to QUIC, so a
+// retransmission and a congestion-window cut on a lossless link. 4 MB by
+// default, for the send buffer too (a full one drops what is sent, the same
+// way). The kernel caps both at net.core.rmem_max / wmem_max.
+//   socketBufferSize: bytes; 0 or false — the OS default.
+var DEFAULT_SOCKET_BUFFER_SIZE = 4 << 20;
+function checkedSocketBufferSize(v, what) {
+  if (v === undefined || v === null) return DEFAULT_SOCKET_BUFFER_SIZE;
+  if (v === 0 || v === false) return 0;
+  if (!Number.isInteger(v) || v < 0 || v > 0x7fffffff) {
+    var e = new RangeError((what || 'socketBufferSize') + ' must be a positive integer (bytes), 0 or false, got ' + v);
+    e.code = 'ERR_OUT_OF_RANGE';
+    throw e;
+  }
+  return v;
+}
+// For dgram.createSocket: applied when the socket is bound.
+function udpSocketOptions(base, size) {
+  return size > 0 ? Object.assign({}, base, { recvBufferSize: size, sendBufferSize: size }) : base;
+}
+// For a socket already bound. A platform that refuses the size does not stop
+// the socket from working.
+function setSocketBuffers(sock, size) {
+  if (!(size > 0)) return;
+  try { sock.setSendBufferSize(size); } catch (e) {}
+  try { sock.setRecvBufferSize(size); } catch (e) {}
+}
+
 export {
+  DEFAULT_SOCKET_BUFFER_SIZE,
+  checkedSocketBufferSize,
+  udpSocketOptions,
+  setSocketBuffers,
   createEmitter,
   mergePriority,
   creditAsRead,

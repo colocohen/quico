@@ -53,7 +53,7 @@ import { EventEmitter } from 'node:events';
 import dgram from 'node:dgram';
 import dns from 'node:dns';
 import net from 'node:net';
-import { readVarInt, writeVarInt } from './utils.js';
+import { readVarInt, writeVarInt, checkedSocketBufferSize, udpSocketOptions } from './utils.js';
 
 var DEFAULT_TEMPLATE = '/.well-known/masque/udp/{target_host}/{target_port}/';
 var MIN_IDLE_MS = 120000;           // §3.1: "SHOULD NOT use a period lower than two minutes"
@@ -369,6 +369,9 @@ function createConnectUdp(options) {
     }
     var headers = opts.headers || null;
     if (opts.relay === false) { this._open(headers); return this; }
+    // The socket to the target, when this tunnel makes it (no opts.socket):
+    // its buffers (utils.js), 4 MB by default; socketBufferSize 0, the OS's.
+    var bufferSize = checkedSocketBufferSize(opts.socketBufferSize, 'accept({ socketBufferSize })');
 
     var allowPrivate = opts.allowPrivate != null ? !!opts.allowPrivate : allowPrivateDefault;
     var host = this.target.host;
@@ -390,7 +393,7 @@ function createConnectUdp(options) {
       if (opts.socket) self._useSocket(opts.socket, false, pick.address, headers);
       else {
         var sock;
-        try { sock = dgram.createSocket(family === 6 ? 'udp6' : 'udp4'); }
+        try { sock = dgram.createSocket(udpSocketOptions({ type: family === 6 ? 'udp6' : 'udp4' }, bufferSize)); }
         catch (e2) { self._refuse(502, proxyStatus('proxy_internal_error'), e2); return; }
         sock.once('error', function (e3) {
           if (self.state === 'pending') self._refuse(502, proxyStatus('destination_ip_unroutable', e3.code), e3);
