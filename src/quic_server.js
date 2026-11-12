@@ -826,6 +826,15 @@ function createQuicServer(options) {
   //  UDP send
   // ============================================================
 
+  // A client that has gone away: its port answers our datagrams with ICMP
+  // "port unreachable", which Bun reports as ECONNREFUSED (Node does not),
+  // on the socket or on a send's callback. It concerns that client alone
+  // (its connection ends at its idle timeout); the socket goes on serving
+  // the others.
+  function isDepartedPeer(err) {
+    return err.code === 'ECONNREFUSED';
+  }
+
   function sendUdp(toIp, toPort, data) {
     var isV6 = toIp.indexOf(':') >= 0;
     // Prefer external socket (shared mode) over internally-bound socket
@@ -836,7 +845,7 @@ function createQuicServer(options) {
     sendsPending++;
     socket.send(data, toPort, toIp, function (err) {
       sendsPending--;
-      if (err && !closing) ev.emit('error', err);
+      if (err && !closing && !isDepartedPeer(err)) ev.emit('error', err);
       if (closing && sendsPending === 0) closing();
     });
   }
@@ -938,20 +947,35 @@ function createQuicServer(options) {
 
     udp4 = dgram.createSocket('udp4');
     udp4.on('message', onUdpMessage);
-    udp4.once('error', function (err) {
+    var bound4 = false;
+    udp4.on('error', function (err) {
       // A bind failure arrives before we are listening; anything later is a
-      // runtime socket error and belongs to the consumer.
+      // runtime socket error and belongs to the consumer, and the socket goes
+      // on serving.
+      if (bound4) {
+        if (!isDepartedPeer(err)) ev.emit('error', err);
+        return;
+      }
+      // Node keeps a socket's handle open after a failed bind: close it here.
+      udp4.close();
       udp4 = null;
       settle(err);
       ev.emit('error', err);
     });
     var host4 = host.indexOf('.') !== -1 ? host : '0.0.0.0';
     if (!refed) udp4.unref();
-    udp4.bind(port, host4, function () { growBuffers(udp4); settle(null); });
+    udp4.bind(port, host4, function () { bound4 = true; growBuffers(udp4); settle(null); });
 
     udp6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
     udp6.on('message', onUdpMessage);
-    udp6.once('error', function (err) {
+    var bound6 = false;
+    udp6.on('error', function (err) {
+      // A runtime error, as on udp4.
+      if (bound6) {
+        if (!isDepartedPeer(err)) ev.emit('error', err);
+        return;
+      }
+      udp6.close();
       udp6 = null;
       // No IPv6 on this host is ordinary, not an error the application needs
       // to see — the v4 socket is serving. Only a total failure is emitted,
@@ -960,7 +984,7 @@ function createQuicServer(options) {
     });
     var host6 = host.indexOf(':') !== -1 ? host : '::';
     if (!refed) udp6.unref();
-    udp6.bind(port, host6, function () { growBuffers(udp6); settle(null); });
+    udp6.bind(port, host6, function () { bound6 = true; growBuffers(udp6); settle(null); });
 
     startSweepTimer();
   }
