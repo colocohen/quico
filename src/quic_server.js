@@ -15,8 +15,11 @@
 import dgram from 'node:dgram';
 import dns from 'node:dns';
 import net from 'node:net';
-import crypto from 'node:crypto';
-import { DEBUG, Emitter, checkedSocketBufferSize, setSocketBuffers } from './utils.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { sha256_sync, sha256_create } from 'cryptographic-primitives/sha2.js';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { aes_gcm_create } from 'cryptographic-primitives/aes.js';
+import { DEBUG, Emitter, checkedSocketBufferSize, setSocketBuffers, randomBuffer } from './utils.js';
 import {
   parse_quic_datagram,
   build_version_negotiation
@@ -153,7 +156,7 @@ function createQuicServer(options) {
   // connection drew its own and no client ever resumed. Random when not given:
   // tickets then last until this server restarts; pass ticketKeys (48 bytes)
   // kept across restarts to have them outlive it.
-  var ticketKeys = options.ticketKeys || crypto.randomBytes(48);
+  var ticketKeys = options.ticketKeys || randomBuffer(48);
   var ticketData = typeof options.ticketData === 'function' ? options.ticketData : null;
   // Encrypted Client Hello keys (lemon-tls): read per connection, so a new
   // set (setEchKeys) applies from the next one.
@@ -182,7 +185,7 @@ function createQuicServer(options) {
   // node:quic's name for it) covers those lost in a restart as well.
   // Whoever holds it can end any connection of this server; kept like the
   // ticket keys.
-  var resetTokenSecret = checkResetTokenSecret(options.resetTokenSecret) || crypto.randomBytes(32);
+  var resetTokenSecret = checkResetTokenSecret(options.resetTokenSecret) || randomBuffer(32);
 
   function checkResetTokenSecret(secret) {
     if (secret === undefined || secret === null) return null;
@@ -216,8 +219,15 @@ function createQuicServer(options) {
   // shortcut lost. The AES key is derived from it (SHA-256), so a 16-byte
   // secret serves as well as a 32-byte one.
   var validateAddress = options.validateAddress === true;
-  var tokenSecret = checkTokenSecret(options.tokenSecret) || crypto.randomBytes(32);
+  var tokenSecret = checkTokenSecret(options.tokenSecret) || randomBuffer(32);
   var retryTokenKey = tokenKeyOf(tokenSecret);
+  // The keyed AES-256-GCM context of the current token key, made again when
+  // the key is (setTokenSecret).
+  var tokenAeadOf = null, tokenAeadCtx = null;
+  function tokenAead() {
+    if (tokenAeadOf !== retryTokenKey) { tokenAeadCtx = aes_gcm_create(retryTokenKey); tokenAeadOf = retryTokenKey; }
+    return tokenAeadCtx;
+  }
 
   function checkTokenSecret(secret) {
     if (secret === undefined || secret === null) return null;
@@ -227,7 +237,7 @@ function createQuicServer(options) {
     return secret;
   }
   function tokenKeyOf(secret) {
-    return crypto.createHash('sha256').update('quico address-validation token key').update(secret).digest();
+    return sha256_create().update('quico address-validation token key').update(secret).digest();
   }
   var RETRY_TOKEN_LIFETIME = 10000;   // ms
   // Tokens of two kinds, sealed alike (RFC 9000 §8.1.3): a Retry's, good for
@@ -267,11 +277,11 @@ function createQuicServer(options) {
   }
 
   function seal(plain, ip, version) {
-    var nonce = crypto.randomBytes(12);
-    var cipher = crypto.createCipheriv('aes-256-gcm', retryTokenKey, nonce);
-    cipher.setAAD(tokenAad(ip, version));
-    var sealed = Buffer.concat([nonce, cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
-    return new Uint8Array(sealed);
+    var nonce = random_bytes_sync(12);
+    var token = new Uint8Array(12 + plain.length + 16);
+    token.set(nonce, 0);
+    tokenAead().encrypt_into_sync(token, 12, nonce, plain, tokenAad(ip, version));   // nonce || ct || tag
+    return token;
   }
 
   // A token this server sealed, for this address and version:
@@ -286,15 +296,9 @@ function createQuicServer(options) {
   function openToken(token, ip, dcid, version) {
     if (token.byteLength < 12 + 8 + 16) return null;
     var t = Buffer.from(token.buffer, token.byteOffset, token.byteLength);
-    var plain;
-    try {
-      var decipher = crypto.createDecipheriv('aes-256-gcm', retryTokenKey, t.subarray(0, 12));
-      decipher.setAAD(tokenAad(ip, version));
-      decipher.setAuthTag(t.subarray(t.length - 16));
-      plain = Buffer.concat([decipher.update(t.subarray(12, t.length - 16)), decipher.final()]);
-    } catch (e) {
-      return null;
-    }
+    var opened = tokenAead().decrypt_sync(t.subarray(0, 12), t.subarray(12), tokenAad(ip, version));
+    if (opened === null) return null;   // not ours: it does not open
+    var plain = Buffer.from(opened.buffer, opened.byteOffset, opened.length);
     var age = Date.now() - plain.readUIntBE(2, 6);
     if (plain[0] === TOKEN_NEW && plain.length === 8) {
       return (age >= 0 && age <= NEW_TOKEN_LIFETIME) ? { kind: 'new' } : null;
@@ -319,7 +323,7 @@ function createQuicServer(options) {
   }
 
   function resetToken(cid) {
-    return new Uint8Array(crypto.createHmac('sha256', resetTokenSecret).update(cid).digest().subarray(0, 16));
+    return hmac_sync(sha256_sync, resetTokenSecret, cid).subarray(0, 16);
   }
 
   // Build SNICallback
@@ -430,7 +434,13 @@ function createQuicServer(options) {
   function onUdpMessage(msg, rinfo) {
     // Closed (or closing, its last datagrams leaving): nothing more is taken.
     if (shutDown) return;
-    var data = new Uint8Array(msg);
+    // A plain Uint8Array over the datagram's bytes, not a copy of them (a
+    // second ArrayBuffer of its size, for every datagram received).
+    // Nothing keeps or changes these bytes past this call (decryption reads
+    // them and writes elsewhere; the one packet held for later, 0-RTT before
+    // its key, is copied: zeroRttHold), so the caller's buffer — Node's,
+    // one per datagram, or handlePacket's — may be reused once it returns.
+    var data = msg instanceof Uint8Array ? new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength) : new Uint8Array(msg);
     var fromIp = rinfo.address;
     var fromPort = rinfo.port;
     if (DEBUG) console.log('[qserver] UDP from ' + fromIp + ':' + fromPort + ' len=' + data.length);
@@ -719,7 +729,7 @@ function createQuicServer(options) {
   // certain rather than merely likely.
   function newLocalCid() {
     var cid;
-    do { cid = new Uint8Array(crypto.randomBytes(SERVER_CID_LEN)); } while (cidKey(cid) in cidMap);
+    do { cid = random_bytes_sync(SERVER_CID_LEN); } while (cidKey(cid) in cidMap);
     return cid;
   }
 
@@ -816,7 +826,7 @@ function createQuicServer(options) {
     if (resetBudget < 1) return;
     resetBudget -= 1;
 
-    var random = crypto.randomBytes(receivedBytes);
+    var random = random_bytes_sync(receivedBytes);
     var size = receivedBytes <= 43 ? receivedBytes - 1 : Math.min(receivedBytes - 1, 43 + random[0] % 58);
     var reset = new Uint8Array(size);
     reset.set(random.subarray(1, 1 + size - 16));

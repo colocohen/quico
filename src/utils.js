@@ -12,6 +12,9 @@
  *     https://github.com/colocohen/quico
  */
 
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+
+
 
 // ============================================================
 //  Debug flag — set QUICO_DEBUG=1 to enable verbose logging.
@@ -121,6 +124,24 @@ function writeVarInt(value) {
     ]);
   }
   throw new Error('Value too large for QUIC VarInt');
+}
+
+
+// writeVarInt's bytes written into `buf` at `off`, without the array it
+// returns; the offset after them. For headers and frames written straight
+// into the packet that carries them.
+function varIntSize(v) { return v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40000000 ? 4 : 8; }
+
+function writeVarIntInto(buf, off, v) {
+  if (v < 0x40) { buf[off] = v; return off + 1; }
+  if (v < 0x4000) { buf[off] = 0x40 | (v >> 8); buf[off + 1] = v & 0xff; return off + 2; }
+  if (v < 0x40000000) {
+    buf[off] = 0x80 | (v >>> 24); buf[off + 1] = (v >>> 16) & 0xff; buf[off + 2] = (v >>> 8) & 0xff; buf[off + 3] = v & 0xff;
+    return off + 4;
+  }
+  var w = writeVarInt(v);
+  buf.set(w, off);
+  return off + w.length;
 }
 
 
@@ -261,6 +282,48 @@ function ack_frame_to_ranges(ackFrame) {
   var firstRange = Number(ackFrame.firstRange);
   if (!isFinite(largest) || !isFinite(firstRange)) return flat;
 
+  // Whole gaps of zero or more, as every ACK frame read off the wire has,
+  // give ranges in descending order with at least one packet number between
+  // each two: nothing to sort or merge, only the order to turn around. Each
+  // range is pushed end first, so reversing the whole array gives
+  // [from,to, ...] ascending. Anything else (a frame made by hand), or a
+  // number past 2^53, where the arithmetic is no longer exact, goes the
+  // general way, ack_ranges_sorted. The sort, its comparator and a pair
+  // array per range were most of what an ACK received allocated.
+  var more = ackFrame.ranges || [];
+  if (!(Number.isInteger(largest) && largest <= Number.MAX_SAFE_INTEGER &&
+        Number.isInteger(firstRange) && firstRange >= 0)) {
+    return ack_ranges_sorted(largest, firstRange, more);
+  }
+  var rangeEnd = largest;
+  var rangeStart = rangeEnd - firstRange;
+  if (rangeStart < -Number.MAX_SAFE_INTEGER) return ack_ranges_sorted(largest, firstRange, more);
+  flat.push(rangeEnd, rangeStart);
+
+  var prevStart = rangeStart;
+  for (var i = 0; i < more.length; i++) {
+    var gap = Number(more[i].gap);
+    var length = Number(more[i].length);
+    if (!isFinite(gap) || !isFinite(length)) continue;
+    if (!(Number.isInteger(gap) && gap >= 0 && Number.isInteger(length))) {
+      return ack_ranges_sorted(largest, firstRange, more);
+    }
+
+    rangeEnd = prevStart - gap - 2;
+    rangeStart = rangeEnd - length;
+    if (rangeStart <= rangeEnd) {
+      if (rangeStart < -Number.MAX_SAFE_INTEGER) return ack_ranges_sorted(largest, firstRange, more);
+      flat.push(rangeEnd, rangeStart);
+      prevStart = rangeStart;
+    }
+  }
+  return flat.reverse();
+}
+
+// ack_frame_to_ranges for any gaps: the ranges sorted ascending, merged
+// where they overlap or touch, and flattened.
+function ack_ranges_sorted(largest, firstRange, more) {
+  var flat = [];
   var rangesDesc = [];
 
   // First range
@@ -271,7 +334,6 @@ function ack_frame_to_ranges(ackFrame) {
   }
 
   // Additional ranges
-  var more = ackFrame.ranges || [];
   var prevStart = rangeStart;
   for (var i = 0; i < more.length; i++) {
     var gap = Number(more[i].gap);
@@ -442,7 +504,15 @@ function setSocketBuffers(sock, size) {
   try { sock.setRecvBufferSize(size); } catch (e) {}
 }
 
+/** n random bytes as a Buffer (a view, no copy), where a Buffer is what goes
+ *  out: ticket keys, as lemon-tls and node:tls hand them out. */
+function randomBuffer(n) {
+  var r = random_bytes_sync(n);
+  return Buffer.from(r.buffer, r.byteOffset, r.length);
+}
+
 export {
+  randomBuffer,
   DEFAULT_SOCKET_BUFFER_SIZE,
   checkedSocketBufferSize,
   udpSocketOptions,
@@ -453,6 +523,8 @@ export {
   DEBUG,
   Emitter,
   writeVarInt,
+  varIntSize,
+  writeVarIntInto,
   readVarInt,
   concatUint8Arrays,
   uint8Equal,

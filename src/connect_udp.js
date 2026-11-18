@@ -144,14 +144,22 @@ function parseTarget(compiled, url) {
 //  the IPv6 forms of all of these (unique-local, an IPv4-mapped address).
 // ============================================================
 
-var blocked = new net.BlockList();
-[['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
- ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15],
- ['224.0.0.0', 4], ['240.0.0.0', 4]].forEach(function (r) { blocked.addSubnet(r[0], r[1], 'ipv4'); });
-[['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]].forEach(function (r) { blocked.addSubnet(r[0], r[1], 'ipv6'); });
+// Built on first use, not at load: a runtime whose node:net has no BlockList
+// (a browser polyfill, a WASM build) can still load this module; only a
+// CONNECT-UDP proxy, which needs node:net anyway, ever builds it.
+var blocked = null;
+function blockedList() {
+  if (blocked) return blocked;
+  var list = new net.BlockList();
+  [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+   ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15],
+   ['224.0.0.0', 4], ['240.0.0.0', 4]].forEach(function (r) { list.addSubnet(r[0], r[1], 'ipv4'); });
+  [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]].forEach(function (r) { list.addSubnet(r[0], r[1], 'ipv6'); });
+  return (blocked = list);
+}
 
 function isPrivateAddress(ip) {
-  if (net.isIPv4(ip)) return blocked.check(ip, 'ipv4');
+  if (net.isIPv4(ip)) return blockedList().check(ip, 'ipv4');
   if (!net.isIPv6(ip)) return true;
   // An IPv4 address in IPv6 clothing (::ffff:10.0.0.1, or in hex) is that
   // IPv4 address.
@@ -163,7 +171,7 @@ function isPrivateAddress(ip) {
     var a = parseInt(hex[1], 16), b = parseInt(hex[2], 16);
     return isPrivateAddress([a >> 8, a & 255, b >> 8, b & 255].join('.'));
   }
-  return blocked.check(ip, 'ipv6');
+  return blockedList().check(ip, 'ipv6');
 }
 
 

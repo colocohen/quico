@@ -61,15 +61,12 @@ var SETTABLE_TRANSPORT_PARAMS = {
 
 // A client's key-exchange groups by default: what node:tls offers (OpenSSL
 // 3.5) and the browsers do — the hybrid post-quantum X25519MLKEM768 first,
-// then X25519, P-256, P-384 — where node:crypto has ML-KEM (Node 24.7+);
-// without it, the classical groups alone. lemon-tls's own client default is
+// then X25519, P-256, P-384 (cryptographic-primitives has ML-KEM on every
+// Node version). lemon-tls's own client default is
 // the same (session/ecdh.js); named here because the QUIC hello's context is
 // set by this bridge. The hybrid share goes with an X25519 share beside it,
 // so a server without it needs no retry.
-var CLIENT_DEFAULT_GROUPS = (function () {
-  try { return lemonParseEcdhCurve('X25519MLKEM768:X25519:P-256:P-384'); }
-  catch (e) { return [29, 23, 24]; }
-})();
+var CLIENT_DEFAULT_GROUPS = lemonParseEcdhCurve('X25519MLKEM768:X25519:P-256:P-384');
 
 function defaultTransportParams(overrides) {
   var tp = baseTransportParams();

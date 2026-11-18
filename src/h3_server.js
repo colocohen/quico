@@ -13,7 +13,10 @@
  */
 
 import { Duplex } from 'node:stream';
-import { X509Certificate } from 'node:crypto';
+// The module, not a named import: getPeerX509Certificate is the only use, and a
+// bundle for a runtime whose node:crypto has no X509Certificate (a browser
+// polyfill) still builds; the method then answers undefined.
+import * as nodeCrypto from 'node:crypto';
 import { readVarInt, writeVarInt, wt_datagram_payload } from './utils.js';
 import { observeH3 } from './h2_fingerprint.js';
 // The Emitter from http_common, not the one in utils.js. Two differences that
@@ -1179,7 +1182,8 @@ function createServer(options, handler) {
     sock.getPeerCertificate = function () { return quic.getPeerCertificate ? quic.getPeerCertificate() : {}; };
     sock.getPeerX509Certificate = function () {
       var c = sock.getPeerCertificate();
-      try { return c && c.raw ? new X509Certificate(c.raw) : undefined; } catch (e) { return undefined; }
+      var X509 = nodeCrypto.X509Certificate;
+      try { return c && c.raw && typeof X509 === 'function' ? new X509(c.raw) : undefined; } catch (e) { return undefined; }
     };
     // The session ticket, { data, resumed, offered } — the same method a
     // TLSSocket has over TCP, so req.socket answers it on every HTTP version.

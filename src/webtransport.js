@@ -17,7 +17,7 @@ import dns from 'node:dns';
 import { H3Connection, wtCloseCapsule, createCapsuleReader } from './h3.js';
 import { createQuicClientSocket } from './quic_socket.js';
 import lemonTls from 'lemon-tls';
-import { createHash } from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import { x509 } from 'cryptographic-formats';
 import { readVarInt, wt_datagram_payload } from './utils.js';
 import { createWtStream, openWtStream, createSendGroup, wtScheduling, createDatagrams, sessionStats, setErrorCode,
@@ -688,7 +688,7 @@ class WebTransport extends EventEmitter {
     var chain = this._quic.getPeerCertificateChain && this._quic.getPeerCertificateChain();
     if (!chain || !chain.length) return new Error('serverCertificateHashes: the server sent no certificate');
     var der = Buffer.from(chain[0]);
-    var digest = createHash('sha256').update(der).digest();
+    var d = sha256_sync(der), digest = Buffer.from(d.buffer, d.byteOffset, d.length);
     var match = hashes.some(function (h) {
       if (!h || String(h.algorithm).toLowerCase() !== 'sha-256' || !h.value) return false;
       var v = ArrayBuffer.isView(h.value) ? Buffer.from(h.value.buffer, h.value.byteOffset, h.value.byteLength) : Buffer.from(h.value);

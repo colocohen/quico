@@ -16,6 +16,8 @@ import {
   DEBUG,
   concatUint8Arrays,
   writeVarInt,
+  varIntSize,
+  writeVarIntInto,
   readVarInt
 } from './utils.js';
 import { SUPPORTED_VERSIONS, isSupportedVersion, longPacketType } from './quic_version.js';
@@ -275,20 +277,6 @@ function build_version_negotiation(recvDcid, recvScid, offered) {
 // size. The frames that carry data (STREAM, CRYPTO, DATAGRAM) and those in
 // most packets (ACK, PADDING, PING) are now measured without encoding and
 // written straight into one buffer; the rest, rare and small, as before.
-
-function varIntSize(v) { return v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40000000 ? 4 : 8; }
-
-function writeVarIntInto(buf, off, v) {
-  if (v < 0x40) { buf[off] = v; return off + 1; }
-  if (v < 0x4000) { buf[off] = 0x40 | (v >> 8); buf[off + 1] = v & 0xff; return off + 2; }
-  if (v < 0x40000000) {
-    buf[off] = 0x80 | (v >>> 24); buf[off + 1] = (v >>> 16) & 0xff; buf[off + 2] = (v >>> 8) & 0xff; buf[off + 3] = v & 0xff;
-    return off + 4;
-  }
-  var w = writeVarInt(v);
-  buf.set(w, off);
-  return off + w.length;
-}
 
 function hotFrameSize(f) {
   var t = f.type;
@@ -605,21 +593,41 @@ function encode_quic_frames_each(frames) {
 }
 
 
+// readVarInt's value without its object: the value, or -1 when the bytes
+// end before it does (no QUIC varint is negative); the offset after it is
+// left in varIntEnd. For the frame parser, which reads every field so.
+var varIntEnd = 0;
+function varIntAt(array, offset) {
+  if (offset >= array.length) return -1;
+  var first = array[offset];
+  var prefix = first >> 6;
+  if (prefix === 0) { varIntEnd = offset + 1; return first & 0x3f; }
+  if (prefix === 1) {
+    if (offset + 1 >= array.length) return -1;
+    varIntEnd = offset + 2;
+    return ((first & 0x3f) << 8) | array[offset + 1];
+  }
+  if (prefix === 2) {
+    if (offset + 3 >= array.length) return -1;
+    varIntEnd = offset + 4;
+    return (((first & 0x3f) << 24) | (array[offset + 1] << 16) | (array[offset + 2] << 8) | array[offset + 3]) >>> 0;
+  }
+  var r = readVarInt(array, offset);   // 8 bytes: rare, as readVarInt reads them
+  if (!r) return -1;
+  varIntEnd = offset + r.byteLength;
+  return r.value;
+}
+
 // ============================================================
 //  QUIC Frame parsing (RFC 9000 §12.4)
 // ============================================================
 
+// The varints read with varIntAt, not readVarInt: a frame's fields were an
+// object each (and the reader a closure per packet), about a third of what
+// parsing a packet allocated.
 function parse_quic_frames(buf) {
   var offset = 0;
   var frames = [];
-
-  function safeReadVarInt() {
-    if (offset >= buf.length) return null;
-    var res = readVarInt(buf, offset);
-    if (!res) return null;
-    offset += res.byteLength;
-    return res;
-  }
 
   // A frame that ends before its fields do — every `break` below but the
   // unknown type's — is reported as { type: 'malformed' }, last: the frames
@@ -637,9 +645,10 @@ function parse_quic_frames(buf) {
     // read as its first byte.
     if (type >= 0x40) {
       offset--;
-      var t = safeReadVarInt();
-      if (!t) break;
-      type = t.value;
+      var t = varIntAt(buf, offset);
+      if (t < 0) break;
+      offset = varIntEnd;
+      type = t;
     }
 
     if (type === 0x00) {
@@ -651,61 +660,61 @@ function parse_quic_frames(buf) {
 
     } else if ((type & 0xfe) === 0x02) {
       var hasECN = (type & 0x01) === 1;
-      var largest = safeReadVarInt(); if (!largest) break;
-      var delay = safeReadVarInt(); if (!delay) break;
-      var rangeCount = safeReadVarInt(); if (!rangeCount) break;
-      var firstRange = safeReadVarInt(); if (!firstRange) break;
+      var largest = varIntAt(buf, offset); if (largest < 0) break; offset = varIntEnd;
+      var delay = varIntAt(buf, offset); if (delay < 0) break; offset = varIntEnd;
+      var rangeCount = varIntAt(buf, offset); if (rangeCount < 0) break; offset = varIntEnd;
+      var firstRange = varIntAt(buf, offset); if (firstRange < 0) break; offset = varIntEnd;
 
       var ranges = [];
-      for (var i = 0; i < rangeCount.value; i++) {
-        var gap = safeReadVarInt(); if (!gap) break;
-        var len = safeReadVarInt(); if (!len) break;
-        ranges.push({ gap: gap.value, length: len.value });
+      for (var i = 0; i < rangeCount; i++) {
+        var gap = varIntAt(buf, offset); if (gap < 0) break; offset = varIntEnd;
+        var len = varIntAt(buf, offset); if (len < 0) break; offset = varIntEnd;
+        ranges.push({ gap: gap, length: len });
       }
-      if (ranges.length !== rangeCount.value) break;
+      if (ranges.length !== rangeCount) break;
 
       var ecn = null;
       if (hasECN) {
-        var ect0 = safeReadVarInt(); if (!ect0) break;
-        var ect1 = safeReadVarInt(); if (!ect1) break;
-        var ce = safeReadVarInt(); if (!ce) break;
-        ecn = { ect0: ect0.value, ect1: ect1.value, ce: ce.value };
+        var ect0 = varIntAt(buf, offset); if (ect0 < 0) break; offset = varIntEnd;
+        var ect1 = varIntAt(buf, offset); if (ect1 < 0) break; offset = varIntEnd;
+        var ce = varIntAt(buf, offset); if (ce < 0) break; offset = varIntEnd;
+        ecn = { ect0: ect0, ect1: ect1, ce: ce };
       }
 
       frames.push({
-        type: 'ack', largest: largest.value, delay: delay.value,
-        firstRange: firstRange.value, ranges: ranges, ecn: ecn
+        type: 'ack', largest: largest, delay: delay,
+        firstRange: firstRange, ranges: ranges, ecn: ecn
       });
 
     } else if (type === 0x04) {
-      var id = safeReadVarInt(); if (!id) break;
-      var error = safeReadVarInt(); if (!error) break;
-      var finalSize = safeReadVarInt(); if (!finalSize) break;
-      frames.push({ type: 'reset_stream', id: id.value, error: error.value, finalSize: finalSize.value });
+      var id = varIntAt(buf, offset); if (id < 0) break; offset = varIntEnd;
+      var error = varIntAt(buf, offset); if (error < 0) break; offset = varIntEnd;
+      var finalSize = varIntAt(buf, offset); if (finalSize < 0) break; offset = varIntEnd;
+      frames.push({ type: 'reset_stream', id: id, error: error, finalSize: finalSize });
 
     } else if (type === 0x24) {
-      var id = safeReadVarInt(); if (!id) break;
-      var error = safeReadVarInt(); if (!error) break;
-      var finalSize = safeReadVarInt(); if (!finalSize) break;
-      var reliableSize = safeReadVarInt(); if (!reliableSize) break;
-      frames.push({ type: 'reset_stream_at', id: id.value, error: error.value, finalSize: finalSize.value, reliableSize: reliableSize.value });
+      var id = varIntAt(buf, offset); if (id < 0) break; offset = varIntEnd;
+      var error = varIntAt(buf, offset); if (error < 0) break; offset = varIntEnd;
+      var finalSize = varIntAt(buf, offset); if (finalSize < 0) break; offset = varIntEnd;
+      var reliableSize = varIntAt(buf, offset); if (reliableSize < 0) break; offset = varIntEnd;
+      frames.push({ type: 'reset_stream_at', id: id, error: error, finalSize: finalSize, reliableSize: reliableSize });
 
     } else if (type === 0x05) {
-      var id = safeReadVarInt(); if (!id) break;
-      var error = safeReadVarInt(); if (!error) break;
-      frames.push({ type: 'stop_sending', id: id.value, error: error.value });
+      var id = varIntAt(buf, offset); if (id < 0) break; offset = varIntEnd;
+      var error = varIntAt(buf, offset); if (error < 0) break; offset = varIntEnd;
+      frames.push({ type: 'stop_sending', id: id, error: error });
 
     } else if (type === 0x06) {
-      var off = safeReadVarInt(); if (!off) break;
-      var len = safeReadVarInt(); if (!len) break;
-      if (offset + len.value > buf.length) break;
-      var data = buf.slice(offset, offset + len.value); offset += len.value;
-      frames.push({ type: 'crypto', offset: off.value, data: data });
+      var off = varIntAt(buf, offset); if (off < 0) break; offset = varIntEnd;
+      var len = varIntAt(buf, offset); if (len < 0) break; offset = varIntEnd;
+      if (offset + len > buf.length) break;
+      var data = buf.slice(offset, offset + len); offset += len;
+      frames.push({ type: 'crypto', offset: off, data: data });
 
     } else if (type === 0x07) {
-      var len = safeReadVarInt(); if (!len) break;
-      if (offset + len.value > buf.length) break;
-      var token = buf.slice(offset, offset + len.value); offset += len.value;
+      var len = varIntAt(buf, offset); if (len < 0) break; offset = varIntEnd;
+      if (offset + len > buf.length) break;
+      var token = buf.slice(offset, offset + len); offset += len;
       frames.push({ type: 'new_token', token: token });
 
     } else if (type >= 0x08 && type <= 0x0f) {
@@ -713,60 +722,64 @@ function parse_quic_frames(buf) {
       var lenb = !!(type & 0x02);
       var offb = !!(type & 0x04);
 
-      var stream_id = safeReadVarInt(); if (!stream_id) break;
-      var offset_val = offb ? safeReadVarInt() : { value: 0 }; if (!offset_val) break;
-      var length_val = lenb ? safeReadVarInt() : { value: buf.length - offset }; if (!length_val) break;
-      if (offset + length_val.value > buf.length) break;
+      var stream_id = varIntAt(buf, offset); if (stream_id < 0) break; offset = varIntEnd;
+      var offset_val = 0;
+      if (offb) { offset_val = varIntAt(buf, offset); if (offset_val < 0) break; offset = varIntEnd; }
+      var length_val = buf.length - offset;
+      if (lenb) { length_val = varIntAt(buf, offset); if (length_val < 0) break; offset = varIntEnd; }
+      if (offset + length_val > buf.length) break;
 
-      var data = buf.slice(offset, offset + length_val.value); offset += length_val.value;
+      var data = buf.slice(offset, offset + length_val); offset += length_val;
       frames.push({
-        type: 'stream', id: stream_id.value,
-        offset: offset_val.value, fin: fin, data: data
+        type: 'stream', id: stream_id,
+        offset: offset_val, fin: fin, data: data
       });
 
     } else if (type === 0x10) {
-      var max = safeReadVarInt(); if (!max) break;
-      frames.push({ type: 'max_data', max: max.value });
+      var max = varIntAt(buf, offset); if (max < 0) break; offset = varIntEnd;
+      frames.push({ type: 'max_data', max: max });
 
     } else if (type === 0x11) {
-      var id = safeReadVarInt(); if (!id) break;
-      var max = safeReadVarInt(); if (!max) break;
-      frames.push({ type: 'max_stream_data', id: id.value, max: max.value });
+      var id = varIntAt(buf, offset); if (id < 0) break; offset = varIntEnd;
+      var max = varIntAt(buf, offset); if (max < 0) break; offset = varIntEnd;
+      frames.push({ type: 'max_stream_data', id: id, max: max });
 
     } else if (type === 0x12 || type === 0x13) {
       // A count past 2^60 is not one (RFC 9000 §19.11): FRAME_ENCODING_ERROR.
       var at = offset;
-      var max = safeReadVarInt(); if (!max || streamCountTooLarge(buf.subarray(at, offset))) break;
-      frames.push({ type: type === 0x12 ? 'max_streams_bidi' : 'max_streams_uni', max: max.value });
+      var max = varIntAt(buf, offset); if (max < 0) break; offset = varIntEnd;
+      if (streamCountTooLarge(buf.subarray(at, offset))) break;
+      frames.push({ type: type === 0x12 ? 'max_streams_bidi' : 'max_streams_uni', max: max });
 
     } else if (type === 0x14) {
-      var limit = safeReadVarInt(); if (!limit) break;
-      frames.push({ type: 'data_blocked', limit: limit.value });
+      var limit = varIntAt(buf, offset); if (limit < 0) break; offset = varIntEnd;
+      frames.push({ type: 'data_blocked', limit: limit });
 
     } else if (type === 0x15) {
-      var id = safeReadVarInt(); if (!id) break;
-      var limit = safeReadVarInt(); if (!limit) break;
-      frames.push({ type: 'stream_data_blocked', id: id.value, limit: limit.value });
+      var id = varIntAt(buf, offset); if (id < 0) break; offset = varIntEnd;
+      var limit = varIntAt(buf, offset); if (limit < 0) break; offset = varIntEnd;
+      frames.push({ type: 'stream_data_blocked', id: id, limit: limit });
 
     } else if (type === 0x16 || type === 0x17) {
       // Likewise (§19.14: STREAM_LIMIT_ERROR or FRAME_ENCODING_ERROR).
       var at = offset;
-      var limit = safeReadVarInt(); if (!limit || streamCountTooLarge(buf.subarray(at, offset))) break;
-      frames.push({ type: type === 0x16 ? 'streams_blocked_bidi' : 'streams_blocked_uni', limit: limit.value });
+      var limit = varIntAt(buf, offset); if (limit < 0) break; offset = varIntEnd;
+      if (streamCountTooLarge(buf.subarray(at, offset))) break;
+      frames.push({ type: type === 0x16 ? 'streams_blocked_bidi' : 'streams_blocked_uni', limit: limit });
 
     } else if (type === 0x18) {
-      var seq = safeReadVarInt(); if (!seq) break;
-      var retire = safeReadVarInt(); if (!retire) break;
+      var seq = varIntAt(buf, offset); if (seq < 0) break; offset = varIntEnd;
+      var retire = varIntAt(buf, offset); if (retire < 0) break; offset = varIntEnd;
       if (offset >= buf.length) break;
       var cidLen = buf[offset++];
       if (offset + cidLen + 16 > buf.length) break;
       var connId = buf.slice(offset, offset + cidLen); offset += cidLen;
       var token = buf.slice(offset, offset + 16); offset += 16;
-      frames.push({ type: 'new_connection_id', seq: seq.value, retire: retire.value, connId: connId, token: token });
+      frames.push({ type: 'new_connection_id', seq: seq, retire: retire, connId: connId, token: token });
 
     } else if (type === 0x19) {
-      var seq = safeReadVarInt(); if (!seq) break;
-      frames.push({ type: 'retire_connection_id', seq: seq.value });
+      var seq = varIntAt(buf, offset); if (seq < 0) break; offset = varIntEnd;
+      frames.push({ type: 'retire_connection_id', seq: seq });
 
     } else if (type === 0x1a || type === 0x1b) {
       if (offset + 8 > buf.length) break;
@@ -774,19 +787,19 @@ function parse_quic_frames(buf) {
       frames.push({ type: type === 0x1a ? 'path_challenge' : 'path_response', data: data });
 
     } else if (type === 0x1c || type === 0x1d) {
-      var error = safeReadVarInt(); if (!error) break;
+      var error = varIntAt(buf, offset); if (error < 0) break; offset = varIntEnd;
       var frameType = null;
       if (type === 0x1c) {
-        var ft = safeReadVarInt(); if (!ft) break;
-        frameType = ft.value;
+        var ft = varIntAt(buf, offset); if (ft < 0) break; offset = varIntEnd;
+        frameType = ft;
       }
-      var reasonLen = safeReadVarInt(); if (!reasonLen) break;
-      if (offset + reasonLen.value > buf.length) break;
-      var reason = new TextDecoder().decode(buf.slice(offset, offset + reasonLen.value));
-      offset += reasonLen.value;
+      var reasonLen = varIntAt(buf, offset); if (reasonLen < 0) break; offset = varIntEnd;
+      if (offset + reasonLen > buf.length) break;
+      var reason = new TextDecoder().decode(buf.slice(offset, offset + reasonLen));
+      offset += reasonLen;
       frames.push({
         type: 'connection_close', application: type === 0x1d,
-        error: error.value, frameType: frameType, reason: reason
+        error: error, frameType: frameType, reason: reason
       });
 
     } else if (type === 0x1e) {
@@ -796,11 +809,11 @@ function parse_quic_frames(buf) {
       frames.push({ type: 'immediate_ack' });
 
     } else if (type === 0xaf) {
-      var afSeq = safeReadVarInt(); if (!afSeq) break;
-      var afThr = safeReadVarInt(); if (!afThr) break;
-      var afDelay = safeReadVarInt(); if (!afDelay) break;
-      var afReorder = safeReadVarInt(); if (!afReorder) break;
-      frames.push({ type: 'ack_frequency', seq: afSeq.value, threshold: afThr.value, maxDelayUs: afDelay.value, reorder: afReorder.value });
+      var afSeq = varIntAt(buf, offset); if (afSeq < 0) break; offset = varIntEnd;
+      var afThr = varIntAt(buf, offset); if (afThr < 0) break; offset = varIntEnd;
+      var afDelay = varIntAt(buf, offset); if (afDelay < 0) break; offset = varIntEnd;
+      var afReorder = varIntAt(buf, offset); if (afReorder < 0) break; offset = varIntEnd;
+      frames.push({ type: 'ack_frequency', seq: afSeq, threshold: afThr, maxDelayUs: afDelay, reorder: afReorder });
 
     } else if (type === 0x30 || type === 0x31) {
       // RFC 9221 DATAGRAM frame. The 0x31 form carries an explicit Length
@@ -810,8 +823,8 @@ function parse_quic_frames(buf) {
       // a "context ID" (that draft-era concept was removed before RFC 9221).
       var data;
       if (type === 0x31) {
-        var len = safeReadVarInt(); if (!len) break;
-        var end = offset + len.value;
+        var len = varIntAt(buf, offset); if (len < 0) break; offset = varIntEnd;
+        var end = offset + len;
         if (end > buf.length) break; // truncated / invalid length
         data = buf.slice(offset, end); offset = end;
       } else {

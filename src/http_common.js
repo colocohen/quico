@@ -29,7 +29,7 @@
 // ============================================================
 
 
-import crypto from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import { createEmitter } from './utils.js';
 
 
@@ -401,7 +401,7 @@ function buildResponsePseudoHeaders(statusCode, headers) {
  * between two unrelated TLS stacks are a curiosity rather than a failure.
  */
 function sha12(str) {
-  return crypto.createHash('sha256').update(str, 'utf8').digest('hex').slice(0, 12);
+  return Buffer.from(sha256_sync(str)).toString('hex').slice(0, 12);   // the string as its UTF-8
 }
 
 

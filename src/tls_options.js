@@ -32,6 +32,20 @@
 //                                    the default) or false (never)
 
 import lemonTls from 'lemon-tls';
+import * as PEM from 'cryptographic-formats/pem';
+
+// node:tls's `pfx` (PKCS#12: a Buffer, { buf, passphrase }, or an array of
+// them) without `key` / `cert`: the options with its key and chain in their
+// place — opened once, by lemon-tls's createSecureContext — for a server's
+// certificate and a client's alike. Anything else as it is.
+function withPfx(options) {
+  if (!options || options.pfx == null || (options.key && options.cert)) return options;
+  var sc = lemonTls.createSecureContext({ pfx: options.pfx, passphrase: options.passphrase });
+  return Object.assign({}, options, {
+    pfx: undefined, passphrase: undefined, key: sc.privateKey,
+    cert: sc.certificateChain.map(function (c) { return PEM.encode(c.cert, 'CERTIFICATE'); }).join(''),
+  });
+}
 
 // RFC 8446 §4.6.1 caps a ticket's lifetime at 7 days; a value past it is
 // refused, where node:tls would take it — a lifetime the client will not
@@ -105,4 +119,4 @@ function pickTlsOptions(options) {
   return out;
 }
 
-export { serverTlsOptions, pickTlsOptions, sessionTimeout };
+export { serverTlsOptions, pickTlsOptions, sessionTimeout, withPfx };

@@ -72,8 +72,9 @@ function createQuicClientSocket(opts) {
   var udpSocket = dgram.createSocket(isIPv6 ? 'udp6' : 'udp4');
   var quic = null;
 
+  // The datagram viewed, not copied (as quic_server's onUdpMessage does).
   udpSocket.on('message', function (msg, rinfo) {
-    if (quic) quic.feedDatagram(rinfo.address, rinfo.port, new Uint8Array(msg));
+    if (quic) quic.feedDatagram(rinfo.address, rinfo.port, new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
   });
 
   udpSocket.on('error', function (err) {

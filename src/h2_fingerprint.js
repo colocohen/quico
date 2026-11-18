@@ -11,7 +11,7 @@
 
 
 
-import crypto from 'node:crypto';
+import { md5_sync } from 'cryptographic-primitives/md5.js';
 import { sha12 } from './http_common.js';
 
 
@@ -112,7 +112,7 @@ function h2Fingerprint(observed) {
     // every fingerprint on a request looking alike; `md5` is for matching
     // anything outside quico, and without it a cross-check fails for no
     // visible reason.
-    md5: crypto.createHash('md5').update(raw, 'utf8').digest('hex'),
+    md5: Buffer.from(md5_sync(raw)).toString('hex'),
 
     raw: raw, s: s, wu: wu, p: p, ps: ps
   };
@@ -216,7 +216,7 @@ function h3Fingerprint(observed) {
   var raw = t + '|' + h + '|' + wu + '|' + ps;
   return {
     hash: sha12(raw),
-    md5: crypto.createHash('md5').update(raw, 'utf8').digest('hex'),
+    md5: Buffer.from(md5_sync(raw)).toString('hex'),
     raw: raw,
     tp: t, h3: h, wu: wu, ps: ps,
 

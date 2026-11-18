@@ -15,7 +15,6 @@
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import lemonTls from 'lemon-tls';
-import crypto from 'node:crypto';
 
 import { createServer as createH3Server } from './h3_server.js';
 import { createServer as createH2Server } from './h2_server.js';
@@ -23,9 +22,9 @@ import { createServer as createH1Server } from './h1_server.js';
 import { createTcpListener } from './tcp_listener.js';
 import { createSecureContext } from './tls_bridge.js';
 import { IncomingMessage, ServerResponse, _makeSocketStub, adoptApp } from './streams.js';
-import { creditAsRead } from './utils.js';
+import { creditAsRead, randomBuffer } from './utils.js';
 import { runEarlyDataFilter } from './http_common.js';
-import { serverTlsOptions, pickTlsOptions } from './tls_options.js';
+import { serverTlsOptions, pickTlsOptions, withPfx } from './tls_options.js';
 import { STATUS_CODES } from 'node:http';
 import { ServerStats } from './server_stats.js';
 import { createConnectUdp, isConnectUdp, datagramCapsule, STREAM_QUEUE_MAX } from './connect_udp.js';
@@ -165,6 +164,7 @@ function createServer(options, handler) {
   var ref = true;           // ref() / unref()
 
   // ---- TLS credentials ----
+  options = withPfx(options);
   var tlsKey = options.key || null;
   var tlsCert = options.cert || null;
   var tlsCa = options.ca || null;
@@ -172,7 +172,7 @@ function createServer(options, handler) {
   // Session tickets: one key for this server, TCP and QUIC alike — random
   // unless the application passes ticketKeys it keeps across restarts. And
   // the application's ticketData, carried inside each ticket (lemon-tls).
-  var ticketKeys = options.ticketKeys || crypto.randomBytes(48);
+  var ticketKeys = options.ticketKeys || randomBuffer(48);
   var ticketData = typeof options.ticketData === 'function' ? options.ticketData : null;
   // Encrypted Client Hello keys (RFC 9849), TCP and QUIC alike:
   // { keys: [{ config, privateKey, retry }] } — see lemon-tls generateEchKey.

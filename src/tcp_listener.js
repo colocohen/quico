@@ -13,7 +13,7 @@
  */
 
 import net from 'node:net';
-import crypto from 'node:crypto';
+import { randomBuffer } from './utils.js';
 import { Emitter } from './http_common.js';
 import { serverTlsOptions } from './tls_options.js';
 
@@ -57,7 +57,7 @@ function createTcpListener(options) {
   // connection drew its own and no client ever resumed. Random when not given:
   // tickets then last until this server restarts; pass ticketKeys (48 bytes)
   // kept across restarts to have them outlive it.
-  var ticketKeys = options.ticketKeys || crypto.randomBytes(48);
+  var ticketKeys = options.ticketKeys || randomBuffer(48);
   // Encrypted Client Hello keys (lemon-tls), read per connection.
   var ech = options.ech || null;
   var ocspRequest = typeof options.ocspRequest === 'function' ? options.ocspRequest : null;

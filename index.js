@@ -11,7 +11,8 @@
 //  Every protocol layer is here: HTTP/1.1 (h1.js), HTTP/2 (h2.js + hpack.js),
 //  HTTP/3 (h3.js + QUIC), and WebSocket. TLS comes from lemon-tls, also pure
 //  JavaScript. What remains from Node is the transport it alone can provide —
-//  node:net for TCP and node:dgram for UDP — plus node:crypto for primitives.
+//  node:net for TCP and node:dgram for UDP. Cryptography comes from
+//  cryptographic-primitives, certificates from cryptographic-formats.
 //
 //  The point is not purity for its own sake. One stack, one set of semantics:
 //  the same IncomingMessage and ServerResponse reach the application whether a
@@ -31,6 +32,7 @@ const generateEchKey = lemonTls.generateEchKey;
 import { WebTransport, WebTransportError, WebTransportBidirectionalStream, WebTransportReceiveStream, WebTransportSendStream,
          WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream } from './src/webtransport.js';
 import { WebSocket } from './src/ws_client.js';
+import { WebSocketStream, WebSocketError } from './src/ws_stream.js';
 import { connectUdp } from './src/connect_udp_client.js';
 import { WebSocketServer, upgradeWebSocket } from './src/ws_server.js';
 import { ja4h } from './src/ja4h.js';
@@ -54,7 +56,7 @@ const api = {
   createServer, request, get, Agent, globalAgent,
   IncomingMessage, ServerResponse, ClientRequest,
   connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebTransportBidirectionalStream, WebTransportReceiveStream, WebTransportSendStream,
-  WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream, WebSocket, WebSocketServer, upgradeWebSocket,
+  WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream, WebSocket, WebSocketStream, WebSocketError, WebSocketServer, upgradeWebSocket,
   ja4h, h2Fingerprint, h3Fingerprint, observeH2, profileRequest,
   createQuicServer, createQuicClientSocket, createTcpListener,
   createH1Server, createH2Server, createH3Server,
@@ -65,7 +67,7 @@ export {
   createServer, request, get, Agent, globalAgent,
   IncomingMessage, ServerResponse, ClientRequest,
   connectUdp, createSecureContext, generateEchKey, WebTransport, WebTransportError, WebTransportBidirectionalStream, WebTransportReceiveStream, WebTransportSendStream,
-  WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream, WebSocket, WebSocketServer, upgradeWebSocket,
+  WebTransportWriter, WebTransportSendGroup, WebTransportDatagramsWritable, WebTransportDatagramDuplexStream, WebSocket, WebSocketStream, WebSocketError, WebSocketServer, upgradeWebSocket,
   ja4h, h2Fingerprint, h3Fingerprint, observeH2, profileRequest,
   createQuicServer, createQuicClientSocket, createTcpListener,
   createH1Server, createH2Server, createH3Server,

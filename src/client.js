@@ -21,6 +21,7 @@ import { request as h1Request, H1Pool } from './h1_client.js';
 import { ClientRequest, IncomingMessage } from './streams.js';
 import { creditAsRead } from './utils.js';
 import { globalAgent, tlsIdentity } from './agent.js';
+import { withPfx } from './tls_options.js';
 
 
 // ============================================================
@@ -87,7 +88,7 @@ function request(url, options, callback) {
     options = url;
   }
 
-  options = options || {};
+  options = withPfx(options || {});
 
   var hostname = options.hostname || options.host || 'localhost';
   // Strip port suffix from host (e.g. "example.com:443")

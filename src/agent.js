@@ -13,7 +13,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { sha256_create } from 'cryptographic-primitives/sha2.js';
 import lemonTls from 'lemon-tls';
 
 
@@ -38,12 +38,12 @@ import lemonTls from 'lemon-tls';
 
 function digestOf(v) {
   if (v === undefined || v === null || v === '') return '';
-  var h = createHash('sha256');
+  var h = sha256_create();
   (Array.isArray(v) ? v : [v]).forEach(function (x) {
-    h.update(typeof x === 'string' || Buffer.isBuffer(x) || x instanceof Uint8Array ? x : String(x));
+    h.update(typeof x === 'string' || x instanceof Uint8Array ? x : String(x));   // a string as its UTF-8
     h.update('\0');
   });
-  return h.digest('hex').slice(0, 16);
+  return Buffer.from(h.digest()).toString('hex').slice(0, 16);
 }
 
 /** The TLS identity part of a pool name: '' for a cleartext connection. */

@@ -43,7 +43,13 @@ import {
 
 import { TLSBridge, defaultTransportParams } from './tls_bridge.js';
 import { QUIC_V1, QUIC_V2, SUPPORTED_VERSIONS, isSupportedVersion, isCompatible, parseVersionList, versionName } from './quic_version.js';
-import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { equal_sync } from 'cryptographic-primitives/ct.js';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
+
+// The SCID a 1-RTT packet passes to encrypt_quic_packet: none (short headers
+// carry no SCID), one array for every packet rather than a new one each.
+var NO_CID = new Uint8Array(0);
 
 // Random bytes for every packet (the greased QUIC bit, RFC 9287; the skipped
 // packet numbers) from a pool, refilled 4 KB at a time from the same secure
@@ -52,7 +58,7 @@ import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 var RANDOM_POOL_SIZE = 4096;
 var randomPool = null, randomPoolAt = RANDOM_POOL_SIZE;
 function randomByte() {
-  if (randomPoolAt >= RANDOM_POOL_SIZE) { randomPool = randomBytes(RANDOM_POOL_SIZE); randomPoolAt = 0; }
+  if (randomPoolAt >= RANDOM_POOL_SIZE) { randomPool = random_bytes_sync(RANDOM_POOL_SIZE); randomPoolAt = 0; }
   return randomPool[randomPoolAt++];
 }
 
@@ -143,7 +149,7 @@ function endpointTag(address) {
     if (!prefix) return null;
   }
   // A short hash: the ticket is encrypted anyway; this keeps it small.
-  return createHash('sha256').update(prefix).digest('hex').slice(0, 8);
+  return Buffer.from(sha256_sync(prefix)).toString('hex').slice(0, 8);
 }
 
 function expandV6(a) {
@@ -343,7 +349,7 @@ function QUICConnection(options) {
     // their_cids[0] — the peer's, as it gave it in its long headers.
     original_dcid: null,
     my_cids: options.isServer !== false
-      ? [options.localCid || new Uint8Array(randomBytes(8))]
+      ? [options.localCid || random_bytes_sync(8)]
       : [],
     their_cids: [],
     // Connection IDs beyond the first (RFC 9000 §5.1.1, §19.15-16). A peer
@@ -1629,7 +1635,12 @@ function QUICConnection(options) {
 
   var ZERO_RTT_HELD_MAX = 32;
   function zeroRttHold(pkt, path) {
-    if (context.zero_rtt_held.length < ZERO_RTT_HELD_MAX) context.zero_rtt_held.push({ pkt: pkt, path: path });
+    if (context.zero_rtt_held.length >= ZERO_RTT_HELD_MAX) return;
+    // Its bytes copied: they are a view of the datagram as received
+    // (quic_server's onUdpMessage), whose buffer is the caller's again once
+    // the datagram has been processed.
+    pkt.raw = new Uint8Array(pkt.raw);
+    context.zero_rtt_held.push({ pkt: pkt, path: path });
   }
   function zeroRttRelease() {
     if (!context.zero_rtt_read || !context.app_write) return;
@@ -2211,10 +2222,10 @@ function QUICConnection(options) {
     // The token of the first ID (from the transport parameters) and of every
     // other ID the peer issued and has not had retired (§10.3.1).
     var hit = false;
-    if (context.peer_reset_token !== null && timingSafeEqual(tail, context.peer_reset_token)) hit = true;
+    if (context.peer_reset_token !== null && equal_sync(tail, context.peer_reset_token)) hit = true;
     for (var i = 0; i < context.peer_cids.length; i++) {
       var pc = context.peer_cids[i];
-      if (!pc.retired && pc.token && pc.token.byteLength === 16 && timingSafeEqual(tail, pc.token)) hit = true;
+      if (!pc.retired && pc.token && pc.token.byteLength === 16 && equal_sync(tail, pc.token)) hit = true;
     }
     return hit;
   }
@@ -4120,7 +4131,9 @@ function QUICConnection(options) {
   function flushStream(sid) {
     var stream = context.recv_streams[sid];
     if (!stream) return;
-    var parts = [];
+    // The first piece alone, and an array only from a second one: a packet
+    // in order delivers one piece, and an array per delivery was garbage.
+    var first = null, parts = null;
     var offset = stream.flushed_to;
     // Walk the in-order prefix. processStreamFrame stores only bytes not held
     // yet, so the pieces never overlap and each one starts exactly where the
@@ -4136,12 +4149,13 @@ function QUICConnection(options) {
       if (chunk === undefined) break;   // a gap — wait for more data
       stream.chunks.delete(offset);
       if (offset + chunk.byteLength > upTo) { stream.held -= offset + chunk.byteLength - upTo; chunk = chunk.subarray(0, upTo - offset); }
-      parts.push(chunk);
+      if (first === null) first = chunk;
+      else (parts || (parts = [first])).push(chunk);
       offset += chunk.byteLength;
     }
     var resetNow = !!stream.reset_at && offset >= upTo;
-    if (parts.length === 0 && resetNow) { endResetAt(sid, stream); return; }
-    if (parts.length === 0) {
+    if (first === null && resetNow) { endResetAt(sid, stream); return; }
+    if (first === null) {
       // No bytes to deliver — but the stream may just have COMPLETED. A peer
       // whose final write ends exactly on a packet boundary closes the stream
       // with a zero-length FIN-only frame (quic-go does this for any body
@@ -4175,7 +4189,7 @@ function QUICConnection(options) {
     // Held for the application (see creditStream): counted before the
     // delivery, which may already credit some of it.
     if (heldCredit[sid] !== undefined) { heldCredit[sid] += delivered; delivered = 0; }
-    var data = parts.length === 1 ? parts[0] : concatUint8Arrays(parts);
+    var data = parts === null ? first : concatUint8Arrays(parts);
     var fin = !stream.reset_at && (stream.has_final && offset >= stream.total_size);
     if (fin) stream.fin_emitted = true;   // a late FIN-only retransmit must not fire a second end
     ev.emit('stream', Number(sid), data, fin);
@@ -6183,7 +6197,7 @@ function QUICConnection(options) {
 
   function startPathValidation(path) {
     if (path.challenge) return;   // already underway
-    path.challenge = { data: new Uint8Array(randomBytes(8)), padded: false, started: Date.now(), tries: 0, timer: null };
+    path.challenge = { data: random_bytes_sync(8), padded: false, started: Date.now(), tries: 0, timer: null };
     sendPathChallenge(path);
   }
 
@@ -6296,7 +6310,7 @@ function QUICConnection(options) {
     while (active < want && context.local_cids_issued < LOCAL_CID_ISSUE_MAX) {
       var made = context.isServer
         ? (typeof options.issueConnectionId === 'function' ? options.issueConnectionId() : null)
-        : { cid: new Uint8Array(randomBytes(context.my_cids[0].byteLength)), token: new Uint8Array(randomBytes(16)) };
+        : { cid: random_bytes_sync(context.my_cids[0].byteLength), token: random_bytes_sync(16) };
       if (!made) return;
       var seq = context.local_cid_next_seq++;
       context.local_cids.push({ seq: seq, cid: made.cid, token: made.token, retired: false });
@@ -6595,7 +6609,7 @@ function QUICConnection(options) {
     // original_dcid (RFC 9000 §7.2, §17.2.5.3).
     // SCID (long headers only): our own.
     var dcid = destinationCid(packetType, path);
-    var scid = packetType === '1rtt' ? new Uint8Array(0) : context.my_cids[0];
+    var scid = packetType === '1rtt' ? NO_CID : context.my_cids[0];
 
     // An ACK owed in this space rides along — any packet we send settles it
     // (see "ACK management"). Only where it fits: callers size their frames
@@ -8322,8 +8336,8 @@ function QUICConnection(options) {
 
     // Phase 2: fill gaps before send_offset (retransmit lost data), with
     // what Phase 1 just yielded no longer among them.
-    if (chunks.length > 0) missing = stream.missing_ranges.slice();
     if (used < maxBytes) {
+      if (chunks.length > 0) missing = stream.missing_ranges.slice();
       for (var i = 0; i < missing.length; i += 2) {
         if (used >= maxBytes) break;
         var mFrom = missing[i];
@@ -8461,8 +8475,8 @@ function QUICConnection(options) {
     // Initial packets, and Math.random() is predictable from its own output.
     // Our own ID is what the server addresses us by; a guessable one makes
     // our packets easier to find and forge.
-    var dcid = new Uint8Array(randomBytes(8));
-    var scid = new Uint8Array(randomBytes(8));
+    var dcid = random_bytes_sync(8);
+    var scid = random_bytes_sync(8);
 
     context.original_dcid = dcid;
     context.initial_key_cid = dcid;

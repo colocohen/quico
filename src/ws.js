@@ -12,8 +12,10 @@
  *     https://github.com/colocohen/quico
  */
 
-import crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { sha1_sync } from 'cryptographic-primitives/sha1.js';
 import { Emitter } from './http_common.js';
+import { randomBuffer } from './utils.js';
 
 
 // ============================================================
@@ -75,12 +77,12 @@ var EMPTY = Buffer.alloc(0);
 
 /** 16 random bytes, base64. RFC 6455 §4.1 requires them to be unpredictable. */
 function generateKey() {
-  return crypto.randomBytes(16).toString('base64');
+  return randomBuffer(16).toString('base64');
 }
 
 /** base64(sha1(key + GUID)) — the value the server must echo (§4.2.2). */
 function acceptKey(key) {
-  return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+  return Buffer.from(sha1_sync(key + WS_GUID)).toString('base64');
 }
 
 /**
@@ -110,7 +112,7 @@ function isValidUserCloseCode(code) {
 //  confidentiality — the key travels in the clear — it exists so an attacker
 //  who controls a page cannot make a browser emit chosen bytes on the wire and
 //  poison an intermediary's cache. That only holds if the key is
-//  unpredictable, which is why it comes from crypto.randomBytes and not
+//  unpredictable, which is why it comes from a secure random source and not
 //  Math.random.
 // ============================================================
 
@@ -173,7 +175,7 @@ function encodeFrame(opcode, payload, options) {
   }
 
   header[1] |= 0x80;
-  var maskKey = crypto.randomBytes(4);
+  var maskKey = random_bytes_sync(4);
   // Copy before masking: the caller's buffer must not be mutated. A user who
   // sends the same Buffer twice would otherwise send garbage the second time,
   // and the bug would look like corruption on the network.
