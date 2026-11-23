@@ -15,13 +15,14 @@
 import { URL } from 'node:url';
 import lemonTls from 'lemon-tls';
 
-import { request as h3Request } from './h3_client.js';
+import { request as h3Request, h3SocketInfo } from './h3_client.js';
 import { request as h2Request, H2Pool } from './h2_client.js';
 import { request as h1Request, H1Pool } from './h1_client.js';
 import { ClientRequest, IncomingMessage } from './streams.js';
 import { creditAsRead } from './utils.js';
 import { globalAgent, tlsIdentity } from './agent.js';
 import { withPfx } from './tls_options.js';
+import { urlHostname } from './http_common.js';
 
 
 // ============================================================
@@ -73,7 +74,7 @@ function request(url, options, callback) {
     var parsed = new URL(url);
     var fromUrl = {
       protocol: parsed.protocol,
-      hostname: parsed.hostname,
+      hostname: urlHostname(parsed.hostname),
       port: parsed.port ? parseInt(parsed.port) : 443,
       path: parsed.pathname + parsed.search
     };
@@ -89,16 +90,24 @@ function request(url, options, callback) {
   }
 
   options = withPfx(options || {});
+  // https.request's: every request here is made over TLS, so an http: URL
+  // (or protocol option) is refused, as node:https refuses it — it was
+  // taken for https: and the request went out as a TLS handshake to a
+  // cleartext server.
+  if (options.protocol != null && options.protocol !== 'https:') {
+    var badProto = new TypeError('Protocol "' + options.protocol + '" not supported. Expected "https:"');
+    badProto.code = 'ERR_INVALID_PROTOCOL';
+    throw badProto;
+  }
 
-  var hostname = options.hostname || options.host || 'localhost';
-  // Strip port suffix from host (e.g. "example.com:443")
-  var colonIdx = hostname.lastIndexOf(':');
-  if (colonIdx > 0) {
-    var afterColon = hostname.substring(colonIdx + 1);
-    if (/^\d+$/.test(afterColon)) {
-      if (!options.port) options.port = parseInt(afterColon);
-      hostname = hostname.substring(0, colonIdx);
-    }
+  var hostname = String(options.hostname || options.host || 'localhost');
+  // A port suffix on the host ("example.com:443", "[::1]:443") is taken off
+  // — and an IPv6 literal kept whole: "::1" has colons and no port, and was
+  // cut into the host ":" on port 1. Brackets are taken off.
+  var hp = /^\[([^\]]*)\](?::(\d+))?$/.exec(hostname) || (hostname.indexOf(':') === hostname.lastIndexOf(':') && /^([^:]+):(\d+)$/.exec(hostname));
+  if (hp) {
+    hostname = hp[1];
+    if (hp[2] && !options.port) options.port = parseInt(hp[2]);
   }
 
   var port = parseInt(options.port) || 443;
@@ -429,30 +438,6 @@ function request(url, options, callback) {
     return true;
   }
 
-  // res.socket over HTTP/3: there is no TLS socket — the handshake ran in
-  // the QUIC connection — so what an application asks a TLSSocket for here
-  // is answered from that connection: as over HTTP/2 and HTTP/1.1, whose
-  // res.socket is the lemon-tls socket.
-  function h3SocketInfo(conn) {
-    var q = conn && conn.quic;
-    if (!q) return null;
-    return {
-      encrypted: true,
-      alpnProtocol: 'h3',
-      get remoteAddress() { return q.remoteAddress || null; },
-      get remotePort() { return q.remotePort || null; },
-      get echStatus() { return q.echStatus; },
-      get echAccepted() { return q.echStatus === 'accepted'; },
-      isSessionReused: function () { return !!(q.isSessionReused && q.isSessionReused()); },
-      getPeerCertificate: function () { return q.getPeerCertificate ? q.getPeerCertificate() : {}; },
-      getNegotiationResult: function () { return q.getNegotiationResult ? q.getNegotiationResult() : null; },
-      // The connection's options while it runs (quic_connection's
-      // setOptions) — shared by every request on it (a pooled connection).
-      setOptions: function (o) { q.setOptions(o); return this; },
-      getOptions: function () { return q.getOptions(); }
-    };
-  }
-
   function tryH3(onFail, h3Port) {
     if (responded || clientReq.destroyed || clientReq.aborted) return;
     h3Port = h3Port || port;
@@ -653,7 +638,8 @@ function request(url, options, callback) {
         // be reused here.
         pool: pool ? agentH2Pool(pool) : oneOffH2(),
         // 0-RTT over TLS (see h2_client); not again after a 425.
-        earlyData: options.earlyData === true && !tooEarlyRetried
+        earlyData: options.earlyData === true && !tooEarlyRetried,
+        insecureHTTPParser: options.insecureHTTPParser === true
       }), function (res) {
         if (responded) return;
 
@@ -709,7 +695,8 @@ function request(url, options, callback) {
         requestOCSP: options.requestOCSP === true,
         ech: echConfig, echGrease: echGrease, ecdhCurve: options.ecdhCurve, sigalgs: options.sigalgs,
         pool: pool ? agentH1Pool(pool) : new H1Pool({ keepAlive: false }),
-        earlyData: options.earlyData === true && !tooEarlyRetried
+        earlyData: options.earlyData === true && !tooEarlyRetried,
+        insecureHTTPParser: options.insecureHTTPParser === true
       }), function (res) {
         if (responded) return;
 

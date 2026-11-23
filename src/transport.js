@@ -18,7 +18,8 @@ import {
   writeVarInt,
   varIntSize,
   writeVarIntInto,
-  readVarInt
+  readVarInt,
+  readVarIntExact
 } from './utils.js';
 import { SUPPORTED_VERSIONS, isSupportedVersion, longPacketType } from './quic_version.js';
 
@@ -989,6 +990,13 @@ function streamCountTooLarge(bytes) {
 
 function quietInt(bytes) { var r = readVarInt(bytes, 0); return r ? r.value : 0; }
 
+// A transport parameter identifier reserved for GREASE (RFC 9000 §18.1):
+// "31 * N + 27 for integer values of N". A BigInt, or a Number below 2^53.
+function isReservedTransportParam(id) {
+  var n = BigInt(id);
+  return n >= 27n && (n - 27n) % 31n === 0n;
+}
+
 function parse_transport_params(buf, start) {
   if (!(buf instanceof Uint8Array)) throw new Error('Expect Uint8Array');
   var offset = start || 0;
@@ -1001,7 +1009,7 @@ function parse_transport_params(buf, start) {
   // the range §18.2 gives it.
   var invalid = null;
   function bad(why) { if (!invalid) invalid = why; }
-  var seen = new Set();
+  var seen = new Set();   // exact identifiers (BigInt)
   // The parameters again in the order sent, on a non-enumerable property so
   // nothing that iterates the result is affected. Both order and unknown
   // identifiers are lost by the object form, and both are fingerprintable
@@ -1023,6 +1031,12 @@ function parse_transport_params(buf, start) {
   while (offset < end) {
     var idVar = readVarInt(buf, offset);
     if (!idVar) { bad('truncated'); break; }
+    // The identifier exactly, for the tests that need every bit of it: a
+    // peer picks a GREASE one at random over the whole varint range, past
+    // where idVar.value is exact — two different ones can round to one Number.
+    var exact = readVarIntExact(buf, offset).value;
+    // Reserved for GREASE (RFC 9000 §18.1: "31 * N + 27").
+    var reserved = isReservedTransportParam(exact);
     offset += idVar.byteLength;
 
     var lenVar = readVarInt(buf, offset);
@@ -1036,8 +1050,8 @@ function parse_transport_params(buf, start) {
     var id = idVar.value;
     // §7.4: "An endpoint SHOULD treat receipt of duplicate transport
     // parameters as a connection error" — unknown ones too.
-    if (seen.has(id)) bad('parameter 0x' + id.toString(16) + ' twice');
-    seen.add(id);
+    if (seen.has(exact)) bad('parameter 0x' + exact.toString(16) + ' twice');
+    seen.add(exact);
 
     var vi = function (bytes) { return viOf(id, bytes); };
     var cid = function (bytes) { return cidOf(id, bytes); };
@@ -1124,11 +1138,16 @@ function parse_transport_params(buf, start) {
     // number, so a length test silently let it through and the fingerprint
     // changed on every connection. Which parameters are opaque is fixed by
     // RFC 9000 §18.2, so it can simply be listed.
+    //
+    // `grease` marks a reserved identifier, whose id and value are both
+    // random per connection: a fingerprint keeps that it was there and drops
+    // the rest.
     ordered.push({
       id: id,
       value: OPAQUE_PARAMS[id] ? ('L' + valueBytes.length)
            : id === 0x11 ? ('V' + Buffer.from(valueBytes).toString('hex'))
-           : quietInt(valueBytes)
+           : quietInt(valueBytes),
+      grease: reserved
     });
   }
 
@@ -1182,5 +1201,6 @@ export {
   // Transport parameters
   build_transport_params,
   parse_transport_params,
+  isReservedTransportParam,
   transport_params_error
 };

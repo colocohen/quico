@@ -19,7 +19,7 @@ import {
   encodePrefixedInt,
   decodeStringLiteral,
   encodeStringLiteral,
-  bytesToLatin1,
+  fieldText,
   entrySize,
   ENTRY_OVERHEAD
 } from './hpack_primitives.js';
@@ -74,7 +74,8 @@ function hpackError(message) {
   // RFC 7540 §4.3: a header-block failure is a CONNECTION error of type
   // COMPRESSION_ERROR, never a stream error. The tables are connection-wide,
   // so once they diverge nothing on any stream can be trusted.
-  err.h2ErrorCode = 0x9;   // COMPRESSION_ERROR
+  // `h2Code`, as h2_frames' h2Error names it.
+  err.h2Code = 0x9;   // COMPRESSION_ERROR
   return err;
 }
 
@@ -185,19 +186,43 @@ function HpackDecoder(options) {
 
   var table = new DynamicTable(options.maxTableSize);
   var maxHeaderListSize = options.maxHeaderListSize || DEFAULT_MAX_HEADER_LIST_SIZE;
+  // The longest string literal (a name or a value, as encoded) a block may
+  // carry: nghttp2's NGHTTP2_HD_MAX_NV, which every node:http2 and nghttp2
+  // peer holds to. Checked on its length, before anything of it is decoded
+  // (a Huffman decode of a long string is the work a flood wants done).
+  var maxStringLength = options.maxStringLength != null ? options.maxStringLength : 65536;
 
   /**
    * Decode one header block into [ [name, value], ... ].
    *
    * Order is preserved: HTTP/2 pseudo-headers must come first and repeated
    * fields keep their order, so an object would be the wrong shape here.
-   * Throws on any inconsistency — see hpackError.
+   * Throws on any inconsistency — see hpackError — and on a list over
+   * maxHeaderListSize (decodeBounded says so instead).
    */
   this.decode = function (block) {
+    var r = this.decodeBounded(block);
+    if (r.tooLarge) throw hpackError('decoded header list exceeds ' + maxHeaderListSize + ' bytes');
+    return r.list;
+  };
+
+  /**
+   * decode, but a list over maxHeaderListSize is not an error of the block:
+   * { list, tooLarge }. The whole block is still decoded, so the dynamic
+   * table stays in step with the peer's encoder (stopping halfway would
+   * leave every later block on the connection wrong); the fields past the
+   * limit are not kept (an indexed field can repeat a large entry many
+   * times for a few bytes each). The list is only that stream's to refuse.
+   * `maxListSize`, when given, is the limit for this block instead
+   * (node:http2's is the stream's: what was in effect when it was made).
+   */
+  this.decodeBounded = function (block, maxListSize) {
     if (!Buffer.isBuffer(block)) block = Buffer.from(block);
+    var limit = maxListSize != null ? maxListSize : maxHeaderListSize;
 
     var out = [];
     var listSize = 0;
+    var tooLarge = false;
     var pos = 0;
 
     // §4.2: dynamic table size updates may only appear at the very start of a
@@ -220,7 +245,7 @@ function HpackDecoder(options) {
         }
         var entry = table.get(idx.value);
         if (!entry) throw hpackError('index ' + idx.value + ' is not in the table');
-        out.push([entry[0], entry[1]]);
+        if (!tooLarge) out.push([entry[0], entry[1]]);
         listSize += entrySize(entry[0], entry[1]);
         allowSizeUpdate = false;
 
@@ -229,7 +254,7 @@ function HpackDecoder(options) {
         var r = readLiteral(block, pos, 6);
         pos = r.next;
         table.add(r.name, r.value);
-        out.push([r.name, r.value]);
+        if (!tooLarge) out.push([r.name, r.value]);
         listSize += entrySize(r.name, r.value);
         allowSizeUpdate = false;
 
@@ -247,7 +272,7 @@ function HpackDecoder(options) {
         // ---- Literal Never Indexed (§6.2.3) ----
         var n = readLiteral(block, pos, 4);
         pos = n.next;
-        out.push([n.name, n.value, true]);   // third slot: never-index flag
+        if (!tooLarge) out.push([n.name, n.value, true]);   // third slot: never-index flag
         listSize += entrySize(n.name, n.value);
         allowSizeUpdate = false;
 
@@ -255,17 +280,15 @@ function HpackDecoder(options) {
         // ---- Literal without Indexing (§6.2.2) ----
         var w = readLiteral(block, pos, 4);
         pos = w.next;
-        out.push([w.name, w.value]);
+        if (!tooLarge) out.push([w.name, w.value]);
         listSize += entrySize(w.name, w.value);
         allowSizeUpdate = false;
       }
 
-      if (listSize > maxHeaderListSize) {
-        throw hpackError('decoded header list exceeds ' + maxHeaderListSize + ' bytes');
-      }
+      if (listSize > limit) tooLarge = true;
     }
 
-    return out;
+    return { list: out, tooLarge: tooLarge };
   };
 
   function readLiteral(block, pos, prefixBits) {
@@ -275,24 +298,25 @@ function HpackDecoder(options) {
 
     var name;
     if (nameIdx.value === 0) {
-      var nameLit = decodeStringLiteral(block, 7, pos, true);
+      var nameLit = decodeStringLiteral(block, 7, pos, true, maxStringLength);
       if (!nameLit) throw hpackError('truncated literal name');
+      if (nameLit.tooLong) throw hpackError('header name longer than ' + maxStringLength + ' bytes');
       pos = nameLit.next;
-      name = bytesToLatin1(nameLit.bytes);
-      if (name.length === 0) throw hpackError('empty header name');
-      // §8.1.2: field names in HTTP/2 are lowercase, and a mismatch must be
-      // treated as malformed. Checking it here catches it before the value
-      // reaches an application that compares names case-sensitively.
-      if (/[A-Z]/.test(name)) throw hpackError('header name is not lowercase: ' + name);
+      name = fieldText(nameLit.bytes);
+      // An empty or uppercase name is valid HPACK, and a malformed message
+      // (RFC 9113 §8.2.1): its stream's error, found by the field section's
+      // validation (http_common), not this block's — throwing here would stop
+      // halfway, the table out of step, and end the whole connection.
     } else {
       var entry = table.get(nameIdx.value);
       if (!entry) throw hpackError('name index ' + nameIdx.value + ' is not in the table');
       name = entry[0];
     }
 
-    var valLit = decodeStringLiteral(block, 7, pos, true);
+    var valLit = decodeStringLiteral(block, 7, pos, true, maxStringLength);
     if (!valLit) throw hpackError('truncated literal value');
-    return { name: name, value: bytesToLatin1(valLit.bytes), next: valLit.next };
+    if (valLit.tooLong) throw hpackError('header value longer than ' + maxStringLength + ' bytes');
+    return { name: name, value: fieldText(valLit.bytes), next: valLit.next };
   }
 
   /** The peer changed SETTINGS_HEADER_TABLE_SIZE. */
@@ -394,6 +418,20 @@ function HpackEncoder(options) {
   };
 
   function huff() { return useHuffman ? undefined : false; }
+
+  /**
+   * The most a header list can take encoded, whatever the table holds:
+   * nghttp2's nghttp2_hd_deflate_bound — two table size updates (6 bytes
+   * each), and every field as a literal with a new name, its two lengths 6
+   * bytes each. What a sender's bound on a header block is checked against
+   * before anything is encoded (the table is left as it was).
+   */
+  this.bound = function (headers) {
+    var list = normalize(headers);
+    var n = 12 + 12 * list.length;
+    for (var i = 0; i < list.length; i++) n += list[i][0].length + list[i][1].length;
+    return n;
+  };
 
   function push(out, bytes) {
     for (var i = 0; i < bytes.length; i++) out.push(bytes[i]);

@@ -162,10 +162,13 @@ function encodeFrame(opcode, payload, options) {
   } else {
     header = Buffer.allocUnsafe(10);
     header[1] = 127;
-    // 64-bit length. The high word is always zero here: a frame longer than
-    // 4 GiB is not something this library will build.
-    header.writeUInt32BE(0, 2);
-    header.writeUInt32BE(len, 6);
+    // 64-bit length, both words. The high one was written as 0 — "a frame
+    // longer than 4 GiB is not something this library will build" — but a
+    // Buffer may be longer (buffer.constants.MAX_LENGTH is 2^53 - 1 on 64-bit
+    // Node), and such a payload went out with its length mod 2^32: the peer
+    // reads the rest of it as frames.
+    header.writeUInt32BE(Math.floor(len / 4294967296), 2);
+    header.writeUInt32BE(len >>> 0, 6);
   }
 
   header[0] = (fin ? 0x80 : 0x00) | (opcode & 0x0f);

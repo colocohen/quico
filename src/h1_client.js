@@ -18,7 +18,7 @@ import { EventEmitter } from 'node:events';
 import { H1Parser, buildRequestHead, encodeChunk, encodeLastChunk } from './h1.js';
 import { IncomingMessage } from './streams.js';
 import { tlsIdentity } from './agent.js';
-import { validateHeaderName, validateHeaderValue, validateRequestTarget, trailerFields, formatPriority } from './http_common.js';
+import { validateHeaderName, validateHeaderValue, validateRequestTarget, trailerFields, formatPriority, formatAuthority } from './http_common.js';
 
 // What the body takes before write() says wait, while the socket is not yet
 // the request's.
@@ -226,6 +226,7 @@ function request(options, callback) {
   var parser = null;
   var reused = false;
   var settled = false;
+  var poolWhenSent = false;    // the response ended first: pooled once the request is all sent
   var sentEarly = false;       // the request went in TLS early data (see connect)
   ev.earlyData = null;         // 'accepted', 'rejected' or null (not sent early)
   var timeoutTimer = null;
@@ -247,6 +248,12 @@ function request(options, callback) {
   }
 
   var headSent = false;
+  function requestSaysClose() {
+    var c = headers['connection'];
+    if (c === undefined || c === null) return false;
+    var list = Array.isArray(c) ? c.join(',') : String(c);
+    return list.toLowerCase().split(',').some(function (t) { return t.replace(/^[ \t]+|[ \t]+$/g, '') === 'close'; });
+  }
   var IDEMPOTENT = { GET: 1, HEAD: 1, OPTIONS: 1, TRACE: 1, PUT: 1, DELETE: 1 };
 
   function fail(err) {
@@ -364,7 +371,7 @@ function request(options, callback) {
     socket.removeAllListeners('data');
     socket.on('error', fail);
 
-    parser = new H1Parser({ isServer: false });
+    parser = new H1Parser({ isServer: false, insecureHTTPParser: options.insecureHTTPParser === true });
     // Response framing depends on the request method: a HEAD reply carries the
     // Content-Length of a body it does not send, and a 2xx to CONNECT is a
     // tunnel. Without this the parser would read the next response's head as
@@ -416,11 +423,23 @@ function request(options, callback) {
 
     parser.on('end', function () {
       if (!res) return;
-      var keepAlive = res._keepAlive;
+      // Kept only if both ends keep it: a request that said Connection:
+      // close may not be followed by another on its connection (RFC 9112
+      // §9.6), and the server closes it after this response. It went back
+      // to the pool, and the next request on it failed (ECONNRESET) as the
+      // server's close arrived — node:http's client does not reuse it.
+      var keepAlive = res._keepAlive && !requestSaysClose();
       res._endData();
       res = null;
 
       if (keepAlive && socket && !socket.destroyed) {
+        // The response ended before the request had all been sent (a 401 or
+        // a 413 to an upload): the socket is the request's until its body
+        // has gone, as node:http waits for the request's 'finish'. It was
+        // pooled at once: the rest of the body was never sent, the server
+        // still waited for it, and the next request on the socket was read
+        // as the rest of this one's body.
+        if (streaming && !ended) { poolWhenSent = true; return; }
         var s = socket;
         releaseSocket(false);
         pool.put(poolHost, port, s);
@@ -494,11 +513,9 @@ function request(options, callback) {
   // The defaults every request head gets, unless the caller set them.
   function defaultHeaders() {
     if (!('host' in headers)) {
-      // RFC 9112 §3.2. The default port for the scheme is omitted, as every
-      // client does — including it changes the origin as far as many servers
-      // and virtual hosts are concerned.
-      var defaultPort = options.tls ? 443 : 80;
-      setHeader('Host', port === defaultPort ? hostname : hostname + ':' + port);
+      // RFC 9112 §3.2: formatAuthority's — the scheme's default port left
+      // out, an IPv6 literal in brackets.
+      setHeader('Host', formatAuthority(hostname, port, options.tls ? 443 : 80));
     }
     if (!('user-agent' in headers)) setHeader('User-Agent', 'quico/1.0');
     if (!('accept' in headers)) setHeader('Accept', '*/*');
@@ -565,6 +582,11 @@ function request(options, callback) {
 
     try {
       socket.write(buildRequestHead(method, path, out));
+      // Sent: a close before the response may have followed a request the
+      // server acted on (see 'close'). Only the streamed path said so, and
+      // a POST sent whole and then lost was tried again over another
+      // protocol — sent twice.
+      headSent = true;
       if (body) socket.write(chunked ? Buffer.concat(encodeChunk(body).concat([encodeLastChunk(reqTrailers)])) : body);
       else if (chunked) socket.write(encodeLastChunk(reqTrailers));
     } catch (err) {
@@ -645,7 +667,10 @@ function request(options, callback) {
     // write once the socket is the request's, chunked unless the caller set
     // a Content-Length — with the socket's backpressure.
     write: function (chunk, encoding) {
-      if (ended || settled) return false;
+      // After the response has begun the body may still go, as on
+      // node:http (an upload the server answered early); not once the
+      // request failed or gave its socket up.
+      if (ended || (settled && !socket)) return false;
       if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding || 'utf8');
       if (!chunk || chunk.length === 0) return !needDrain;
       if (!streaming && readyDone && !sent) startStreaming();
@@ -676,6 +701,11 @@ function request(options, callback) {
         if (chunk && chunk.length) writeOut(chunk);
         ended = true;
         finishStream();
+        if (poolWhenSent && socket && !socket.destroyed) {
+          var s = socket;
+          releaseSocket(false);
+          pool.put(poolHost, port, s);
+        }
         return clientReq;
       }
       if (chunk && chunk.length) { bodyChunks.push(chunk); bodyBuffered += chunk.length; }

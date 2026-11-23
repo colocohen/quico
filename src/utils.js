@@ -199,6 +199,17 @@ function readVarInt(array, offset) {
   return null;
 }
 
+// The varint at offset, exactly, as a BigInt — readVarInt returns a Number,
+// which rounds above 2^53. For the few tests that need every bit of an
+// identifier the peer chose freely, such as whether it is a reserved (GREASE)
+// one: a modulus of a rounded value answers for a different number.
+function readVarIntExact(array, offset) {
+  var r = readVarInt(array, offset);
+  if (!r) return null;
+  var v = BigInt(array[offset] & 0x3f);
+  for (var i = 1; i < r.byteLength; i++) v = (v << 8n) | BigInt(array[offset + i]);
+  return { value: v, byteLength: r.byteLength };
+}
 
 // ============================================================
 //  Binary helpers
@@ -526,6 +537,7 @@ export {
   varIntSize,
   writeVarIntInto,
   readVarInt,
+  readVarIntExact,
   concatUint8Arrays,
   uint8Equal,
   wt_stream_header,

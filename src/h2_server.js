@@ -15,10 +15,11 @@
 import { EventEmitter } from 'node:events';
 import { Duplex } from 'node:stream';
 
-import { H2Connection, SOCKET_HIGH_WATER } from './h2.js';
+import { H2Connection, SOCKET_HIGH_WATER, H2_STREAM_CODES, addSessionOps, toWire, validateSettings, checkRemoteCustomSettings } from './h2.js';
 import * as F from './h2_frames.js';
 import { buildResponsePseudoHeaders, corkForTick, pseudoHeadersToRequest, runRequestHandler, STATUS_TEXT, maxRequestsPerSocket,
-         DEFAULT_HEADERS_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, startDeadline, responsePriority, trailerFields, statusHasNoBody, httpDate, streamResetLimiter } from './http_common.js';
+         DEFAULT_HEADERS_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, startDeadline, responsePriority, trailerFields, statusHasNoBody, httpDate, streamResetLimiter,
+         argType, sessionGone, sessionCodeError, http2HeaderObject, ServerStream } from './http_common.js';
 import { observeH2 } from './h2_fingerprint.js';
 import { IncomingMessage, ServerResponse } from './streams.js';
 import { createTcpListener } from './tcp_listener.js';
@@ -72,8 +73,21 @@ function translateConnError(code) {
 }
 
 
+// node:http2's checks of `settings`, `remoteCustomSettings` and `origins`, at
+// createServer() / connect() rather than on the first connection.
+function checkSessionOptions(o) {
+  if (o.settings !== undefined) {
+    if (o.settings === null || typeof o.settings !== 'object') throw argType('options.settings', 'object', o.settings);
+    validateSettings(o.settings);
+  }
+  checkRemoteCustomSettings(o.remoteCustomSettings);
+  if (o.origins !== undefined && !Array.isArray(o.origins)) throw argType('options.origins', 'Array', o.origins);
+}
+
+
 function createServer(options, handler) {
   if (typeof options === 'function') { handler = options; options = {}; }
+  checkSessionOptions(options || {});
   options = options || {};
 
   var ev = new EventEmitter();
@@ -116,11 +130,24 @@ function createServer(options, handler) {
       maxFrameSize: options.maxFrameSize,
       maxHeaderListSize: options.maxHeaderListSize,
       headerTableSize: options.headerTableSize,
+      // node:http2's: entries a client's SETTINGS may carry (32).
+      maxSettings: options.maxSettings,
+      // node:http2's: refused frames a client may send before the
+      // connection is given up (1000).
+      maxSessionInvalidFrames: options.maxSessionInvalidFrames,
+      // node:http2's: the longest header block sent (64 KB).
+      maxSendHeaderBlockLength: options.maxSendHeaderBlockLength,
+      // Its maxSessionMemory, in bytes: new streams past it are refused.
+      maxSessionMemory: maxSessionMemory,
+      // node:http2's paddingStrategy (0 none, 1 aligned, 2 max).
+      paddingStrategy: options.paddingStrategy,
       // RFC 8441. On by default: a server that can accept WebSocket over
       // HTTP/2 should say so, or browsers open a second HTTP/1.1 connection
       // instead. Passing false turns it off for a server that has no
       // WebSocket endpoint and no reason to invite extended CONNECT.
       enableConnectProtocol: options.enableConnectProtocol,
+      // node:http2's `settings` option, by the RFC's names.
+      settings: options.settings ? toWire(options.settings) : null,
       // DATA is held while the socket's unsent bytes are over this mark — the
       // flow-control windows bound what the peer may receive, this what we
       // queue for it (see flushStream in h2.js).
@@ -133,6 +160,7 @@ function createServer(options, handler) {
     });
 
     var streams = {};     // id -> { req, res, deadline }
+    var wires = {};       // id -> the response wiring's close hook, while the stream is open
     var served = 0;       // requests on this connection (maxRequestsPerSocket)
     var destroyed = false;
 
@@ -192,16 +220,25 @@ function createServer(options, handler) {
      * a QUIC stream there — so that one piece of limiting code works against
      * both without branching on version.
      */
-    var connHandle = {
-      httpVersion: '2.0',
-      get remoteAddress() { return socket.remoteAddress; },
-      get remotePort() { return socket.remotePort; },
-      get encrypted() { return !!socket.encrypted; },
+    var connHandle = new EventEmitter();
+    var sessionClosed = false;   // close() called: node:http2's `closed`
+    Object.defineProperties(connHandle, {
+      httpVersion: { value: '2.0', enumerable: true },
+      remoteAddress: { get: function () { return socket.remoteAddress; }, enumerable: true },
+      remotePort: { get: function () { return socket.remotePort; }, enumerable: true },
+      encrypted: { get: function () { return !!socket.encrypted; }, enumerable: true },
+      // node:http2's: what ALPN chose, 'h2c' over cleartext.
+      alpnProtocol: { get: function () { return socket.encrypted ? (socket.alpnProtocol || 'h2') : 'h2c'; }, enumerable: true },
+      type: { value: 0, enumerable: true },   // NGHTTP2_SESSION_SERVER
+      closed: { get: function () { return sessionClosed; }, enumerable: true },
+      destroyed: { get: function () { return destroyed; }, enumerable: true },
+      activeStreams: { get: function () { return Object.keys(streams).length; }, enumerable: true }
+    });
+    Object.assign(connHandle, {
       // The session ticket: { data, resumed, offered } (see lemon-tls
       // getTicketInfo); null over cleartext.
       getTicketInfo: function () { return socket.getTicketInfo ? socket.getTicketInfo() : null; },
       isSessionReused: function () { return !!(socket.isSessionReused && socket.isSessionReused()); },
-      get activeStreams() { return Object.keys(streams).length; },
       fingerprint: getFingerprint,
 
       sendRstStream: function (streamId, code) {
@@ -209,11 +246,72 @@ function createServer(options, handler) {
       },
 
       // Stops new streams; in-flight ones finish. See the note in h2.js.
-      goaway: function (code) { h2.goaway(translateConnError(code)); },
+      //
+      // node:http2's goaway(code, lastStreamId, opaqueData), and its checks.
+      // `code` may also be one of quico's intents ('overloaded': HTTP/2's
+      // ENHANCE_YOUR_CALM, HTTP/3's H3_EXCESSIVE_LOAD), which a rate limiter
+      // uses without knowing the version.
+      goaway: function (code, lastStreamId, opaqueData) {
+        if (destroyed) throw sessionGone();
+        if (code !== undefined && typeof code !== 'number' && typeof code !== 'string') throw argType('code', 'number', code);
+        if (lastStreamId !== undefined && typeof lastStreamId !== 'number') throw argType('lastStreamId', 'number', lastStreamId);
+        if (opaqueData !== undefined && !ArrayBuffer.isView(opaqueData)) throw argType('opaqueData', 'Buffer, TypedArray, or DataView', opaqueData);
+        var data = opaqueData && Buffer.from(opaqueData.buffer, opaqueData.byteOffset, opaqueData.byteLength);
+        h2.goaway(translateConnError(code), lastStreamId, data);
+      },
 
-      // For when stopping is not enough.
-      destroy: function () { destroy(null); }
-    };
+      // node:http2's close(callback): GOAWAY (NO_ERROR), no new streams, and
+      // the session ends when the ones in flight have — then 'close', and the
+      // callback.
+      close: function (callback) {
+        if (sessionClosed || destroyed) return;
+        sessionClosed = true;
+        if (typeof callback === 'function') connHandle.once('close', callback);
+        draining = true;
+        try { h2.sendGoaway(F.ERROR.NO_ERROR); } catch (e) {}
+        finishIfDone();
+      },
+
+      // node:http2's destroy(error, code): at once, GOAWAY with `code` —
+      // INTERNAL_ERROR when there is an error, NO_ERROR when not —, the
+      // streams with it; 'error' (when an error), then 'close'. A number in
+      // place of the error is the code (an error of its own unless NO_ERROR),
+      // and as goaway(), the code may be one of quico's intents.
+      destroy: function (error, code) {
+        if (destroyed) return;
+        if (typeof error === 'number' || typeof error === 'string') {
+          code = translateConnError(error);
+          error = code !== F.ERROR.NO_ERROR ? sessionCodeError(code) : undefined;
+        } else if (code !== undefined) code = translateConnError(code);
+        if (code === undefined) code = error ? F.ERROR.INTERNAL_ERROR : F.ERROR.NO_ERROR;
+        // goaway(), not sendGoaway(): the code goes even after an earlier GOAWAY.
+        try { h2.goaway(code); } catch (e) {}
+        if (error) process.nextTick(sessionError, error);
+        destroy(error || null, true);
+      }
+    });
+
+    // settings(), ping(), setLocalWindowSize(), state, setTimeout() — node:http2's
+    // session operations, the client's too (h2.js addSessionOps).
+    var ops = addSessionOps(connHandle, {
+      h2: function () { return h2; },
+      destroyed: function () { return destroyed; },
+      connecting: function () { return false; },
+      closed: function () { return sessionClosed; },
+      whenUp: function (fn) { fn(); },
+      fail: function (err) { connHandle.destroy(err); },
+      isServer: true,
+      encrypted: function () { return !!socket.encrypted; },
+      options: options
+    });
+    ops.attach(h2);
+
+    // A session's errors, as node:http2 reports them: 'error' on it, and
+    // 'sessionError' (err, session) on the server.
+    function sessionError(err) {
+      if (connHandle.listenerCount('error') > 0) connHandle.emit('error', err);
+      ev.emit('sessionError', err, connHandle);
+    }
 
     h2.on('stream_open', function (streamId) {
       ev.emit('stream_open', connHandle, streamId);
@@ -228,7 +326,7 @@ function createServer(options, handler) {
       var rr = new Error('too many stream resets (streamResetBurst, streamResetRate)');
       rr.code = 'ERR_HTTP2_STREAM_RESET_RATE';
       try { h2.goaway(F.ERROR.ENHANCE_YOUR_CALM); } catch (e) {}
-      ev.emit('sessionError', rr, connHandle);
+      sessionError(rr);
       destroy(rr, true);
     });
 
@@ -293,6 +391,11 @@ function createServer(options, handler) {
         if (st.res) st.res._abortResponse();
       }
       streams = {};
+      // The core API's streams go with it, at once.
+      for (var wid in wires) wires[wid].close(err ? F.ERROR.INTERNAL_ERROR : F.ERROR.NO_ERROR, true);
+      ops.end();
+      // 'close' after what the destroy reports ('error'), as node:http2's.
+      process.nextTick(function () { connHandle.emit('close'); });
       if (!linger) { try { socket.destroy(); } catch (e) {} return; }
       try { socket.end(); } catch (e) {}
       var t = setTimeout(function () { try { socket.destroy(); } catch (e) {} }, 1000);
@@ -316,7 +419,7 @@ function createServer(options, handler) {
       if (socket.writableLength > maxSessionMemory) {
         var e = new Error('peer is not reading: ' + socket.writableLength + ' bytes queued');
         e.code = 'ERR_HTTP2_SESSION_MEMORY';
-        ev.emit('sessionError', e, connHandle);
+        sessionError(e);
         destroy(e);
       }
     });
@@ -325,7 +428,7 @@ function createServer(options, handler) {
     socket.on('drain', function () { if (!destroyed) h2.flushAll(); });
 
     h2.on('error', function (err) {
-      ev.emit('sessionError', err, connHandle);
+      sessionError(err);
       // GOAWAY has already been queued by the connection layer; let it reach
       // the peer before the socket goes, so the client learns why.
       destroy(err, true);
@@ -334,11 +437,11 @@ function createServer(options, handler) {
     socket.on('data', function (chunk) {
       if (destroyed) return;
       try { h2.execute(chunk); }
-      catch (err) { ev.emit('sessionError', err, connHandle); destroy(err); }
+      catch (err) { sessionError(err); destroy(err); }
     });
 
     socket.on('error', function (err) {
-      ev.emit('sessionError', err, connHandle);
+      sessionError(err);
       destroy(err);
     });
 
@@ -389,6 +492,9 @@ function createServer(options, handler) {
       finishIfDone();
     });
     h2.on('stream_close', function (id) {
+      // After this tick's 'rst' (which gives the code) and 'end'.
+      var w = wires[id];
+      if (w) process.nextTick(function () { w.close(w.rstCode); });
       // A tunnel closed both ways: its entry goes (nothing else removes it —
       // a long-lived connection kept every WebSocket it ever carried).
       var st = streams[id];
@@ -494,14 +600,8 @@ function createServer(options, handler) {
       // reading the body (an auth check, a lookup). The chunks and the 'end'
       // were lost, and the request waited forever for a body it had already
       // been given. node:http keeps a request paused until someone reads it;
-      // so does this now.
-      var uncredited = 0;
-      req._h2Arrived = function (n) { uncredited += n; };
-      req._read = function () {
-        if (uncredited > 0) { h2.consume(streamId, uncredited); uncredited = 0; }
-      };
-
-      wireResponse(streamId, req, res);
+      // so does this now. (The body's way in, and the credit: wireResponse.)
+      wireResponse(streamId, req, res, headers, endStream);
 
       if (endStream) req._endData();
       else if (req.method !== 'CONNECT') armRequestDeadline(streamId, streams[streamId]);   // a tunnel stays open
@@ -513,8 +613,10 @@ function createServer(options, handler) {
       runRequestHandler(function () {
         if (typeof handler === 'function') handler(req, res);
         ev.emit('request', req, res);
+        // The unified server announces it itself, after its own gates.
+        if (!options.announcesStream) req._announceStream(ev);
       }, function () {
-        if (res.writableEnded || streams[streamId] === undefined) return;
+        if (res.writableEnded || streams[streamId] === undefined || streams[streamId].responseDone) return;
         clearRequestDeadline(streams[streamId]);
         delete streams[streamId];
         h2.sendRstStream(streamId, F.ERROR.INTERNAL_ERROR);
@@ -527,17 +629,13 @@ function createServer(options, handler) {
       var st = streams[streamId];
       if (!st) return;
       if (st.duplex) { st.duplex.push(chunk); h2.consume(streamId, chunk.length); return; }
-      if (st.req) {
-        // Counted before the push: a consumer already reading pulls
-        // synchronously from inside it, and _read hands the credit back.
-        st.req._h2Arrived(chunk.length);
-        st.req._pushData(chunk);
-      }
+      if (st.deliver) st.deliver(chunk);
     });
 
     h2.on('trailers', function (streamId, trailers) {
       var st = streams[streamId];
       if (st && st.req) st.req.trailers = trailers;
+      if (st && st.trailersTo) st.trailersTo(trailers);
     });
 
     h2.on('end', function (streamId) {
@@ -545,11 +643,19 @@ function createServer(options, handler) {
       if (!st) return;
       if (st.duplex) { st.duplex.push(null); return; }
       clearRequestDeadline(st);
-      if (st.req) st.req._endData();
+      if (st.deliverEnd) st.deliverEnd();
       if (st.responseDone) delete streams[streamId];
     });
 
+    // A response's HEADERS or trailers too long to send
+    // (maxSendHeaderBlockLength): the stream is reset FRAME_SIZE_ERROR, as
+    // node:http2 closes it, so the client is not left waiting.
+    h2.on('frame_error', function (streamId, type, code) {
+      h2.sendRstStream(streamId, code);
+    });
+
     h2.on('rst', function (streamId, code) {
+      if (wires[streamId]) wires[streamId].rstCode = code;
       var st = streams[streamId];
       if (!st) return;
       delete streams[streamId];
@@ -685,45 +791,36 @@ function createServer(options, handler) {
     //  three hooks to write HTTP/1.1 bytes, h3_server to write H3 frames.
     // ============================================================
 
-    function wireResponse(streamId, req, res) {
+    function wireResponse(streamId, req, res, reqHeaders, endAfterHeaders) {
       var bodyAllowed = true;
-      var finished = false;
+      var finished = false;      // the response's end has gone (END_STREAM, or trailers)
+      // Its head has gone — sent by res (writeHead, the first write) or by the
+      // stream's respond(), whichever came first: there is one response, and
+      // the other API sees it sent.
+      var headersSent = false;
+      var isHead = req.method === 'HEAD';
+      var core = null;           // node:http2's ServerHttp2Stream, made when asked for
+      var closedCode;            // the stream closed, with this code
 
-      res._flushHeaders = function () {
-        if (res.headersSent || res._aborted || destroyed) return;
-        var headers = res.getHeaders();
-        var code = res.statusCode;
-
-        // HTTP/2 has no reason phrase and no connection-specific fields.
-        // buildResponsePseudoHeaders drops the latter; sending them would make
-        // the message malformed for the peer and, worse, would be forwarded by
-        // a proxy into an HTTP/1.1 hop where they change the framing.
-        delete headers['connection'];
-        delete headers['keep-alive'];
-        delete headers['transfer-encoding'];
-        delete headers['upgrade'];
-
-        bodyAllowed = !statusHasNoBody(code) && req.method !== 'HEAD';
-
-        if (!('date' in headers) && res.sendDate !== false) headers['date'] = httpDate();
-        // A function when the server was built before its port was known —
-        // the unified server builds its layers at creation and learns the
-        // port from listen(), or from options.port when fed from outside.
-        var altSvcNow = typeof altSvc === 'function' ? altSvc() : altSvc;
-        if (altSvcNow && !('alt-svc' in headers)) headers['alt-svc'] = altSvcNow;
-
-        var list = buildResponsePseudoHeaders(code, headers);
-        try { h2.sendHeaders(streamId, list, false); }
-        catch (e) { destroy(e); return; }
+      /**
+       * The response's head, the one place it is sent. A head that ends the
+       * stream (the core API's endStream, a 204, a HEAD) is the response's
+       * end as well.
+       */
+      function sendHead(list, status, endStream) {
+        bodyAllowed = !statusHasNoBody(status) && !isHead;
+        h2.sendHeaders(streamId, list, endStream);
+        headersSent = true;
         res.headersSent = true;
-      };
+        if (endStream) responseOver();
+      }
 
-      res._write = function (chunk, encoding, callback) {
+      // A body chunk, for res and the stream alike.
+      function sendBody(chunk, encoding, callback) {
         // The peer reset this stream while the handler was still producing.
         // Discard rather than error: the handler is mid-flight and cannot be
         // expected to check on every write.
-        if (res._aborted || destroyed) { callback(); return; }
-        if (!res.headersSent) res._flushHeaders();
+        if (res._aborted || destroyed || finished) { callback(); return; }
         if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
 
         // A HEAD response, or a bodiless status: the application still wrote
@@ -744,19 +841,18 @@ function createServer(options, handler) {
           callback();
         }
         h2.on('drain', onDrain);
-      };
+      }
 
-      res._final = function (callback) {
-        if (res._aborted || destroyed) { callback(); return; }
-        if (finished) { callback(); return; }
+      // The response's end: trailers, or END_STREAM on an empty DATA frame.
+      function sendEnd(trailers) {
+        if (finished || res._aborted || destroyed) return;
+        if (trailers) h2.sendTrailers(streamId, trailers);
+        else h2.sendData(streamId, null, true);
+        responseOver();
+      }
+
+      function responseOver() {
         finished = true;
-        if (!res.headersSent) res._flushHeaders();
-        var trailers = trailerFields(res.trailers);
-        if (trailers) {
-          h2.sendTrailers(streamId, trailers);
-        } else {
-          h2.sendData(streamId, null, true);
-        }
         // The entry goes when the request is over too. Removed here, with the
         // request body still arriving — an application reading it after
         // answering — every DATA frame after the response was dropped, its
@@ -766,8 +862,164 @@ function createServer(options, handler) {
           st.responseDone = true;
           if (req.complete || req.aborted) delete streams[streamId];
         }
+      }
+
+      res._flushHeaders = function () {
+        if (headersSent || res._aborted || destroyed) return;
+        var headers = res.getHeaders();
+        var code = res.statusCode;
+
+        // HTTP/2 has no reason phrase and no connection-specific fields.
+        // buildResponsePseudoHeaders drops the latter; sending them would make
+        // the message malformed for the peer and, worse, would be forwarded by
+        // a proxy into an HTTP/1.1 hop where they change the framing.
+        delete headers['connection'];
+        delete headers['keep-alive'];
+        delete headers['transfer-encoding'];
+        delete headers['upgrade'];
+
+        if (!('date' in headers) && res.sendDate !== false) headers['date'] = httpDate();
+        // A function when the server was built before its port was known —
+        // the unified server builds its layers at creation and learns the
+        // port from listen(), or from options.port when fed from outside.
+        var altSvcNow = typeof altSvc === 'function' ? altSvc() : altSvc;
+        if (altSvcNow && !('alt-svc' in headers)) headers['alt-svc'] = altSvcNow;
+
+        try { sendHead(buildResponsePseudoHeaders(code, headers), code, false); }
+        catch (e) { destroy(e); }
+      };
+
+      res._write = function (chunk, encoding, callback) {
+        if (res._aborted || destroyed) { callback(); return; }
+        if (!headersSent) res._flushHeaders();
+        sendBody(chunk, encoding, callback);
+      };
+
+      res._final = function (callback) {
+        if (res._aborted || destroyed || finished) { callback(); return; }
+        if (!headersSent) res._flushHeaders();
+        sendEnd(trailerFields(res.trailers));
+        // node:http2's res.end() is its stream's end().
+        if (core && !core.writableEnded) core.end();
         callback();
       };
+
+      // ---- The request body's way in ----
+      //
+      // Into req — and, once the core API's stream exists, into the stream,
+      // which req then reads from (from its first read: node's direction,
+      // where req is a view of its stream). So a 'stream' listener that reads
+      // the body, or only listens to it, takes nothing from a handler that
+      // reads req later. Flow-control credit goes back as the one the body
+      // arrives in is read.
+      var uncredited = 0;
+      function credit() { if (uncredited > 0) { h2.consume(streamId, uncredited); uncredited = 0; } }
+      var reqReading = false;    // req has asked for data
+      var reqViewing = false;    // … and reads it from the stream
+      req._read = function () {
+        reqReading = true;
+        if (!core) { credit(); return; }
+        if (!reqViewing) viewStream();
+        else process.nextTick(function () { if (!core.destroyed) core.resume(); });
+      };
+      function viewStream() {
+        reqViewing = true;
+        if (core.readableEnded) { if (!req.readableEnded) req.push(null); return; }
+        core.on('data', function (chunk) { if (!req.push(chunk)) core.pause(); });
+        core.on('end', function () { if (!req.readableEnded) req.push(null); });
+      }
+      var st0 = streams[streamId];
+      // Counted before the push: a consumer already reading pulls
+      // synchronously from inside it, and _read hands the credit back.
+      st0.deliver = function (chunk) {
+        uncredited += chunk.length;
+        if (core) { core._touch(); core.push(chunk); } else req._pushData(chunk);
+      };
+      // node:http2's 'trailers' (headers, flags) on the stream.
+      st0.trailersTo = function (trailers) {
+        if (!core) return;
+        core._touch();
+        core.emit('trailers', http2HeaderObject(trailers._rawHeaders || []), F.FLAG.END_HEADERS | F.FLAG.END_STREAM);
+      };
+      // `complete` says the body has arrived, as before; req's end comes
+      // through the stream.
+      st0.deliverEnd = function () {
+        if (!core) { req._endData(); return; }
+        req.complete = true;
+        core.push(null);
+      };
+
+      // ---- The core API's stream (node:http2's ServerHttp2Stream) ----
+      //
+      // Made only when something asks for it — a 'stream' listener, or
+      // req.stream / res.stream — so a server that answers with req and res
+      // alone pays nothing for it. It rides on the same functions as res:
+      // one head, one body, one end, whichever API calls them.
+      var hooks = {
+        isHead: isHead,
+        endAfterHeaders: endAfterHeaders,
+        headersSent: function () { return headersSent; },
+        respond: function (list, status, endStream) { sendHead(list, status, endStream); },
+        body: sendBody,
+        end: function () { sendEnd(null); },
+        // Trailers from the core API: a [[name, value], …] list, empty for none.
+        trailers: function (list) { sendEnd(list.length ? list : null); },
+        // A 1xx head (additionalHeaders), the stream left open.
+        info: function (list) { h2.sendHeaders(streamId, list, false); },
+        state: function () { return h2.getStreamInfo(streamId); },
+        read: credit,
+        // The stream closed cleanly: its reads end, and what is left of them
+        // goes on to req rather than being dropped.
+        endReads: function () {
+          if (!core._readableState.ended) core.push(null);
+          if (!reqViewing) viewStream();
+        },
+        reset: function (code) { if (!destroyed && streams[streamId] && closedCode === undefined) res.destroyStream(code); }
+      };
+      function getStream() {
+        if (!core) {
+          core = new ServerStream(connHandle, streamId, hooks, H2_STREAM_CODES);
+          // As node's compat layer does for a stream with a request: its
+          // errors are not the request's, and unheard they would take the
+          // server down (a client's RST_STREAM INTERNAL_ERROR, say).
+          core.on('error', function () {});
+          // What req already has stays there; what comes now comes here.
+          if (req.complete) core.push(null);
+          if (reqReading) viewStream();
+          if (closedCode !== undefined) core._gone(closedCode, true);
+        }
+        return core;
+      }
+      Object.defineProperty(req, 'stream', { get: getStream, configurable: true });
+      Object.defineProperty(res, 'stream', { get: getStream, configurable: true });
+
+      // The stream closed (both ways, or reset), or the connection went.
+      wires[streamId] = {
+        rstCode: F.ERROR.NO_ERROR,
+        close: function (code, now) {
+          if (closedCode !== undefined) return;
+          closedCode = code;
+          delete wires[streamId];
+          if (core) core._gone(code, now);
+        }
+      };
+
+      /**
+       * node:http2's 'stream' (stream, headers, flags, rawHeaders): on the
+       * server given (the unified server's, or this one's), then on the
+       * session — node's order, after 'request' when there is a request
+       * handler. Called where 'request' is, so a request held back (0-RTT, a
+       * refused WebTransport) is held back here too.
+       */
+      Object.defineProperty(req, '_announceStream', { configurable: true, value: function (emitter) {
+        if (emitter.listenerCount('stream') === 0 && connHandle.listenerCount('stream') === 0) return;
+        var stream = getStream();
+        var raw = reqHeaders._rawHeaders || [];
+        var obj = http2HeaderObject(raw);
+        var flags = F.FLAG.END_HEADERS | (endAfterHeaders ? F.FLAG.END_STREAM : 0);
+        emitter.emit('stream', stream, obj, flags, raw.slice());
+        connHandle.emit('stream', stream, obj, flags, raw.slice());
+      } });
 
       /**
        * 103 Early Hints (RFC 8297): a HEADERS frame with :status 103, the
@@ -825,6 +1077,15 @@ function createServer(options, handler) {
     // The client speaks first, but the server's SETTINGS must go out
     // immediately — a client may not send anything until it has ours.
     h2.sendPreface();
+    // node:http2's `origins` option: an ORIGIN frame (RFC 8336) at the start.
+    if (Array.isArray(options.origins) && options.origins.length) {
+      try { connHandle.origin.apply(connHandle, options.origins); } catch (e) {}
+    }
+
+    // node:http2's 'session': the connection is HTTP/2, before any stream.
+    // A listener may end it here (destroy()), as it may a socket in
+    // 'connection'.
+    if (!destroyed) ev.emit('session', connHandle);
   }
 
 
@@ -908,4 +1169,4 @@ function createServer(options, handler) {
 }
 
 
-export { createServer, STREAM_REFUSED, STREAM_CANCELLED, CONN_OVERLOADED };
+export { createServer, checkSessionOptions, STREAM_REFUSED, STREAM_CANCELLED, CONN_OVERLOADED };

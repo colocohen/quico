@@ -311,6 +311,7 @@ function QUICConnection(options) {
     close_frame: null,         // the CONNECTION_CLOSE frame to (re)send while closing
     peer_close: null,          // { error, application, reason } from the peer's CONNECTION_CLOSE
     last_close_echo: 0,        // timestamp throttle for closing-state CC echoes
+    close_unsent: false,       // a server closed before its first packet: answerClose
 
     // QUIC version (quic_version.js). `version` is the one packets are sent
     // in — the negotiated version once it is known; `original_version` the
@@ -996,6 +997,10 @@ function QUICConnection(options) {
     // isn't ACKing us, the retransmit timeout widens so we don't flood a dead
     // path. Distinct from last_activity (which also bumps on send/receive).
     last_ack_time: Date.now(),
+    // An expiry pass waits for the I/O poll (expireInFlight): one is
+    // scheduled, and the pass running now is it.
+    expiry_waiting: false,
+    expiry_polled: false,
     // When the current stretch without an ACK began, for that backoff: the
     // first ack-eliciting packet sent after the last ACK (backoff_mark: the
     // last_ack_time it followed). Counted from the ACK alone, a connection
@@ -1316,7 +1321,11 @@ function QUICConnection(options) {
       if (context.isServer ? context.peer_finished : context.state === 'connected') return;
       if (DEBUG) console.log('[quic] handshake timeout (' + context.handshake_timeout + 'ms)');
       if (!tls) { set_context({ state: 'closed' }); return; }
-      ev.emit('error', new Error('QUIC handshake timeout'));
+      // ETIMEDOUT, as a connect() that times out reports it (net's code):
+      // a caller can tell it from a refusal without reading the message.
+      var timedOut = new Error('QUIC handshake timeout');
+      timedOut.code = 'ETIMEDOUT';
+      ev.emit('error', timedOut);
       close(0x100, 'handshake timeout');  // 0x100 = CRYPTO_ERROR
     }, context.handshake_timeout);
     if (context.handshake_timer.unref) context.handshake_timer.unref();
@@ -1704,11 +1713,12 @@ function QUICConnection(options) {
     context.limbo_n = 0;
     context.no_resend_in_flight = {};
     context.control_in_flight = {};
-    for (var sid in context.send_streams) {
-      var st = context.send_streams[sid];
-      releaseStreamInFlight(st);
-      checkSentWait(st, true);
-    }
+    // Every packet in flight is forgotten above, the streams' with them: their
+    // writers are released, and nothing of theirs is carried over. (It went
+    // through releaseStreamInFlight, which moved their packets' bytes into
+    // no_resend_in_flight just emptied — packets no longer in flight anywhere,
+    // which kept the planner's timer ticking until the expiry found them.)
+    for (var sid in context.send_streams) checkSentWait(context.send_streams[sid], true);
     context.send_streams = {};
     context.stream_priority = {};
     context.send_final = new Map();
@@ -2230,8 +2240,38 @@ function QUICConnection(options) {
     return hit;
   }
 
+  // A server closed before its first packet was read — a connection refused
+  // in quic_server's 'connection', which fires on that packet, before it is
+  // fed in: there were no Initial keys yet and no client connection ID to
+  // address, so the CONNECTION_CLOSE went nowhere. The client heard nothing,
+  // sent its Initial again, and each one became a new connection, refused as
+  // silently, until its handshake timed out.
+  //
+  // It goes now, in an Initial, in answer to the packet: the keys come from
+  // the packet's DCID (RFC 9001 §5.2), the address from its SCID, taken only
+  // once the packet has decrypted — a datagram that is not a client's Initial
+  // is not answered. Nothing in it is processed (§10.2.1).
+  function answerClose(packets) {
+    for (var i = 0; i < packets.length; i++) {
+      var pkt = packets[i];
+      if (!pkt || pkt.type !== 'initial' || pkt.version !== context.version || !pkt.scid || !pkt.dcid || !pkt.dcid.byteLength) continue;
+      // Its DCID: the client's first (or, after a Retry, the one the Retry gave it).
+      var keys = quic_derive_init_secrets(pkt.dcid, context.version, 'read');
+      var d = decrypt_quic_packet(pkt.raw, keys.key, keys.iv, keys.hp, context.my_cids[0], -1, keys.aead);
+      if (!d || !d.plaintext) continue;
+      context.close_unsent = false;
+      context.initial_key_cid = pkt.dcid;
+      set_context({ initial_read: keys, initial_write: quic_derive_init_secrets(pkt.dcid, context.version, 'write') });
+      if (pkt.scid.byteLength > 0 && context.their_cids.length === 0) set_context({ add_their_cid: pkt.scid });
+      sendConnectionClose();
+      return;
+    }
+  }
+
   function receivePackets(packets, path) {
     if (context.state === 'closing') {
+      // Closed before anything arrived: answered now (answerClose).
+      if (context.close_unsent) { answerClose(packets); return; }
       // RFC 9000 §10.2.1: while closing, don't process packets normally; instead
       // re-send CONNECTION_CLOSE in response (rate-limited) so the peer learns
       // we've closed even if the first CC was lost.
@@ -3378,6 +3418,8 @@ function QUICConnection(options) {
           }
         }
         else if (f.type === 'retire_connection_id') context.peer_cids_retiring.delete(f.seq);
+        // A PING of the application's (ping()): answered.
+        else if (f.type === 'ping' && typeof f._onAck === 'function') { var onAck = f._onAck; f._onAck = null; onAck(); }
       }
     }
   }
@@ -3638,6 +3680,43 @@ function QUICConnection(options) {
   }
 
   // The connection-level rule, for delivery and for released credit alike.
+  /**
+   * A PING (RFC 9000 §19.2) for the application — node:http2's session.ping()
+   * over HTTP/3, which has no PING of its own: cb() when a packet carrying it
+   * is acknowledged. Through the control queue, so sent again if lost. A
+   * connection that ends first never calls it (the caller cancels).
+   */
+  var pingSeq = 0;
+  function ping(cb) {
+    queueControl('uping:' + (++pingSeq), { type: 'ping', _onAck: cb });
+  }
+
+  /**
+   * The connection's receive window (node:http2's setLocalWindowSize() over
+   * HTTP/3): larger, granted at once (MAX_DATA); smaller, the window is
+   * smaller from here, what was granted standing — a limit, once sent, is
+   * not taken back (RFC 9000 §4.1). Autotuning may grow it again.
+   */
+  function setConnectionWindow(size) {
+    context.local_max_data_window = size;
+    var limit = context.local_max_data_consumed + size;
+    if (limit > context.local_max_data) {
+      context.local_max_data = limit;
+      context.local_max_data_at = Date.now();
+      queueControl('max_data');
+    }
+  }
+
+  // node:http2's session.state, as QUIC has it: the connection's windows.
+  function flowState() {
+    return {
+      effectiveLocalWindowSize: context.local_max_data_window,
+      localWindowSize: Math.max(0, context.local_max_data - context.fc_recv_usage),
+      effectiveRecvDataLength: Math.max(0, context.fc_recv_usage - context.local_max_data_consumed),
+      remoteWindowSize: Math.max(0, context.remote_max_data - context.max_data_sent)
+    };
+  }
+
   function slideConnWindow() {
     var W = context.local_max_data_window;
     if (context.local_max_data_consumed + W - context.local_max_data >= W / 2) {
@@ -4312,6 +4391,37 @@ function QUICConnection(options) {
     context.skipped_pns.push(pn);
     if (context.skipped_pns.length > 8) context.skipped_pns.shift();
     context.pn_skip_countdown = nextSkipGap();
+  }
+
+  // sending_app_pn_history: what is kept of it. It was cut by age, every
+  // entry older than 2 s at each send pass — whether or not its packet was
+  // still on the books. A packet with no entry is taken as expired at once
+  // (expireInFlight's fail-safe), so the retransmission backoff never got
+  // past 2 s: during an outage, with the timeout doubled to 4 s, 8 s…, every
+  // packet in flight was resent each 2 s all the same — the flood of a dead
+  // path the backoff is there to prevent. And a late ACK more than 2 s after
+  // its packet left gave no RTT sample, the one that widens the timer.
+  // Only a packet still on the books is looked up — in flight
+  // (pkt_in_flight, sending_app_pn_in_flight, pn_sids, no_resend_in_flight)
+  // or kept for a late ACK (expired_unacked) — so it is exactly what lies
+  // below the oldest of those that goes. Each of them is in packet-number
+  // order: its first entry is its oldest. The pn → index math (send_pn.app -
+  // length) holds as it is: cut from the front, the base moves with it. Cut
+  // only when half of it can go, so a cut costs O(1) a packet.
+  var PN_HISTORY_TRIM_MIN = 1024;
+  function trimPnHistory() {
+    var h = context.sending_app_pn_history;
+    if (h.length < 2 * PN_HISTORY_TRIM_MIN) return;
+    // The newest entry always stays: the packet just sent, not yet entered
+    // in flight by its caller.
+    var floor = context.send_pn.app - 1;
+    for (var a of context.pkt_in_flight.keys()) { if (a < floor) floor = a; break; }
+    for (var b of context.sending_app_pn_in_flight) { if (b < floor) floor = b; break; }
+    for (var c of context.pn_sids.keys()) { if (c < floor) floor = c; break; }
+    for (var d in context.no_resend_in_flight) { if (Number(d) < floor) floor = Number(d); break; }
+    for (var e in context.expired_unacked) { if (Number(e) < floor) floor = Number(e); break; }
+    var cut = floor - (context.send_pn.app - h.length);
+    if (cut * 2 >= h.length) h.splice(0, cut);
   }
 
   function acksSkippedNumber(ackedRanges) {
@@ -5078,7 +5188,17 @@ function QUICConnection(options) {
         // it put them, and what is delivered meanwhile is not a measurement
         // of the path (RFC 9959 Appendix C.3).
         var crRetreat = !!(context.cr && context.cr.phase === 'safe_retreat');
-        if (!crRetreat && roundDur >= 1 && roundDelivered > 0) {
+        // A round shorter than a millisecond (a path under 1 ms: localhost, a
+        // LAN) is too short to time: its bytes are measured with the next
+        // rounds', over one interval of 1 ms or more — the interval starts
+        // again only once it has been measured. A round left unmeasured is no
+        // evidence that the bandwidth stopped growing (the plateau detector
+        // below counts only measured rounds). Without this, on such a path
+        // the estimate stayed at the handshake's few Mbit/s, three unmeasured
+        // rounds ended Startup within a millisecond, and ProbeBW climbed from
+        // there 25% per eight rounds: 32 MB each way took 6.1 s, not 0.7.
+        var roundMeasured = roundDur >= 1;
+        if (!crRetreat && roundMeasured && roundDelivered > 0) {
           var roundRate = (roundDelivered * 1000) / roundDur;
           if (!roundAppLimited || roundRate > (context.bbr_btlbw || 0)) {
             context.bbr_btlbw_samples.push({ round: context.bbr_round_count, rate: roundRate });
@@ -5097,8 +5217,10 @@ function QUICConnection(options) {
         context.bbr_ea_round_max = 0;
         context.bbr_extra_acked = Math.max.apply(null, context.bbr_ea_rounds);
         context.bbr_round_start_pn = context.send_pn.app; // next PN must be acked for the next round
-        context.bbr_round_start_delivered = context.delivered;
-        context.bbr_round_start_time = ackNow;
+        if (roundMeasured || crRetreat) {
+          context.bbr_round_start_delivered = context.delivered;
+          context.bbr_round_start_time = ackNow;
+        }
         context.bbr_prev_peak_inflight = context.bbr_peak_inflight;
         context.bbr_peak_inflight = context.app_bytes_in_flight;
 
@@ -5157,7 +5279,7 @@ function QUICConnection(options) {
             else if (context.bbr_btlbw >= context.bbr_full_bw * 1.25) {
               context.bbr_full_bw = context.bbr_btlbw;
               context.bbr_full_bw_count = 0;
-            } else if (!roundAppLimited && ++context.bbr_full_bw_count >= 3) {
+            } else if (!roundAppLimited && roundMeasured && ++context.bbr_full_bw_count >= 3) {
               // Only rounds that actually tried to fill the pipe count. An
               // app-limited round didn't grow because there was nothing to
               // send; counting it left Startup on an idle connection with a
@@ -5201,7 +5323,14 @@ function QUICConnection(options) {
           // The window as the ACKs left it — Startup's floor, below; read
           // before it is written.
           var ackGrown = context.current_limit_bytes_in_flight;
-          var targetInflight = clamp(cwnd_gain * context.bbr_bdp,
+          // Plus extra_acked, in every state (BBR's BBRUpdateMaxInflight):
+          // ACKs arrive late and in batches — the peer holds them up to a
+          // quarter of the RTT because we ask it to (maybeSendAckFrequency),
+          // Chromium up to its 25 ms besides. Without the room, 1.25·BDP was
+          // used up while the ACKs waited: every round delivered less than
+          // BtlBw, the next window was smaller, and through a 10 Mbit/s link
+          // BtlBw slid to 0.02-0.4 Mbit/s, one packet per round trip.
+          var targetInflight = clamp(cwnd_gain * context.bbr_bdp + context.bbr_extra_acked,
             context.min_limit_bytes_in_flight, context.max_limit_bytes_in_flight);
           context.current_limit_bytes_in_flight = targetInflight;
           context.current_limit_packets_in_flight = clamp(
@@ -6719,6 +6848,7 @@ function QUICConnection(options) {
 
       if (space === 'app') {
         context.sending_app_pn_history.push([Date.now(), encrypted.length, context.delivered, context.delivered_time]);
+        trimPnHistory();
         // In flight, by its size on the wire, until acknowledged or given up
         // on (pkt_in_flight) — whatever it carries, if the peer must ACK it.
         if (isAckEliciting(frameList)) {
@@ -7557,6 +7687,21 @@ function QUICConnection(options) {
     sendFrames('app', frames);
   }
 
+  // Whether expireInFlight would give anything up now: the oldest packet in
+  // flight, or the oldest that carried stream data, is past the timeout.
+  function expiryDue(now, timeout, pnBase) {
+    for (var pk of context.pkt_in_flight) { if (now - pk[1].t >= timeout) return true; break; }
+    for (var ps of context.pn_sids) {
+      var h = context.sending_app_pn_history[ps[0] - pnBase];
+      return !h || now - h[0] >= timeout;
+    }
+    for (var rpn in context.no_resend_in_flight) {
+      var rh = context.sending_app_pn_history[Number(rpn) - pnBase];
+      if (!rh || now - rh[0] >= timeout) return true;
+    }
+    return false;
+  }
+
   function expireInFlight() {
     var now = Date.now();
     // RFC 9002 §6.2.1: PTO = srtt + max(4·rttvar, granularity) + max_ack_delay.
@@ -7578,6 +7723,28 @@ function QUICConnection(options) {
 
     // PN of history index 0 (the array is a contiguous suffix of recent PNs).
     var pnBase = context.send_pn.app - context.sending_app_pn_history.length;
+
+    // Nothing is given up on before the datagrams already here are read.
+    // Node runs timers before it polls I/O, so a pass from a timer can find a
+    // packet past the timeout whose ACK has arrived and waits, unread — after
+    // the process was stopped for a while (a loaded host does that for
+    // hundreds of ms), every packet in flight: 17-103 resent at once, up to
+    // 1 MB of a 10 MB download sent twice. When one is due, the expiry moves
+    // to a pass of its own just after the poll (setImmediate runs after it);
+    // a packet that is lost waits that much longer, one whose ACK was there
+    // is not resent. Only when something is due: a pass otherwise costs
+    // nothing more.
+    if (!context.expiry_polled && expiryDue(now, timeout, pnBase)) {
+      if (!context.expiry_waiting) {
+        context.expiry_waiting = true;
+        setImmediate(function expiryAfterPoll() {
+          context.expiry_waiting = false;
+          context.expiry_polled = true;
+          try { plan_quic_burst(); } finally { context.expiry_polled = false; }
+        });
+      }
+      return;
+    }
 
     // Packets are visited oldest first — pn_sids is in the order they were
     // sent — and the first one still within the timeout ends the walk:
@@ -7713,16 +7880,8 @@ function QUICConnection(options) {
     // "missing" below and gets resent. (Runs before inflight/hasData are read.)
     expireInFlight();
 
-    var now = Date.now();
-
-    // Prune the send history (older than 2 seconds) — in one splice, not a
-    // shift() per entry; it is in send order, so the walk stops at the first
-    // entry still young enough.
-    var hist = context.sending_app_pn_history;
-    var twoSecAgo = now - 2000;
-    var drop = 0;
-    while (drop < hist.length && hist[drop][0] < twoSecAgo) drop++;
-    if (drop > 0) hist.splice(0, drop);
+    // (The send history is kept to what is still on the books as packets
+    // are sent: trimPnHistory.)
 
     // Effective limits. For rate: min(current_, max_). For in-flight: clamp
     // current_ to [min_, max_] — the min_ floor is the min-cwnd that keeps the
@@ -8235,8 +8394,12 @@ function QUICConnection(options) {
    * for the same packet or burst does not yield it again; a packet that then
    * fails to leave hands it back (execute_quic_burst's unsend).
    *
-   * Strategy: first forward from send_offset (new data),
-   *           then fill gaps before send_offset (retransmit).
+   * Strategy: missing_ranges in offset order, lowest first — a gap a lost
+   * packet left goes before new data (RFC 9000 §13.3: "Endpoints SHOULD
+   * prioritize retransmission of data over sending new data"). The peer
+   * delivers nothing past the gap; new data first held it there for as long
+   * as the application kept writing — 231 s in Chromium, 10 Mbit/s, until
+   * the peer's stream window closed and only the gap was left to send.
    * Bytes come from the send queue; what has been acknowledged from offset 0
    * is released there by the ACK path (sendQueueRelease).
    */
@@ -8274,23 +8437,13 @@ function QUICConnection(options) {
     if (stream.missing_ranges.length === 0) return [];
     var missing = stream.missing_ranges.slice();
 
-    var sendOffset = stream.send_offset;
     var chunks = [];
     var used = 0;
 
-    // Phase 1: forward from send_offset (new data, priority)
     for (var i = 0; i < missing.length; i += 2) {
       if (used >= maxBytes) break;
-      var mFrom = missing[i];
-      var mTo = missing[i + 1];
-
-      // Only ranges at or after send_offset
-      if (mTo <= sendOffset) continue;
-      var from = Math.max(mFrom, sendOffset);
-      var to = mTo;
-
-      // Clamp to budget
-      var len = Math.min(to - from, maxBytes - used);
+      var from = missing[i];
+      var len = Math.min(missing[i + 1] - from, maxBytes - used);
       if (len <= 0) continue;
 
       // Clamp to the bytes still held
@@ -8298,7 +8451,9 @@ function QUICConnection(options) {
       if (from + len > qHi) len = qHi - from;
       if (len <= 0) continue;
 
-      // FC clamp 1: never extend past the peer's per-stream offset cap.
+      // FC clamp 1: never extend past the peer's per-stream offset cap. Only
+      // new bytes reach it — a gap lies below max_sent_offset, itself capped
+      // when first sent.
       if (from + len > streamLimit) {
         stream.fc_blocked = true;   // the cap bound — signal STREAM_DATA_BLOCKED
         context.fc_blocked_sids.add(streamId);
@@ -8327,58 +8482,7 @@ function QUICConnection(options) {
         context.max_data_sent += newBytes;
         connRemaining -= newBytes;
       }
-
-      // Advance send_offset
-      if (from + len > stream.send_offset) {
-        stream.send_offset = from + len;
-      }
-    }
-
-    // Phase 2: fill gaps before send_offset (retransmit lost data), with
-    // what Phase 1 just yielded no longer among them.
-    if (used < maxBytes) {
-      if (chunks.length > 0) missing = stream.missing_ranges.slice();
-      for (var i = 0; i < missing.length; i += 2) {
-        if (used >= maxBytes) break;
-        var mFrom = missing[i];
-        var mTo = missing[i + 1];
-
-        // Only ranges before send_offset
-        if (mFrom >= sendOffset) break;
-        var to = Math.min(mTo, sendOffset);
-
-        var len = Math.min(to - mFrom, maxBytes - used);
-        if (len <= 0) continue;
-
-        if (mFrom < qLo || mFrom >= qHi) continue;
-        if (mFrom + len > qHi) len = qHi - mFrom;
-        if (len <= 0) continue;
-
-        // FC fail-safe: retransmits sit below the high-water mark, which was
-        // itself capped when first sent, and limits are monotonic — so these
-        // clamps should never bind here. Applied anyway so the invariant
-        // "nothing ever leaves above streamLimit / beyond the conn budget"
-        // holds unconditionally, whatever the scheduler does around us.
-        if (mFrom >= streamLimit) continue;
-        if (mFrom + len > streamLimit) len = streamLimit - mFrom;
-        var newStart2 = Math.max(mFrom, stream.max_sent_offset);
-        var newBytes2 = Math.max(0, (mFrom + len) - newStart2);
-        if (newBytes2 > connRemaining) {
-          len -= (newBytes2 - connRemaining);
-          newBytes2 = connRemaining;
-        }
-        if (len <= 0) continue;
-
-        chunks.push({ offset: mFrom, data: sendQueueRead(stream, mFrom, len) });
-        flat_ranges.remove(stream.missing_ranges, [mFrom, mFrom + len]);
-        used += len;
-
-        if (newBytes2 > 0) {
-          stream.max_sent_offset = mFrom + len;
-          context.max_data_sent += newBytes2;
-          connRemaining -= newBytes2;
-        }
-      }
+      if (from + len > stream.send_offset) stream.send_offset = from + len;
     }
 
     checkSentWait(stream, false);   // max_sent_offset may have advanced
@@ -8454,6 +8558,8 @@ function QUICConnection(options) {
       error: errorCode || 0, frameType: 0, reason: reason || ''
     };
     if (serverStats) serverStats.code(serverStats.closes[application ? 'h3' : 'quic'].sent, errorCode || 0);
+    // A server with nothing read yet has no one to send it to: see answerClose.
+    if (context.isServer && !context.initial_write && context.recv_pn_largest.initial < 0) context.close_unsent = true;
     sendConnectionClose();
     // RFC 9000 §10.2.1: the endpoint that *sends* CONNECTION_CLOSE enters the
     // closing state — it re-echoes the CC (rate-limited) in response to incoming
@@ -8565,6 +8671,12 @@ function QUICConnection(options) {
     whenStreamCommitted: whenStreamCommitted,
     whenStreamPermitted: whenStreamPermitted,
     getStats: getStats,
+    ping: ping,
+    setConnectionWindow: setConnectionWindow,
+    flowState: flowState,
+    // When something last went or came on the connection (ms): a session's
+    // setTimeout() reads it.
+    get lastActivity() { return context.last_activity; },
     countInternalError: countInternalError,
     // 0-RTT: null (none), 'offered' (a client's, undecided), 'accepted',
     // 'rejected'; and whether a stream's data came in 0-RTT (server).

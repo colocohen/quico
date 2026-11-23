@@ -251,12 +251,17 @@ function h3Fingerprint(observed) {
  */
 function observeH2(conn) {
   var state = { settings: [], windowUpdate: 0, priorities: [], pseudoHeaderOrder: [] };
+  // By a flag, not by the list's length: a client whose first SETTINGS is
+  // empty — itself a property of the implementation — would otherwise be
+  // fingerprinted by a later one.
+  var settingsSeen = false;
 
   // Two arguments: the object keyed by name, and the ordered list. The list is
   // the second one — the object cannot carry order, which is the whole point
   // of this section.
   conn.on('settings', function (settingsObj, settingsList) {
-    if (state.settings.length) return;      // first SETTINGS only
+    if (settingsSeen) return;      // first SETTINGS only
+    settingsSeen = true;
     var list = settingsList || [];
     for (var i = 0; i < list.length; i++) {
       state.settings.push({ id: list[i].id, value: list[i].value });
@@ -285,22 +290,13 @@ function observeH2(conn) {
 
 
 /**
- * Watch an H3Connection and its QUIC connection, and accumulate what the
- * HTTP/3 fingerprint needs.
+ * Is this entry a GREASE identifier?
  *
- * The mirror of observeH2, with the parts QUIC puts in different places: the
- * transport parameters arrive inside the TLS ClientHello and are read from the
- * QUIC connection, while the HTTP/3 SETTINGS arrive on the control stream.
- *
- * Returns a getter, callable once the handshake is complete.
- */
-/**
- * Is this a GREASE identifier?
- *
- * RFC 9287 reserves identifiers of the form 31 * N + 27 for QUIC, and RFC 9114
- * uses the same construction for HTTP/3 settings. An endpoint sends one with a
- * random identifier and a random value purely to check that the peer ignores
- * what it does not recognise. Chrome does; most libraries do not.
+ * RFC 9000 §18.1 reserves transport parameter identifiers of the form
+ * 31 * N + 27, and RFC 9114 §7.2.4.1 reserves SETTINGS identifiers of the form
+ * 0x1f * N + 0x21. An endpoint sends one with a random N and a random value
+ * purely to check that the peer ignores what it does not recognise. Chrome
+ * does; most libraries do not.
  *
  * They MUST be stripped before hashing, for the same reason JA3 strips TLS
  * GREASE: identifier and value are both random per connection, so keeping them
@@ -308,41 +304,21 @@ function observeH2(conn) {
  * that GREASE was present, which is a stable property of the implementation —
  * and, in practice, one of the cleaner browser-versus-library signals.
  *
- * The test is by MAGNITUDE, not by the 31N+27 formula, and that is deliberate.
- * A QUIC varint holds up to 2^62-1, well past the 2^53 where a JavaScript
- * number stops being exact — Chrome sent 4421552879925488000, which cannot be
- * represented and arrives already rounded. Any modulo on it answers a question
- * about the rounded value rather than the real one, and answers it wrongly.
+ * The test is the RFC's formula, and it is made by the PARSER, on the
+ * identifier's exact bits (the entry's `grease`). N is random over the whole
+ * varint range, up to 2^62, past the 2^53 where a JavaScript number stops
+ * being exact — Chrome sent an identifier that arrives as
+ * 4421552879925488000, already rounded — so a modulus here would answer for a
+ * different number.
  *
- * So: no real transport parameter or HTTP/3 setting is anywhere near that
- * range. Every one currently defined fits in a couple of bytes, and the
- * registry reserves the high space precisely so that GREASE can live there.
- * Treating "absurdly large" as "reserved" is exact where the arithmetic
- * cannot be.
+ * Not by magnitude. Real, stable identifiers are large too: grease_quic_bit
+ * is 0x2ab2, min_ack_delay 0xff04de1b, Google's own parameters 0x3127 and
+ * 0x3128, and the WebTransport SETTINGS sit in the billions. Dropping those
+ * removes signal from the hash, and reporting them as GREASE makes a library
+ * that sends grease_quic_bit look like a browser.
  */
-// Every identifier assigned by RFC 9000, RFC 9114 and their extensions is
-// small: the transport parameters run to 0x20, the HTTP/3 settings to 0x33,
-// and the registered extensions (datagrams, version negotiation) sit below
-// 0x100. 4096 leaves an order of magnitude of headroom above anything real.
-var GREASE_FLOOR = 0x1000;   // 4096
-
-function isGrease(id) {
-  var n = Number(id);
-  if (!isFinite(n)) return false;
-
-  // BY MAGNITUDE, not by the 31N+27 formula.
-  //
-  // The formula is what the RFCs describe for reserving the identifier space,
-  // and it is the wrong test to apply here. Measured against what Chrome
-  // actually sends — 12583, 12584, 41284154305, 4421552879925488000 — not one
-  // satisfies it; their residues mod 31 are 1, 2, 6 and 8. Whatever Chrome
-  // uses to pick a reserved identifier, it is not that formula, and a check
-  // built on it lets every one of them into the hash along with its random
-  // value.
-  //
-  // What IS true of all four, and of no assigned identifier, is that they are
-  // enormous. That is the property to test.
-  return n >= GREASE_FLOOR;
+function isGrease(entry) {
+  return !!(entry && entry.grease);
 }
 
 
@@ -354,7 +330,10 @@ function observeH3(h3, quic, existingState) {
   // later without losing what the first pass collected.
   var state = existingState ||
               { transportParams: [], h3Settings: [], alpn: 'h3', grease: false,
-                windowUpdate: 0, pseudoHeaderOrder: [] };
+                windowUpdate: 0, pseudoHeaderOrder: [],
+                // Each list taken once, by a flag: one that came empty, or
+                // only GREASE, was still taken.
+                transportParamsSeen: false, h3SettingsSeen: false };
 
   if (h3 && h3.on) {
     h3.on('pseudo_order', function (names) {
@@ -363,25 +342,21 @@ function observeH3(h3, quic, existingState) {
     });
 
     h3.on('peer_settings', function (ordered) {
-      if (state.h3Settings.length) return;
+      if (state.h3SettingsSeen) return;
+      state.h3SettingsSeen = true;
       for (var i = 0; i < ordered.length; i++) {
-        if (isGrease(ordered[i].id)) { state.grease = true; continue; }
+        if (isGrease(ordered[i])) { state.grease = true; continue; }
         state.h3Settings.push({ id: ordered[i].id, value: ordered[i].value });
       }
     });
   }
 
   if (quic && quic.on) {
-    quic.on('peer_max_data', function (bytes) {
-      // initial_max_data from the transport parameters: the connection-level
-      // window, and the QUIC equivalent of an HTTP/2 WINDOW_UPDATE on stream 0.
-      if (!state.windowUpdate) state.windowUpdate = bytes;
-    });
-
     quic.on('peer_transport_params', function (params) {
-      if (state.transportParams.length) return;
+      if (state.transportParamsSeen) return;
+      state.transportParamsSeen = true;
       for (var k = 0; k < (params || []).length; k++) {
-        if (isGrease(params[k].id)) { state.grease = true; continue; }
+        if (isGrease(params[k])) { state.grease = true; continue; }
         // 0x04 is initial_max_data — the connection-level window. Captured
         // into its own section as well as the parameter list, so the string
         // has the same four-part shape as the HTTP/2 one.

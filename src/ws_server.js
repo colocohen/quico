@@ -444,6 +444,12 @@ function parseSubprotocols(header) {
 function upgradeWebSocket(req, socket, head, options) {
   options = options || {};
 
+  // Whatever comes of it, the client is answered here — accepted, or refused
+  // with a status. A WebSocketServer on the same server whose path this is
+  // not must not answer it too: its 404 went into the socket this call had
+  // just upgraded, and the client failed the connection (1006).
+  socket._quicoWsClaimed = true;
+
   var headers = req.headers || {};
   var version = parseInt(headers['sec-websocket-version'], 10);
 

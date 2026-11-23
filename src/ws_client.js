@@ -15,6 +15,7 @@ import { Blob } from 'node:buffer';
 import { request as h1Request } from './h1_client.js';
 import lemonTls from 'lemon-tls';
 import { globalAgent } from './agent.js';
+import { urlHostname } from './http_common.js';
 import {
   WSParser, encodeFrame, generateKey, acceptKey,
   OPCODE, CLOSE,
@@ -382,10 +383,10 @@ class WebSocket extends EventTarget {
     // explicit options.session wins. wss:// began with a full handshake
     // every time.
     var sAgent = secure ? (this._options.agent && this._options.agent._sessionKey ? this._options.agent : globalAgent) : null;
-    var sKey = sAgent && this._options.agent !== false ? sAgent._sessionKey('tcp:http/1.1', parsed.hostname, port, this._options) : null;
+    var sKey = sAgent && this._options.agent !== false ? sAgent._sessionKey('tcp:http/1.1', urlHostname(parsed.hostname), port, this._options) : null;
     var explicitSession = this._options.session, sessionTaken = false, sessionNow;
     var reqOptions = {
-      hostname: parsed.hostname,
+      hostname: urlHostname(parsed.hostname),
       port: port,
       path: (parsed.pathname || '/') + (parsed.search || ''),
       method: 'GET',

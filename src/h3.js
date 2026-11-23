@@ -25,7 +25,9 @@ import {
   encodeSectionAck as qpackEncodeSectionAck,
   entrySize as qpackEntrySize
 } from './qpack.js';
-import { validateFieldSection, parseContentLength, parsePriority, formatPriority } from './http_common.js';
+import { validateFieldSection, parseContentLength, parsePriority, formatPriority,
+         nodeError, argType, sessionGone, checkInt } from './http_common.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 
 // ============================================================
 //  QPACK dynamic table (RFC 9204): ON.
@@ -57,18 +59,30 @@ var QPACK_TABLE_BYTES = 4096;
 // field at all. 0 was advertised. Chromium advertises 100.
 var QPACK_BLOCKED_STREAMS = 100;
 
+// Empty DATA frames: two bytes each on the wire, and each one reported up as a
+// body chunk — work for a few bytes, as many as a peer cares to send (QUIC's
+// flow control returns credit as the bytes are read, so it bounds nothing over
+// time). nghttp2 counts them for node:http2's maxSessionInvalidFrames; here a
+// connection may send EMPTY_DATA_BURST at once and EMPTY_DATA_RATE a second
+// after that, then it is closed with H3_EXCESSIVE_LOAD. (One per request, as a
+// client that ends its bodies with one sends, is far inside it.)
+var EMPTY_DATA_BURST = 1000;
+var EMPTY_DATA_RATE = 1000;
+
 import {
   DEBUG,
   Emitter,
   concatUint8Arrays,
   writeVarInt,
   readVarInt,
+  readVarIntExact,
   wt_stream_header
 } from './utils.js';
 import {
   QPACK_STATIC,
   readPrefixedInt,
-  decodeStringLiteral
+  decodeStringLiteral,
+  fieldText
 } from './hpack_primitives.js';
 
 
@@ -81,19 +95,16 @@ import {
 //  what is genuinely QPACK: the RIC/base-index prefix, the encoder-stream
 //  instructions, and the static table's own contents.
 //
-//  Names and values are turned into text with TextDecoder (UTF-8), which is
-//  what this file has always done. hpack_primitives exports bytesToLatin1 as a
-//  lossless alternative; switching to it is a deliberate behaviour change and
-//  deliberately NOT part of this move.
+//  Names and values are field text (hpack_primitives: one character per
+//  octet, as node:http and node:http2 give them, and as HTTP/1.1 and HTTP/2
+//  here read them). They were UTF-8 — TextDecoder here, TextEncoder in the
+//  encoder — so an octet past 0x7F changed on the way (one that is not UTF-8
+//  became U+FFFD), a field read differently over HTTP/3 than over the other
+//  two, and the peer's table, sized from that text, drifted from the peer's
+//  own (entrySize).
 // ============================================================
 
-// One decoder for the module: decode() holds no state between calls (no
-// `stream` option), and constructing one per name and per value cost more
-// than the decoding itself.
-var _utf8Decoder = new TextDecoder();
-function _text(bytes) {
-  return _utf8Decoder.decode(bytes);
-}
+var _text = fieldText;
 
 // Every decodeStringLiteral() call below passes strict = true, enabling the
 // padding checks of RFC 7541 §5.2: padding over 7 bits, padding that is not the
@@ -286,6 +297,166 @@ var H3_SETTINGS_MAP = {
 var H3_ID_TO_NAME = {};
 for (var k in H3_SETTINGS_MAP) H3_ID_TO_NAME[H3_SETTINGS_MAP[k]] = k;
 
+/**
+ * A SETTINGS frame's values as node:http2 names settings (localSettings,
+ * remoteSettings), from [{ id, value }] or { NAME: value }: HTTP/2's names
+ * where HTTP/3 has the same setting — headerTableSize (the QPACK table),
+ * maxHeaderListSize / maxHeaderSize (MAX_FIELD_SECTION_SIZE; unlimited reads
+ * 2^32 - 1, as over HTTP/2), enableConnectProtocol — and HTTP/3's own beside
+ * them. A setting not sent has its RFC default.
+ */
+function h3SettingsToNode(settings) {
+  var by = {};
+  if (Array.isArray(settings)) for (var i = 0; i < settings.length; i++) by[settings[i].id] = settings[i].value;
+  else for (var n in settings) if (H3_SETTINGS_MAP[n] !== undefined) by[H3_SETTINGS_MAP[n]] = settings[n];
+  var v = function (id, dflt) { return by[id] !== undefined ? by[id] : dflt; };
+  var max = Math.min(v(0x06, 0xffffffff), 0xffffffff);
+  var out = {
+    headerTableSize: v(0x01, 0),
+    maxHeaderListSize: max,
+    maxHeaderSize: max,
+    enableConnectProtocol: v(0x08, 0) !== 0,
+    qpackBlockedStreams: v(0x07, 0),
+    h3Datagram: v(0x33, 0) !== 0,
+    enableWebTransport: v(0x2b603742, 0) !== 0
+  };
+  if (by[0x14e9cd29] !== undefined) out.webTransportMaxSessions = by[0x14e9cd29];
+  return out;
+}
+
+// ============================================================
+//  node:http2's session operations, as HTTP/3 has them
+// ============================================================
+//
+// For a session of either side — h3_server's connection handle, h3_client's
+// ClientSession. HTTP/2's frames for these have no HTTP/3 counterpart, or a
+// QUIC one:
+//   ping()               QUIC's PING (RFC 9000 §19.2): the callback when it
+//                        is acknowledged. It carries no payload: the one
+//                        given comes back to the callback as it was.
+//   settings()           HTTP/3 sends its SETTINGS once, at the start
+//                        (RFC 9114 §7.2.4): ERR_HTTP3_SETTINGS_SENT.
+//   localSettings /      HTTP/3's SETTINGS by node's names (h3SettingsToNode);
+//   remoteSettings       'remoteSettings' when the peer's arrive (remote()),
+//                        'localSettings' (ours, in effect from the start) on
+//                        the tick after local().
+//   setLocalWindowSize() the QUIC connection's receive window (MAX_DATA).
+//   state                its windows (quic_connection's flowState).
+//   setTimeout()         'timeout' after msecs with no packet either way.
+//
+// hooks: quic() and h3() (null while there is none), destroyed(), closed()
+// (no new pings: a session closing), isServer, options (maxOutstandingPings).
+// Returns { remote(list), local(), end() }: the peer's SETTINGS arrived, ours
+// are in effect, the session is over (pings cancelled, the timer stopped).
+function addH3SessionOps(handle, hooks) {
+  var options = hooks.options || {};
+  var pings = [];
+  var maxPings = options.maxOutstandingPings > 0 ? options.maxOutstandingPings : 10;
+  var peerSettings = null;
+  var idleMs = 0, idleTimer = null;
+  var live = function () { return !!hooks.h3() && !hooks.destroyed(); };
+
+  Object.defineProperties(handle, {
+    localSettings: { get: function () { return live() ? h3SettingsToNode(hooks.h3().getLocalSettings()) : {}; }, enumerable: true, configurable: true },
+    remoteSettings: { get: function () { return peerSettings && !hooks.destroyed() ? h3SettingsToNode(peerSettings) : {}; }, enumerable: true, configurable: true },
+    // Nothing to acknowledge: HTTP/3's SETTINGS are not.
+    pendingSettingsAck: { get: function () { return false; }, enumerable: true, configurable: true },
+    state: {
+      get: function () {
+        if (!live()) return {};
+        var quic = hooks.quic();
+        var st = quic.flowState();
+        // The last request stream the peer opened (a server's; a client's peer opens none).
+        var top = quic.context.peer_max_opened_bidi;
+        st.lastProcStreamID = top >= 0 ? top * 4 + (hooks.isServer ? 0 : 1) : 0;
+        return st;
+      },
+      enumerable: true, configurable: true
+    }
+  });
+
+  handle.settings = function () {
+    if (hooks.destroyed()) throw sessionGone();
+    throw nodeError(Error, 'ERR_HTTP3_SETTINGS_SENT', 'HTTP/3 sends its SETTINGS once, at the start of the connection (RFC 9114 §7.2.4)');
+  };
+
+  handle.ping = function (payload, callback) {
+    if (hooks.destroyed()) throw sessionGone();
+    if (typeof payload === 'function') { callback = payload; payload = undefined; }
+    if (payload !== undefined && payload !== null) {
+      if (!ArrayBuffer.isView(payload)) throw argType('payload', 'Buffer, TypedArray, or DataView', payload);
+      if (payload.byteLength !== 8) throw nodeError(RangeError, 'ERR_HTTP2_PING_LENGTH', 'HTTP2 ping payload must be 8 bytes');
+    }
+    if (typeof callback !== 'function') throw argType('callback', 'function', callback);
+    var bytes = payload ? Buffer.from(payload.buffer, payload.byteOffset, 8) : Buffer.from(random_bytes_sync(8));
+    if (!hooks.h3() || hooks.closed()) {
+      process.nextTick(callback, nodeError(Error, 'ERR_HTTP2_PING_CANCEL', 'HTTP2 ping cancelled'));
+      return;
+    }
+    if (pings.length >= maxPings) return false;
+    var entry = { cb: callback, at: process.hrtime.bigint() };
+    pings.push(entry);
+    hooks.quic().ping(function () {
+      var i = pings.indexOf(entry);
+      if (i < 0) return;
+      pings.splice(i, 1);
+      callback(null, Number(process.hrtime.bigint() - entry.at) / 1e6, bytes);
+    });
+    return true;
+  };
+
+  handle.setLocalWindowSize = function (windowSize) {
+    if (hooks.destroyed()) throw sessionGone();
+    checkInt(windowSize, 'windowSize', 0, 2 ** 31 - 1);
+    if (hooks.quic()) hooks.quic().setConnectionWindow(windowSize);
+  };
+
+  handle.setTimeout = function (msecs, callback) {
+    if (hooks.destroyed()) return handle;
+    if (typeof msecs !== 'number') throw argType('msecs', 'number', msecs);
+    if (msecs < 0 || !Number.isFinite(msecs)) {
+      throw nodeError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "msecs" is out of range. It must be a non-negative finite number. Received ' + msecs);
+    }
+    if (callback !== undefined && typeof callback !== 'function') throw argType('callback', 'function', callback);
+    idleMs = msecs;
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (msecs === 0) { if (callback) handle.removeListener('timeout', callback); return handle; }
+    var started = Date.now();
+    var check = function () {
+      idleTimer = null;
+      if (hooks.destroyed() || idleMs === 0) return;
+      // Still connecting: quiet since the call.
+      var quic = hooks.quic();
+      var last = quic ? Math.max(quic.lastActivity, started) : started;
+      var quiet = Date.now() - last;
+      if (quiet >= idleMs) { handle.emit('timeout'); return; }
+      idleTimer = setTimeout(check, idleMs - quiet);
+      if (idleTimer.unref) idleTimer.unref();
+    };
+    idleTimer = setTimeout(check, msecs);
+    if (idleTimer.unref) idleTimer.unref();
+    if (callback) handle.once('timeout', callback);
+    return handle;
+  };
+
+  return {
+    remote: function (list) {
+      peerSettings = list;
+      if (!hooks.destroyed()) handle.emit('remoteSettings', handle.remoteSettings);
+    },
+    local: function () {
+      process.nextTick(function () { if (live()) handle.emit('localSettings', handle.localSettings); });
+    },
+    end: function () {
+      var pend = pings; pings = [];
+      for (var i = 0; i < pend.length; i++) {
+        process.nextTick(pend[i].cb, nodeError(Error, 'ERR_HTTP2_PING_CANCEL', 'HTTP2 ping cancelled'));
+      }
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    }
+  };
+}
+
 function buildSettingsPayload(settings) {
   var payload = [];
   for (var name in settings) {
@@ -297,6 +468,13 @@ function buildSettingsPayload(settings) {
   return new Uint8Array(payload);
 }
 
+// A SETTINGS identifier reserved for GREASE (RFC 9114 §7.2.4.1): "of the
+// format 0x1f * N + 0x21". A BigInt, or a Number below 2^53.
+function isReservedSetting(id) {
+  var n = BigInt(id);
+  return n >= 0x21n && (n - 0x21n) % 0x1fn === 0n;
+}
+
 function parseSettingsPayload(buf) {
   var out = {}, offset = 0;
   // The same settings as an ordered list, on a non-enumerable property so it
@@ -305,7 +483,7 @@ function parseSettingsPayload(buf) {
   // fingerprinting: which settings a peer sends, and in which order, is a
   // property of its implementation.
   var list = [];
-  var seen = {};
+  var seen = new Set();   // exact identifiers (BigInt)
   while (offset < buf.length) {
     // A payload that ends inside an identifier or before its value is
     // H3_FRAME_ERROR (RFC 9114 §7.1). It was cut short silently: the setting
@@ -317,15 +495,22 @@ function parseSettingsPayload(buf) {
       te.h3ErrorCode = 0x0106;
       throw te;
     }
+    // The identifier exactly, for the tests that need every bit of it: a
+    // peer picks a GREASE one at random over the whole varint range, past
+    // where id.value is exact — two different ones can round to one Number.
+    var exact = readVarIntExact(buf, offset).value;
+    // Reserved for GREASE (RFC 9114 §7.2.4.1).
+    var reserved = isReservedSetting(exact);
     offset += id.byteLength + val.byteLength;
     // RFC 9114 §7.2.4: an identifier twice, or one of HTTP/2's that HTTP/3
     // reserves (0x02-0x05), is H3_SETTINGS_ERROR.
-    if (seen[id.value] || (id.value >= 0x02 && id.value <= 0x05)) {
-      var se = new Error('SETTINGS identifier 0x' + id.value.toString(16) + (seen[id.value] ? ' repeated' : ' is reserved'));
+    var twice = seen.has(exact);
+    if (twice || (exact >= 0x02n && exact <= 0x05n)) {
+      var se = new Error('SETTINGS identifier 0x' + exact.toString(16) + (twice ? ' repeated' : ' is reserved'));
       se.h3ErrorCode = 0x0109;
       throw se;
     }
-    seen[id.value] = true;
+    seen.add(exact);
     // Settings that are a yes or no: SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC
     // 8441 §3, by RFC 9220 §3 for HTTP/3) and SETTINGS_H3_DATAGRAM (RFC 9297
     // §2.1.1: "...any value other than 0 or 1 ... as a connection error of
@@ -337,7 +522,7 @@ function parseSettingsPayload(buf) {
     }
     var name = H3_ID_TO_NAME[id.value] || ('UNKNOWN_0x' + id.value.toString(16));
     out[name] = val.value;
-    list.push({ id: id.value, value: val.value });
+    list.push({ id: id.value, value: val.value, grease: reserved });
   }
   Object.defineProperty(out, '_ordered', { value: list, enumerable: false });
   return out;
@@ -493,6 +678,38 @@ function isInternalError(err) {
 
 var H3_ERR_NAME = {};
 for (var _ec in H3_ERR) H3_ERR_NAME[H3_ERR[_ec]] = _ec;
+
+// An HTTP/2 error code (0x0..0xd: a code written for node:http2, its
+// http2.constants) as the HTTP/3 one RFC 9114 §A.4.2 maps it to; none of
+// them is an HTTP/3 code. The rest are HTTP/3's (or the application's) as
+// they are. For a connection's code (h3_server's session) and a stream's.
+var H2_TO_H3 = [
+  H3_ERR.H3_NO_ERROR,                // NO_ERROR
+  H3_ERR.H3_GENERAL_PROTOCOL_ERROR,  // PROTOCOL_ERROR
+  H3_ERR.H3_INTERNAL_ERROR,          // INTERNAL_ERROR
+  H3_ERR.H3_GENERAL_PROTOCOL_ERROR,  // FLOW_CONTROL_ERROR (QUIC's own in HTTP/3)
+  H3_ERR.H3_GENERAL_PROTOCOL_ERROR,  // SETTINGS_TIMEOUT (no HTTP/3 counterpart)
+  H3_ERR.H3_STREAM_CREATION_ERROR,   // STREAM_CLOSED
+  H3_ERR.H3_FRAME_ERROR,             // FRAME_SIZE_ERROR
+  H3_ERR.H3_REQUEST_REJECTED,        // REFUSED_STREAM
+  H3_ERR.H3_REQUEST_CANCELLED,       // CANCEL
+  H3_ERR.H3_GENERAL_PROTOCOL_ERROR,  // COMPRESSION_ERROR (QPACK's own in HTTP/3)
+  H3_ERR.H3_CONNECT_ERROR,           // CONNECT_ERROR
+  H3_ERR.H3_EXCESSIVE_LOAD,          // ENHANCE_YOUR_CALM
+  H3_ERR.H3_GENERAL_PROTOCOL_ERROR,  // INADEQUATE_SECURITY (TLS's in HTTP/3)
+  H3_ERR.H3_VERSION_FALLBACK         // HTTP_1_1_REQUIRED
+];
+function h2CodeToH3(code) { return code < H2_TO_H3.length ? H2_TO_H3[code] : code; }
+
+// A request stream's codes, for node:http2's stream API over HTTP/3
+// (http_common's StreamBase): close() takes HTTP/2's codes too, as above;
+// what goes on the wire, and rstCode, is HTTP/3's.
+var H3_STREAM_CODES = {
+  none: H3_ERR.H3_NO_ERROR, cancel: H3_ERR.H3_REQUEST_CANCELLED, internal: H3_ERR.H3_INTERNAL_ERROR,
+  max: Number.MAX_SAFE_INTEGER,
+  wire: h2CodeToH3,
+  name: function (code) { return H3_ERR_NAME[code] || ('0x' + code.toString(16)); }
+};
 
 
 // ============================================================
@@ -944,6 +1161,23 @@ function H3Connection(options) {
   }
 
 
+  // ---- ORIGIN (RFC 9412 for HTTP/3, the frame of RFC 8336 §2) ----
+  //
+  // The origins this connection may serve: on the control stream, each an
+  // ASCII serialization behind its 16-bit length. A server's.
+  function sendOrigin(origins) {
+    sendControlStreams();
+    var ctrlId = context.isServer ? 3 : 2;
+    var parts = [];
+    for (var i = 0; i < origins.length; i++) {
+      var b = Buffer.from(String(origins[i]), 'latin1');
+      var len = Buffer.alloc(2); len.writeUInt16BE(b.length, 0);
+      parts.push(len, b);
+    }
+    quic.sendStream(ctrlId, buildH3Frames([{ frame_type: 0x0c, payload: new Uint8Array(Buffer.concat(parts)) }]), false);
+  }
+
+
   // ---- Incoming stream data ----
 
   var _claimedStreams = new Set(); // streams owned by WebTransport (skip H3 processing)
@@ -1002,16 +1236,6 @@ function H3Connection(options) {
     });
   }
 
-  // Streams running an extended-CONNECT protocol that is NOT WebTransport —
-  // in practice WebSocket (RFC 9220). Their bytes are the inner protocol's,
-  // not HTTP/3 frames, so they bypass the frame parser entirely.
-  //
-  // Kept apart from _wtSessions on purpose. A WebTransport session makes every
-  // LATER stream that carries its id a member of that session; a WebSocket
-  // does not, and registering one as a session would make unrelated streams
-  // look like they belong to it.
-  var _tunnelStreams = new Set();
-
   // Request bodies whose flow-control credit the application returns as it
   // reads them (holdBody / creditBody / releaseBody). On the server every
   // request stream's credit is held at the QUIC layer from its first byte
@@ -1045,25 +1269,6 @@ function H3Connection(options) {
   function creditRecv(sid, n) { if (n > 0 && quic.creditStream) quic.creditStream(sid, n); }
   function releaseRecvCredit(sid) { if (quic.releaseStreamCredit) quic.releaseStreamCredit(sid); }
 
-  // Bytes on a stream we have decided is a tunnel but have not yet accepted.
-  //
-  // The window is real and unavoidable: the client learns the CONNECT was
-  // accepted only when our 2xx reaches it, but nothing stops it sending frames
-  // the moment it sent the CONNECT — and an eager client (or a slow network in
-  // the other direction) does exactly that. Those bytes are not HTTP/3 frames,
-  // so they cannot go to the frame parser; they are held here and replayed, in
-  // order, the instant the tunnel opens.
-  var _tunnelPending = {};
-  var _tunnelPendingBytes = {};
-  var _tunnelPendingIds = new Set();
-  // QUIC returns flow-control credit as it delivers bytes, so bytes held
-  // here are not bounded by it: a client that never waits for the 2xx could
-  // fill memory. Past this, the tunnel is refused.
-  var MAX_TUNNEL_PENDING = 1024 * 1024;           // per stream
-  var MAX_TUNNEL_PENDING_TOTAL = 4 * 1024 * 1024; // per connection
-  var _tunnelPendingTotal = 0;
-  var _tunnelPendingFin = new Set();
-
   // Frames on the control stream are read whole (SETTINGS, GOAWAY); no real
   // one comes near this. Anything else there is skipped as it arrives.
   var MAX_CONTROL_FRAME = 16384;
@@ -1073,7 +1278,7 @@ function H3Connection(options) {
   // releaseStream is the ONLY place per-stream state is dropped, and every
   // way a stream can end comes through it:
   //
-  //   FIN, on whichever path read the stream (HTTP/3 frames, a tunnel, a
+  //   FIN, on whichever path read the stream (HTTP/3 frames, a
   //     WebTransport stream — including a FIN that arrived with its prefix —,
   //     a claimed or an ignored stream)        → the 'stream' handler
   //   RESET_STREAM from the peer               → quic 'stream_reset'
@@ -1098,9 +1303,6 @@ function H3Connection(options) {
     // A CONNECT that ends unanswered: the streams waiting for it will not
     // get a session.
     if (_wtConnects.delete(sid) || !_wtSessions.has(sid)) settleHeldWt(sid, false);
-    _tunnelStreams.delete(sid);
-    _tunnelPendingIds.delete(sid);
-    dropTunnelPending(sid);
     delete _wtStreams[sid];
     _claimedStreams.delete(sid);
     delete _wtLocalUni[sid];
@@ -1120,30 +1322,17 @@ function H3Connection(options) {
   listenQuic('close', function () {
     _connClosed = true;
     var ids = new Set();
-    [context.streams, _wtStreams, _tunnelPending, _wtLocalUni].forEach(function (m) {
+    [context.streams, _wtStreams, _wtLocalUni].forEach(function (m) {
       for (var k in m) ids.add(Number(k));
     });
-    [_tunnelStreams, _tunnelPendingIds, _claimedStreams, _wtSessions, _bodyHeld].forEach(function (set) {
+    [_claimedStreams, _wtSessions, _bodyHeld].forEach(function (set) {
       set.forEach(function (k) { ids.add(Number(k)); });
     });
-    ids.forEach(releaseStream);
+    // Not ids.forEach(releaseStream): a Set's forEach passes the value
+    // twice, so every stream but 0 went in as releaseStream(sid, keepBody =
+    // sid) — a body still held kept its entry and its credit.
+    ids.forEach(function (id) { releaseStream(id); });
   });
-
-  function dropTunnelPending(sid) {
-    if (_tunnelPendingBytes[sid]) _tunnelPendingTotal -= _tunnelPendingBytes[sid];
-    delete _tunnelPending[sid];
-    delete _tunnelPendingBytes[sid];
-    _tunnelPendingFin.delete(sid);
-  }
-
-  // Bytes held for a tunnel, handed over in order — with the FIN, if it came.
-  function replayTunnelPending(sid) {
-    var pend = _tunnelPending[sid];
-    var fin = _tunnelPendingFin.has(sid);
-    dropTunnelPending(sid);
-    if (pend) for (var i = 0; i < pend.length; i++) ev.emit('tunnel_data', sid, pend[i], false);
-    if (fin) { ev.emit('tunnel_data', sid, new Uint8Array(0), true); releaseStream(sid); }
-  }
 
   // A WebTransport session is over (its CONNECT stream ended or was reset).
   // Its streams go with it: reset and stopped with WEBTRANSPORT_SESSION_GONE
@@ -1187,9 +1376,10 @@ function H3Connection(options) {
   // (RFC 9114 §8). The stream is cancelled both ways, and reported: a
   // request above may already exist for it, and would otherwise wait for
   // an end that is never coming.
-  function streamError(sid, code, reason) {
+  // `sectionOpen`: a field section on it is refused unprocessed (see abortStream).
+  function streamError(sid, code, reason, sectionOpen) {
     if (DEBUG) console.log('[h3] stream error on ' + sid + ' (' + (H3_ERR_NAME[code] || code) + '): ' + reason);
-    abortStream(sid, code);
+    abortStream(sid, code, sectionOpen);
     ev.emit('stream_error', sid, code, reason);
   }
 
@@ -1260,13 +1450,22 @@ function H3Connection(options) {
    * the server declines to process, `code` is H3_REQUEST_REJECTED (the
    * client may safely retry it); for one abandoned part way,
    * H3_REQUEST_CANCELLED.
+   *
+   * The peer's encoder hears of it (Stream Cancellation) when reading is cut
+   * short — or when a field section on the stream is left unprocessed though
+   * every byte of it is in (`sectionOpen`: one refused as too large; or one
+   * still blocked on the encoder stream): its FIN arrived already, so there
+   * was nothing to stop, but the section is never acknowledged, and without
+   * the cancellation the entries it references could never be evicted
+   * (RFC 9204 §2.2.2.2).
    */
-  function abortStream(streamId, code) {
+  function abortStream(streamId, code, sectionOpen) {
     var sid = Number(streamId);
     rememberAborted(sid);
+    var open = !!sectionOpen || _blocked.has(sid);
     var stopped = quic.stopSending ? quic.stopSending(sid, code) : false;
     if (quic.resetStream) quic.resetStream(sid, code);
-    if (stopped) sendStreamCancel(sid);
+    if (stopped || open) sendStreamCancel(sid);
     releaseStream(sid);
   }
 
@@ -1276,8 +1475,9 @@ function H3Connection(options) {
   function stopReading(streamId, code) {
     var sid = Number(streamId);
     rememberAborted(sid);
+    var open = _blocked.has(sid);
     var stopped = quic.stopSending ? quic.stopSending(sid, code) : false;
-    if (stopped) sendStreamCancel(sid);
+    if (stopped || open) sendStreamCancel(sid);
     releaseStream(sid);
   }
 
@@ -1298,19 +1498,6 @@ function H3Connection(options) {
     if (_fatal) return;   // connection is closing; decoding further is pointless
     var sid = Number(streamId);
 
-    // An extended-CONNECT tunnel: after the CONNECT is accepted, everything on
-    // this stream belongs to the protocol running inside it. RFC 9220 §3 —
-    // WebSocket frames, not DATA frames, and reading them as HTTP/3 would fail
-    // on the first opcode.
-    if (_tunnelStreams.has(sid)) {
-      // Bytes that arrived before the application accepted the CONNECT
-      // (normally replayed at accept already). They go first, in order.
-      if (_tunnelPending[sid]) replayTunnelPending(sid);
-      ev.emit('tunnel_data', sid, data, fin);
-      if (fin) releaseStream(sid);
-      return;
-    }
-
     // Route data for already-detected WT streams
     if (sid in _wtStreams) {
       var ws = _wtStreams[sid];
@@ -1319,24 +1506,6 @@ function H3Connection(options) {
       // claim is not needed past it. Kept, both grew by one entry for every
       // WebTransport stream the connection ever carried.
       if (fin) releaseStream(sid);
-      return;
-    }
-
-    if (_tunnelPendingIds.has(sid)) {
-      // Marked as a tunnel-to-be by the application, not yet accepted.
-      if (!_tunnelPending[sid]) { _tunnelPending[sid] = []; _tunnelPendingBytes[sid] = 0; }
-      if (data && data.byteLength) {
-        _tunnelPendingBytes[sid] += data.byteLength;
-        _tunnelPendingTotal += data.byteLength;
-        if (_tunnelPendingBytes[sid] > MAX_TUNNEL_PENDING || _tunnelPendingTotal > MAX_TUNNEL_PENDING_TOTAL) {
-          streamError(sid, H3_ERR.H3_EXCESSIVE_LOAD, 'tunnel data held before the CONNECT was accepted exceeds the limit');
-          return;
-        }
-        _tunnelPending[sid].push(data);
-      }
-      // The FIN is kept too: nothing more arrives after it, so it has to be
-      // replayed at accept, not on a next delivery that never comes.
-      if (fin) _tunnelPendingFin.add(sid);
       return;
     }
 
@@ -1581,8 +1750,10 @@ function H3Connection(options) {
       if (ft.value === 0x0d && !context.isServer) {
         throw h3Error(H3_ERR.H3_FRAME_UNEXPECTED, 'MAX_PUSH_ID from the server');
       }
+      // ORIGIN (RFC 9412) is read by a client; a server ignores it (RFC 8336 §2.1).
       if (ft.value !== 0x04 && ft.value !== 0x07 && ft.value !== 0x03 && ft.value !== 0x0d &&
-          ft.value !== PRIORITY_UPDATE_REQUEST && ft.value !== PRIORITY_UPDATE_PUSH) {
+          ft.value !== PRIORITY_UPDATE_REQUEST && ft.value !== PRIORITY_UPDATE_PUSH &&
+          !(ft.value === 0x0c && !context.isServer)) {
         consumeBytes(s, headLen);
         s.skip_left = flen.value;
         continue;
@@ -1656,6 +1827,19 @@ function H3Connection(options) {
       var mp = oneVarint(payload, 'MAX_PUSH_ID');
       if (mp < _peerMaxPushId) throw h3Error(H3_ERR.H3_ID_ERROR, 'MAX_PUSH_ID went down, ' + _peerMaxPushId + ' to ' + mp);
       _peerMaxPushId = mp;
+    } else if (frameType === 0x0c) {
+      // ORIGIN (RFC 9412, the frame of RFC 8336 §2): (Origin-Len,
+      // ASCII-Origin) entries. Malformed, it is ignored, as over HTTP/2
+      // (h2_frames).
+      var origins = [];
+      for (var oi = 0; oi < payload.length;) {
+        if (oi + 2 > payload.length) return;
+        var ol = (payload[oi] << 8) | payload[oi + 1];
+        if (oi + 2 + ol > payload.length) return;
+        origins.push(Buffer.from(payload.subarray(oi + 2, oi + 2 + ol)).toString('latin1'));
+        oi += 2 + ol;
+      }
+      ev.emit('origin', origins);
     } else {
       handlePriorityUpdate(frameType, payload);
     }
@@ -1783,6 +1967,17 @@ function H3Connection(options) {
 
     flushQpackAcks();
     unblockStreams();
+  }
+
+  // ---- Empty DATA frames (EMPTY_DATA_BURST, EMPTY_DATA_RATE) ----
+  var _emptyTokens = EMPTY_DATA_BURST, _emptyAt = Date.now();
+  function emptyDataTooMany() {
+    var now = Date.now();
+    _emptyTokens = Math.min(EMPTY_DATA_BURST, _emptyTokens + (now - _emptyAt) / 1000 * EMPTY_DATA_RATE);
+    _emptyAt = now;
+    if (_emptyTokens < 1) return true;
+    _emptyTokens -= 1;
+    return false;
   }
 
   // ---- Blocked streams (RFC 9204 §2.1.2) ----
@@ -1987,6 +2182,7 @@ function H3Connection(options) {
         consumeBytes(s, headLen);
         s.data_left = len.value;
         if (len.value === 0) {
+          if (emptyDataTooMany()) throw h3Error(H3_ERR.H3_EXCESSIVE_LOAD, 'too many empty DATA frames');
           // An empty one is still reported, as it always was.
           ev.emit('http_body', Number(streamId), new Uint8Array(0));
           if (context.streams[streamId] !== s) return;
@@ -2025,7 +2221,7 @@ function H3Connection(options) {
       }
       if (len.value > context.local_max_header_size) {
         streamError(Number(streamId), H3_ERR.H3_EXCESSIVE_LOAD,
-                    'HEADERS of ' + len.value + ' bytes exceeds ' + context.local_max_header_size);
+                    'HEADERS of ' + len.value + ' bytes exceeds ' + context.local_max_header_size, true);
         return;
       }
       if (avail < headLen + len.value) break;
@@ -2048,7 +2244,7 @@ function H3Connection(options) {
       try { headers = decodeHeaders(payload, Number(streamId)); }
       catch (e) {
         if (!e.excessive) throw e;
-        streamError(Number(streamId), H3_ERR.H3_EXCESSIVE_LOAD, e.message);
+        streamError(Number(streamId), H3_ERR.H3_EXCESSIVE_LOAD, e.message, true);
         return;
       }
 
@@ -2117,7 +2313,10 @@ function H3Connection(options) {
       // second head: the client took them for the response's headers — its
       // status read 0 and 'response' fired twice — and the server merged
       // them into the request's headers.
-      ev.emit(isTrailers ? 'http_trailers' : 'http_headers', Number(streamId), r.headers);
+      // A request's third: whether its stream ended with its headers (its FIN
+      // already here, nothing after them) — node:http2's END_STREAM flag.
+      ev.emit(isTrailers ? 'http_trailers' : 'http_headers', Number(streamId), r.headers,
+              !isTrailers && !!s.fin_received && !(s.data_left > 0) && !(s.skip_left > 0) && bufferedBytes(s) === 0);
       // A handler may cancel the stream the moment it sees the headers;
       // DATA behind them in this batch must not surface as a body for a
       // request that no longer exists — h3_server would build a new one.
@@ -2170,8 +2369,17 @@ function H3Connection(options) {
   // alone, and references and inserts nothing. (A second,
   // static-only encoder used to serve that case, without Huffman: a typical
   // page's response headers came out 313 bytes instead of 245.)
+  //
+  // A section over the peer's SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114
+  // §4.2.2: SHOULD NOT be sent — the peer would only refuse it, after reading
+  // and decoding all of it) is not sent, and false returned: the stream is
+  // cancelled (H3_REQUEST_CANCELLED for a request, H3_INTERNAL_ERROR for a
+  // response, which is ours to fail), and 'stream_error' tells the layer
+  // above, after this call, as for a stream the peer broke. The QPACK tables
+  // are not touched. (node:http2's maxSendHeaderBlockLength, for HTTP/3.)
   function sendHeaders(streamId, headers, fin) {
     var list = [];
+    var size = 0;
     for (var hname in headers) {
       if (Object.prototype.hasOwnProperty.call(headers, hname)) {
         // A list: one field line per value (Set-Cookie above all, which may
@@ -2179,6 +2387,18 @@ function H3Connection(options) {
         var hv = headers[hname];
         if (Array.isArray(hv)) { for (var hi = 0; hi < hv.length; hi++) list.push([hname, String(hv[hi])]); }
         else list.push([hname, hv]);
+      }
+    }
+    var peerMax = context.remote_max_header_size;
+    if (peerMax > 0) {
+      for (var li = 0; li < list.length; li++) size += qpackEntrySize(list[li][0], String(list[li][1]));
+      if (size > peerMax) {
+        var sid = Number(streamId);
+        var code = context.isServer ? H3_ERR.H3_INTERNAL_ERROR : H3_ERR.H3_REQUEST_CANCELLED;
+        var reason = 'field section of ' + size + ' bytes exceeds the peer\'s SETTINGS_MAX_FIELD_SECTION_SIZE ' + peerMax;
+        abortStream(sid, code);
+        queueMicrotask(function () { ev.emit('stream_error', sid, code, reason); });
+        return false;
       }
     }
     var enc = qpackEncodeHeaderBlock(list, encoderTable, {
@@ -2204,6 +2424,7 @@ function H3Connection(options) {
     var frame = buildH3Frames([{ frame_type: 1, payload: new Uint8Array(enc.block) }]);
     if (DEBUG) console.log('[h3] sendHeaders stream=' + streamId + ' len=' + frame.byteLength + ' fin=' + !!fin);
     quic.sendStream(streamId, frame, !!fin);
+    return true;
   }
 
   function sendBody(streamId, data, fin) {
@@ -2243,6 +2464,9 @@ function H3Connection(options) {
     sendControlStreams: sendControlStreams,
     sendPriorityUpdate: sendPriorityUpdate,
     sendGoaway: sendGoaway,
+    sendOrigin: sendOrigin,
+    // The SETTINGS this side sends (by their names), for localSettings.
+    getLocalSettings: function () { return localSettings(context); },
 
     // WebTransport server-side API
     registerWebTransportSession: function (sessionStreamId) {
@@ -2264,47 +2488,11 @@ function H3Connection(options) {
     // with WEBTRANSPORT_SESSION_GONE as when the peer ends it.
     endWebTransportSession: function (sessionStreamId) { endWtSession(Number(sessionStreamId)); },
 
-    /**
-     * Take a stream out of HTTP/3 framing and hand its bytes through raw.
-     *
-     * Called once an extended CONNECT has been accepted with a 2xx. From then
-     * on the stream carries whatever protocol `:protocol` named — WebSocket
-     * frames, for RFC 9220 — and 'tunnel_data' delivers them verbatim.
-     */
-    registerTunnelStream: function (streamId) {
-      var id = Number(streamId);
-      _tunnelStreams.add(id);
-      _tunnelPendingIds.delete(id);
-      // Anything that arrived before the accept is delivered now — after the
-      // caller's accept returns — rather than on the next arrival, which may
-      // never come (the client's FIN may already be here).
-      if (_tunnelPending[id] || _tunnelPendingFin.has(id)) {
-        queueMicrotask(function () { if (_tunnelStreams.has(id)) replayTunnelPending(id); });
-      }
-    },
-
     /** Stop reading a stream without resetting what we sent on it. */
     stopReading: stopReading,
 
     /** A WebTransport stream we opened has ended on our side. */
     releaseWebTransportStream: function (streamId) { releaseStream(streamId); },
-
-    /**
-     * Mark a stream as a tunnel-in-progress: stop feeding it to the HTTP/3
-     * frame parser, but hold its bytes until registerTunnelStream() accepts.
-     *
-     * Called the moment `:protocol` is seen, which is before the application
-     * has decided whether to accept. Without it, a client that sends its first
-     * WebSocket frame immediately after the CONNECT has that frame parsed as
-     * an HTTP/3 frame and lost.
-     */
-    beginTunnelStream: function (streamId) {
-      _tunnelPendingIds.add(Number(streamId));
-      // Its bytes are the tunnel's, bounded by MAX_TUNNEL_PENDING until the
-      // accept: credited as delivered from here on.
-      _bodyHeld.delete(Number(streamId));
-      releaseRecvCredit(Number(streamId));
-    },
 
     /**
      * The application returns a request body's flow-control credit itself, as
@@ -2320,11 +2508,6 @@ function H3Connection(options) {
       var id = Number(streamId);
       if (!_bodyHeld.delete(id)) return;
       releaseRecvCredit(id);
-    },
-
-    /** Write raw bytes onto a tunnel stream. */
-    sendTunnelData: function (streamId, data, fin) {
-      quic.sendStream(Number(streamId), data, !!fin);
     },
 
     // A WebTransport stream of our own, on either side: the next free stream
@@ -2423,7 +2606,9 @@ function wtDrainCapsule() { return encodeCapsule(CAPSULE_DRAIN_WT, new Uint8Arra
 // Reads a CONNECT stream's capsules as they arrive, however they are split:
 // onClose({ closeCode, reason }) and onDrain(). A CLOSE whose value is
 // malformed (shorter than its code, or a reason past the limit) is still a
-// close — with code 0 and no reason.
+// close — with code 0 and no reason. So is a DRAIN with a value: it has
+// none (draft-ietf-webtrans-http3: Length = 0). One longer than a CLOSE's
+// value was a close already, while a shorter one passed for a drain.
 function createCapsuleReader(onClose, onDrain) {
   var buf = new Uint8Array(0), skip = 0;
   return function feed(data) {
@@ -2438,7 +2623,8 @@ function createCapsuleReader(onClose, onDrain) {
       var l = readVarInt(buf, t.byteLength); if (!l) return;
       var head = t.byteLength + l.byteLength;
       var known = t.value === CAPSULE_CLOSE_WT || t.value === CAPSULE_DRAIN_WT;
-      if (!known || l.value > 4 + WT_CLOSE_REASON_MAX) {
+      var maxValue = t.value === CAPSULE_CLOSE_WT ? 4 + WT_CLOSE_REASON_MAX : 0;
+      if (!known || l.value > maxValue) {
         if (known) onClose({ closeCode: 0, reason: '' });   // oversized: a close all the same
         var have = buf.byteLength - head;
         if (have >= l.value) { buf = buf.subarray(head + l.value); continue; }
@@ -2458,5 +2644,5 @@ function createCapsuleReader(onClose, onDrain) {
 // parseQpackHeaderBlock is exported for the QPACK tests, which check it
 // against sections from an independent encoder.
 export { settingsContext as h3SettingsContext };
-export { H3Connection, H3_ERR, H3_ERR_NAME, parseQpackHeaderBlock, wtErrorToH3, h3ErrorToWt,
+export { H3Connection, H3_ERR, H3_ERR_NAME, H3_STREAM_CODES, h2CodeToH3, h3SettingsToNode, addH3SessionOps, parseQpackHeaderBlock, wtErrorToH3, h3ErrorToWt,
          wtCloseCapsule, wtDrainCapsule, createCapsuleReader };

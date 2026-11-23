@@ -37,6 +37,7 @@ import dns from 'node:dns';
 import net from 'node:net';
 import lemonTls from 'lemon-tls';
 import { readVarInt, writeVarInt } from './utils.js';
+import { urlHostname, formatAuthority } from './http_common.js';
 import { tlsIdentity, globalAgent } from './agent.js';
 import { H3Connection, H3_ERR_NAME } from './h3.js';
 import { H2Connection } from './h2.js';
@@ -74,7 +75,7 @@ function parseProxy(proxy, options) {
     p.hostname = hp[1]; p.port = hp[2] ? Number(hp[2]) : 443;
     p.template = rest.indexOf('{') >= 0 ? rest : (options.template || DEFAULT_TEMPLATE_PATH);
   } else if (proxy && typeof proxy === 'object') {
-    p.hostname = proxy.hostname || proxy.host;
+    p.hostname = urlHostname(proxy.hostname || proxy.host);
     p.port = Number(proxy.port) || 443;
     p.template = proxy.template || options.template || DEFAULT_TEMPLATE_PATH;
   } else throw new TypeError('connectUdp: a proxy URL or { hostname, port } is needed');
@@ -174,9 +175,7 @@ UdpProxySocket.prototype._start = function () {
 // The request's own fields: the extended CONNECT's pseudo-headers, the
 // application's (a Proxy-Authorization, say), capsule-protocol.
 UdpProxySocket.prototype._authority = function () {
-  var h = this._proxy.hostname;
-  if (net.isIPv6(h)) h = '[' + h + ']';
-  return h + (this._proxy.port !== 443 ? ':' + this._proxy.port : '');
+  return formatAuthority(this._proxy.hostname, this._proxy.port, 443);
 };
 UdpProxySocket.prototype._extraHeaders = function () {
   var out = {}, h = this._options.headers || {};
@@ -467,10 +466,12 @@ ProxyH3Connection.prototype._connected = function (q, s) {
 };
 
 ProxyH3Connection.prototype._gone = function () {
-  var was = this.state;
+  // Still connecting: the waiters fail (_failed takes it out of the pool).
+  // (quic_socket reports a handshake that ends with onError first, so this
+  // is a guard: _failed, called after the state was set, did nothing.)
+  if (this.state === 'connecting') { this._failed(connLost()); return; }
   this.state = 'closed';
   if (h3Connections.get(this.key) === this) h3Connections.delete(this.key);
-  if (was === 'connecting') { this._failed(connLost()); return; }
   var ts = Array.from(this.tunnels.values()); this.tunnels.clear();
   for (var i = 0; i < ts.length; i++) ts[i].lost();
 };
@@ -665,13 +666,15 @@ UdpProxySocket.prototype._startTcp = function (alpn) {
 };
 
 // Capsules on a byte stream: what both TCP versions write, and how much may
-// wait — past STREAM_QUEUE_MAX, a payload is dropped, as UDP drops.
-function streamTransport(writable, write, close, destroy, address) {
+// wait — past STREAM_QUEUE_MAX, a payload is dropped, as UDP drops. What
+// waits is the socket's, and over HTTP/2 the stream's own queue too (`queued`):
+// with the proxy's window closed, DATA waits there, not in the socket.
+function streamTransport(writable, queued, write, close, destroy, address) {
   return {
     mode: function () { return 'capsule'; },
     maxPayload: function () { return MAX_UDP_PAYLOAD; },
     send: function (u8) {
-      if (writable.destroyed || writable.writableLength > STREAM_QUEUE_MAX) return 'dropped';
+      if (writable.destroyed || writable.writableLength + queued() > STREAM_QUEUE_MAX) return 'dropped';
       write(datagramCapsule(u8));
       return 'sent';
     },
@@ -689,7 +692,8 @@ UdpProxySocket.prototype._overH2 = function (socket) {
   socket.on('data', function (d) { try { h2.execute(d); } catch (e) { self._ended(e); try { socket.destroy(); } catch (e2) {} } });
   socket.on('close', function () { self._ended(self._state === 'open' && !ended ? connLost() : null); });
 
-  self._t = streamTransport(socket, function (bytes) { h2.sendData(id, Buffer.from(bytes), false); },
+  self._t = streamTransport(socket, function () { return h2.streamQueued(id); },
+    function (bytes) { h2.sendData(id, Buffer.from(bytes), false); },
     function () { try { h2.sendData(id, null, true); } catch (e) {} setTimeout(function () { try { socket.end(); } catch (e) {} }, 50); },
     function () { try { socket.destroy(); } catch (e) {} },
     function () { try { return socket.address(); } catch (e) { return {}; } });
@@ -735,7 +739,8 @@ UdpProxySocket.prototype._overH1 = function (socket) {
   var self = this;
   var head = Buffer.alloc(0), inHead = true;
   var read = createCapsuleParser(function (u8) { self._payload(udpPayloadOf(u8)); }, function () { self._stats.dropped++; });
-  self._t = streamTransport(socket, function (bytes) { socket.write(bytes); },
+  self._t = streamTransport(socket, function () { return 0; },
+    function (bytes) { socket.write(bytes); },
     function () { try { socket.end(); } catch (e) {} },
     function () { try { socket.destroy(); } catch (e) {} },
     function () { try { return socket.address(); } catch (e) { return {}; } });

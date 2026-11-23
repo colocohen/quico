@@ -12,6 +12,7 @@
  *     https://github.com/colocohen/quico
  */
 
+import { EventEmitter } from 'node:events';
 import { Duplex } from 'node:stream';
 // The module, not a named import: getPeerX509Certificate is the only use, and a
 // bundle for a runtime whose node:crypto has no X509Certificate (a browser
@@ -26,11 +27,12 @@ import { observeH3 } from './h2_fingerprint.js';
 // which is how a handler that throws becomes silence.
 import { Emitter, isConnectionSpecific, runRequestHandler, validateHeaderName, validateHeaderValue, validateStatus,
          DEFAULT_HEADERS_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, startDeadline, responsePriority,
-         sfString, parseSfStringList, maxRequestsPerSocket, trailerFields, statusHasNoBody, runEarlyDataFilter, httpDate, streamResetLimiter } from './http_common.js';
+         sfString, parseSfStringList, maxRequestsPerSocket, trailerFields, statusHasNoBody, runEarlyDataFilter, httpDate, streamResetLimiter,
+         argType, sessionGone, sessionCodeError, nodeError } from './http_common.js';
 import { createQuicServer } from './quic_server.js';
 import { pickTlsOptions } from './tls_options.js';
 import { _makeSocketStub } from './streams.js';
-import { H3Connection, H3_ERR, wtCloseCapsule, wtDrainCapsule, createCapsuleReader, h3SettingsContext } from './h3.js';
+import { H3Connection, H3_ERR, h2CodeToH3, addH3SessionOps, wtCloseCapsule, wtDrainCapsule, createCapsuleReader, h3SettingsContext } from './h3.js';
 import { createWtStream, openWtStream, createSendGroup, wtScheduling, createDatagrams, sessionStats,
          exporterArgs, exportSessionKeyingMaterial } from './wt_stream.js';
 import { contextZero, datagramCapsule, STREAM_QUEUE_MAX } from './connect_udp.js';
@@ -197,7 +199,7 @@ function createServer(options, handler) {
   //
   //   normally (aborted = false)
   //     a request over in both directions        → releaseIfDone
-  //     a tunnel's FIN, or a refused tunnel      → tunnel_data / reject / 501
+  //     a tunnel's FIN, or a refused tunnel      → request_end / reject / 501
   //     a WebTransport stream's FIN              → wt_stream / wt_data
   //     our own WT stream finished               → its 'close'
   //     a session's FIN (CONNECT stream)         → request_end
@@ -231,6 +233,14 @@ function createServer(options, handler) {
     delete conn.http_streams[streamId];
     clearRequestDeadline(stream);
     var req = stream.req;
+    // The request stream is over (both ways, or cut): for the layer above's
+    // core-API stream, with the code it ended with — the peer's or ours, or
+    // H3_NO_ERROR / H3_REQUEST_CANCELLED when it carried none.
+    if (typeof req._onClose === 'function') {
+      var closeCode = stream.closeCode !== undefined ? stream.closeCode
+                    : aborted ? H3_ERR.H3_REQUEST_CANCELLED : H3_ERR.H3_NO_ERROR;
+      try { req._onClose(closeCode, !!aborted); } catch (e) {}
+    }
     // Its body's credit, if the layer above was returning it as it read: the
     // request is over, so nothing more is waited for.
     if (conn.h3) conn.h3.releaseBody(streamId);
@@ -278,10 +288,12 @@ function createServer(options, handler) {
   // 'overloaded'), as HTTP/3 connection error codes: one piece of limiting
   // code drives both versions.
   function h3ConnCode(code) {
-    if (typeof code === 'number') return code;
+    if (typeof code === 'number') return h2CodeToH3(code);
     if (code === 'overloaded') return H3_ERR.H3_EXCESSIVE_LOAD;
     return H3_ERR.H3_NO_ERROR;
   }
+
+  // (An HTTP/2 code: as h3.js's h2CodeToH3 maps it.)
 
   // After GOAWAY, once the last request accepted has finished and everything
   // sent on the connection has been acknowledged, the connection is closed
@@ -323,8 +335,8 @@ function createServer(options, handler) {
    * runs on it, and sends every fetch for the origin over it too: the map grew
    * without bound, and the datagram handler below walks it for every datagram.
    *
-   * A tunnel and a WebTransport session have their own ends (tunnel_data FIN,
-   * 'request_end' on the CONNECT stream) and are left to them.
+   * A tunnel and a WebTransport session have their own ends ('request_end' on
+   * the CONNECT stream) and are left to them.
    */
   function releaseIfDone(conn, streamId) {
     var stream = conn.http_streams[streamId];
@@ -353,7 +365,17 @@ function createServer(options, handler) {
    * The same shape h2_server builds over an HTTP/2 stream, and for the same
    * reason: ws_server was written against a socket, so handing it one of these
    * is the whole integration — the WebSocket framing never learns whether its
-   * bytes are TCP, HTTP/2 DATA frames, or QUIC stream bytes.
+   * bytes are TCP, HTTP/2 DATA frames, or HTTP/3 ones.
+   *
+   * DATA frames both ways, as on any CONNECT stream (RFC 9114 §4.4: "Once the
+   * CONNECT method has completed, only DATA frames are permitted to be sent on
+   * the stream"; RFC 9220 keeps HTTP/2's semantics, where the WebSocket bytes
+   * are DATA). The stream used to leave HTTP/3 framing at the accept and carry
+   * raw bytes: a conformant client's DATA frame headers reached the WebSocket
+   * parser as data, and what was sent back was no frame it could read.
+   *
+   * Its body's credit goes back as the tunnel is read (h3's holdBody), as a
+   * request's does: bytes nobody reads do not pile up here.
    *
    * What QUIC adds for free is worth naming: each of these is an independent
    * QUIC stream, so a WebSocket that stalls does not hold up the others on the
@@ -361,9 +383,14 @@ function createServer(options, handler) {
    */
   function _createTunnelDuplex(conn, streamId, req) {
     var accepted = false;
+    var owed = 0;   // bytes pushed whose credit waits for the reader
 
     var duplex = new Duplex({
-      read: function () {},
+      // The reader wants more: what it was handed is credited now.
+      read: function () {
+        if (owed && conn.h3) conn.h3.creditBody(streamId, owed);
+        owed = 0;
+      },
       // Destroyed by the application (ws.terminate(), socket.destroy()) while
       // the tunnel is open: the stream cancelled both ways. It was left open
       // — the peer never heard the tunnel had gone. Destroyed because the
@@ -378,15 +405,23 @@ function createServer(options, handler) {
       write: function (chunk, encoding, cb) {
         if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
         var u8 = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-        if (conn.h3) conn.h3.sendTunnelData(streamId, u8, false);
+        if (conn.h3) conn.h3.sendBody(streamId, u8, false);
         // Backpressure, as for a response (whenStreamSent in quic_connection).
         if (conn.quic) conn.quic.whenStreamSent(Number(streamId), duplex.writableHighWaterMark, cb); else cb();
       },
       final: function (cb) {
-        if (conn.h3) conn.h3.sendTunnelData(streamId, new Uint8Array(0), true);
+        if (conn.h3) conn.h3.sendBody(streamId, null, true);
         cb();
       }
     });
+
+    // A DATA frame's payload from the client: credited at once while the
+    // reader keeps up, else when it asks for more.
+    duplex._pushData = function (u8) {
+      var buf = Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+      if (duplex.push(buf)) { if (conn.h3) conn.h3.creditBody(streamId, buf.length); }
+      else owed += buf.length;
+    };
 
     duplex._streamId = streamId;
     duplex.encrypted = true;          // QUIC is always encrypted
@@ -399,18 +434,14 @@ function createServer(options, handler) {
      *
      * HTTP/3 has no 101 any more than HTTP/2 does: a 2xx accepts (RFC 9220
      * §3). The headers go out WITHOUT FIN — the stream stays open in both
-     * directions, which is the entire point — and only then does the stream
-     * leave HTTP/3 framing.
+     * directions, which is the entire point.
      */
     duplex._h2Accept = function (extraHeaders) {
       if (accepted) return;
       accepted = true;
       var h = { ':status': '200' };
       for (var n in (extraHeaders || {})) h[String(n).toLowerCase()] = extraHeaders[n];
-      if (conn.h3) {
-        conn.h3.sendHeaders(streamId, h, false);
-        conn.h3.registerTunnelStream(streamId);
-      }
+      if (conn.h3) conn.h3.sendHeaders(streamId, h, false);
     };
 
     /** Refuse it, with a status. */
@@ -419,8 +450,8 @@ function createServer(options, handler) {
       accepted = true;
       if (conn.h3) {
         conn.h3.sendHeaders(streamId, { ':status': String(status) }, true);
-        // Whatever the client sent ahead of our answer is held for a tunnel
-        // that will now never open: drop it and stop reading.
+        // Whatever the client sent ahead of our answer is for a tunnel that
+        // will now never open: stop reading it.
         conn.h3.stopReading(streamId, H3_ERR.H3_REQUEST_REJECTED);
       }
       releaseHttpStream(conn, streamId, false);
@@ -582,6 +613,8 @@ function createServer(options, handler) {
         },
 
         socket: conn.socket,
+        // The connection handle ('session'), for node:http2's stream.session.
+        get session() { return conn.handle || null; },
 
         on: function (event, fn) {
           (req._listeners[event] = req._listeners[event] || []).push(fn);
@@ -720,8 +753,44 @@ function createServer(options, handler) {
           try { conn.h3.sendHeaders(streamId, { ':status': '102' }, false); } catch (e) { /* stream gone */ }
         },
 
+        // ---- For node:http2's stream API (server.js's ServerStream hooks) ----
+        //
+        // A head already checked (http_common's http2FieldList) and made
+        // final — its :status, its date — sent as it is.
+        _sendHead: function (fields, status) {
+          if (res.headersSent || res._finished) return;
+          res.statusCode = status;
+          res._bodyAllowed = !statusHasNoBody(status) && req.headers[':method'] !== 'HEAD';
+          if (conn.h3) conn.h3.sendHeaders(streamId, fields, undefined);
+          res.headersSent = true;
+        },
+        // A 1xx head (103, 102, …), the stream left open.
+        _sendInfo: function (fields) {
+          if (res.headersSent || res._finished || !conn.h3) return;
+          conn.h3.sendHeaders(streamId, fields, false);
+        },
+        // node:http2's stream.close(code) / destroy(): the response not
+        // finished, the stream cancelled both ways with `code`; finished,
+        // what is left of the request body refused (STOP_SENDING, `code`).
+        _reset: function (code) {
+          var st = conn.http_streams[streamId];
+          if (!st) return;
+          if (!res._finished) {
+            res._finished = true;
+            if (conn.h3) conn.h3.abortStream(streamId, code);
+          } else if (!req._ended) {
+            if (conn.h3) conn.h3.stopReading(streamId, code);
+          } else {
+            return;
+          }
+          st.closeCode = code;
+          releaseHttpStream(conn, streamId, false);
+        },
+
         write: function (chunk) {
           if (!res.headersSent) res.writeHead(res.statusCode);
+          // After the end (the core API ended it, say): nothing more goes.
+          if (res._finished) return true;
           if (!res._bodyAllowed) return true;
           if (typeof chunk === 'string') chunk = new TextEncoder().encode(chunk);
           if (conn.h3) conn.h3.sendBody(streamId, chunk, false);
@@ -788,6 +857,7 @@ function createServer(options, handler) {
           if (!res._finished) {
             res._finished = true;
             if (conn.h3) conn.h3.abortStream(streamId, code);
+            conn.http_streams[streamId].closeCode = code;
           } else if (!req._ended) {
             if (conn.h3) conn.h3.stopReading(streamId, H3_ERR.H3_NO_ERROR);
           } else {
@@ -965,6 +1035,7 @@ function createServer(options, handler) {
           Object.defineProperty(stream.req.headers, '_rawHeaders', { value: params.request_headers._rawHeaders, enumerable: false });
         }
 
+        stream.req._endAfterHeaders = !!params.end_after_headers;
         // Extract :method and :path
         if (stream.req.method === null && ':method' in stream.req.headers) {
           stream.req.method = stream.req.headers[':method'];
@@ -987,6 +1058,8 @@ function createServer(options, handler) {
         if (stream.req._capsules) { stream.req._capsules(params.request_body_chunk); return; }
         // A CONNECT-UDP tunnel's: capsules too, for the proxy.
         if (stream.udp) { if (stream.udp.sink) stream.udp.sink.data(params.request_body_chunk); return; }
+        // An extended-CONNECT tunnel's (a WebSocket): its bytes.
+        if (stream.tunnel) { stream.tunnel._pushData(params.request_body_chunk); return; }
         var listeners = stream.req._listeners['data'] || [];
         for (var i = 0; i < listeners.length; i++) {
           try { listeners[i](params.request_body_chunk); } catch (e) { }
@@ -999,6 +1072,8 @@ function createServer(options, handler) {
         clearRequestDeadline(stream);
         // The client closed the tunnel (§3.1 of RFC 9298).
         if (stream.udp) { stream.udp.peerEnded = true; if (stream.udp.sink) stream.udp.sink.end(); return; }
+        // The client closed its side of the tunnel; ours may still send.
+        if (stream.tunnel) { stream.tunnel.push(null); releaseHttpStream(conn, streamId, false); return; }
         var listeners = stream.req._listeners['end'] || [];
         for (var i = 0; i < listeners.length; i++) {
           try { listeners[i](); } catch (e) { }
@@ -1041,10 +1116,10 @@ function createServer(options, handler) {
         return;
       }
       if (proto && String(proto).toLowerCase() !== 'webtransport' && shouldUpgradeCallback(stream.req)) {
-        // Stop HTTP/3 framing on this stream NOW, before the application has
-        // decided anything: a client may already be sending WebSocket frames,
-        // and they must not reach the frame parser.
-        if (conn.h3) conn.h3.beginTunnelStream(streamId);
+        // The tunnel's bytes arrive as DATA frames, like a body: what comes
+        // before the application accepts waits in the Duplex, its credit held
+        // until it is read.
+        if (conn.h3) conn.h3.holdBody(streamId);
         var duplex = _createTunnelDuplex(conn, streamId, stream.req);
         stream.tunnel = duplex;
 
@@ -1070,7 +1145,7 @@ function createServer(options, handler) {
       // response it had already ended is left to finish.
       // maxRequestsPerSocket: after the Nth request, GOAWAY — those in flight
       // finish, the client takes the next to a new connection (as HTTP/2).
-      if (maxRequests > 0 && ++conn.served === maxRequests && conn.handle) conn.handle.goaway();
+      if (maxRequests > 0 && ++conn.served === maxRequests && conn.handle) conn.goawayNow();
       runRequestHandler(function () {
         if (typeof handler === 'function') handler(stream.req, stream.res);
         ev.emit('request', stream.req, stream.res);
@@ -1251,10 +1326,20 @@ function createServer(options, handler) {
     // finished in both directions are already gone (releaseIfDone).
     conns.add(conn);
     // Over for the application ('closing'), or its draining done ('close').
-    var gone = function () { if (conns.delete(conn)) connGone(); };
+    var gone = function (peer) {
+      if (!conns.delete(conn)) return;
+      h3OpsEnd();
+      connGone();
+      // The client closed with an HTTP/3 error code (its destroy(code)):
+      // 'error', as node:http2's session on a GOAWAY with one — to a
+      // listener, as the session's own errors go.
+      if (peer && peer.application && peer.error !== H3_ERR.H3_NO_ERROR) sessionError(sessionCodeError(peer.error));
+      // The session's 'close' (node:http2's): after what ended it reported.
+      process.nextTick(function () { connHandle.emit('close'); });
+    };
     quic.on('closing', gone);
     quic.on('close', function () {
-      gone();
+      gone(null);
       for (var hid in conn.headerDeadlines) clearHeadersDeadline(conn, hid);
       for (var sid in conn.http_streams) releaseHttpStream(conn, sid, true);
       for (var wid in conn._wtStreamObjects) releaseHttpStream(conn, wid, true);
@@ -1275,24 +1360,34 @@ function createServer(options, handler) {
      * The same handle h2_server builds, so that one piece of rate-limiting
      * code works against both protocols without branching on version.
      */
-    var connHandle = {
-      httpVersion: '3.0',
+    var connHandle = new EventEmitter();
+    var sessionClosed = false;   // close() called: node:http2's `closed`
+    Object.defineProperties(connHandle, {
+      httpVersion: { value: '3.0', enumerable: true },
       // quic_server attaches the address to the connection, but the listener
       // is handed it directly too — `peer` — and that one does not depend on
       // which version of quic_server is installed. Without the fallback an
       // older quic_server gives null here, and an IP screen that reads it
       // skips the connection silently rather than failing.
-      get remoteAddress() { return quic.remoteAddress || (peer && peer.address) || null; },
-      get remotePort() { return quic.remotePort || (peer && peer.port) || null; },
+      remoteAddress: { get: function () { return quic.remoteAddress || (peer && peer.address) || null; }, enumerable: true },
+      remotePort: { get: function () { return quic.remotePort || (peer && peer.port) || null; }, enumerable: true },
 
       // Read by anything that checks before it acts, the way checkIpBlacklist
       // does with a TCP socket: its answer arrives asynchronously, and by then
       // the peer may already have gone.
-      get destroyed() {
-        var st = quic.state;
-        return st === 'closed' || st === 'draining' || st === 'closing';
+      destroyed: {
+        get: function () {
+          var st = quic.state;
+          return st === 'closed' || st === 'draining' || st === 'closing';
+        },
+        enumerable: true
       },
-      encrypted: true,
+      closed: { get: function () { return sessionClosed; }, enumerable: true },
+      encrypted: { value: true, enumerable: true },
+      alpnProtocol: { value: 'h3', enumerable: true },
+      type: { value: 0, enumerable: true }   // node:http2's NGHTTP2_SESSION_SERVER
+    });
+    Object.assign(connHandle, {
       fingerprint: function () { return h3Observer(); },
       getTicketInfo: function () { return quic.getTicketInfo ? quic.getTicketInfo() : null; },
       isSessionReused: function () { return !!(quic.isSessionReused && quic.isSessionReused()); },
@@ -1332,15 +1427,30 @@ function createServer(options, handler) {
       // H3_NO_ERROR, or H3_EXCESSIVE_LOAD for goaway('overloaded') (HTTP/2's
       // ENHANCE_YOUR_CALM). Before the handshake there is no HTTP/3 to speak
       // of: refused, as destroy() does.
-      goaway: function (code) {
-        if (conn.goaway) return;
-        if (!conn.h3) { try { quic.close(0x02, 'refused', false); } catch (e) {} return; }
-        conn.goaway = { id: (quic.context.peer_max_opened_bidi + 1) * 4, code: h3ConnCode(code), closing: false };
-        conn.h3.sendGoaway(conn.goaway.id);
-        closeAfterGoaway(conn);
+      //
+      // node:http2's goaway(code, lastStreamId, opaqueData), with its checks:
+      // a lastStreamId (not 0) lowers the GOAWAY's id to the stream after it,
+      // and a second call may lower it again (RFC 9114 §5.2: never raise it).
+      // HTTP/3's GOAWAY has no error code or data: the code is the one the
+      // connection closes with, and opaqueData is not sent.
+      goaway: function (code, lastStreamId, opaqueData) {
+        if (connHandle.destroyed) throw sessionGone();
+        if (code !== undefined && typeof code !== 'number' && typeof code !== 'string') throw argType('code', 'number', code);
+        if (lastStreamId !== undefined && typeof lastStreamId !== 'number') throw argType('lastStreamId', 'number', lastStreamId);
+        if (opaqueData !== undefined && !ArrayBuffer.isView(opaqueData)) throw argType('opaqueData', 'Buffer, TypedArray, or DataView', opaqueData);
+        goaway(code, lastStreamId);
       },
 
-      destroy: function (code) {
+      // node:http2's close(callback): goaway(), and 'close' (the callback)
+      // when the requests in flight have finished and the connection is gone.
+      close: function (callback) {
+        if (sessionClosed || connHandle.destroyed) return;
+        sessionClosed = true;
+        if (typeof callback === 'function') connHandle.once('close', callback);
+        goaway();
+      },
+
+      destroy: function (error, code) {
         // Two different closes, because the right one depends on WHEN.
         //
         // Before the handshake completes there is no HTTP/3 yet — an
@@ -1354,12 +1464,88 @@ function createServer(options, handler) {
         // H3_NO_ERROR, H3_EXCESSIVE_LOAD for 'overloaded', or a number. It sent
         // 0x10c — H3_REQUEST_CANCELLED, a stream's code, which says nothing
         // about why a connection ended.
+        //
+        // node:http2's destroy(error, code): a number (or an intent) in place
+        // of the error is the code; with an error and no code,
+        // H3_INTERNAL_ERROR; 'error' (when an error), then 'close'.
+        if (connHandle.destroyed) return;
+        if (typeof error === 'number' || typeof error === 'string') {
+          code = h3ConnCode(error);
+          error = code !== H3_ERR.H3_NO_ERROR ? sessionCodeError(code) : undefined;
+        } else if (code !== undefined) code = h3ConnCode(code);
+        if (code === undefined) code = error ? H3_ERR.H3_INTERNAL_ERROR : H3_ERR.H3_NO_ERROR;
+        if (error) process.nextTick(sessionError, error);
         try {
           if (!conn.h3) quic.close(0x02, 'refused', false);
-          else          quic.close(h3ConnCode(code), 'closed', true);
+          else          quic.close(code, 'closed', true);
         } catch (e) {}
       }
-    };
+    });
+
+    // ---- node:http2's session operations, as HTTP/3 has them ----
+    //
+    // ping(), settings(), localSettings / remoteSettings, setLocalWindowSize(),
+    // state, setTimeout(): h3.js's addH3SessionOps, the client's too. The
+    // server's own:
+    //   origin()             ORIGIN (RFC 9412), on the control stream.
+    //   altsvc()             no ALTSVC frame in HTTP/3: ERR_HTTP3_NO_ALTSVC
+    //                        (an Alt-Svc header field does the same).
+    var h3Ops = addH3SessionOps(connHandle, {
+      quic: function () { return quic; },
+      h3: function () { return conn.h3 || null; },
+      destroyed: function () { return connHandle.destroyed; },
+      closed: function () { return sessionClosed; },
+      isServer: true,
+      options: options
+    });
+    var h3OpsEnd = h3Ops.end;
+    Object.assign(connHandle, {
+      origin: function () {
+        if (connHandle.destroyed) throw sessionGone();
+        if (arguments.length === 0) return;
+        var list = [], len = 0;
+        for (var i = 0; i < arguments.length; i++) {
+          var o = arguments[i];
+          if (typeof o === 'string') { try { o = new URL(o).origin; } catch (e) { o = 'null'; } }
+          else if (o !== null && typeof o === 'object') o = o.origin;
+          if (typeof o !== 'string') throw argType('origin', 'string', o);
+          if (o === 'null') throw nodeError(TypeError, 'ERR_HTTP2_INVALID_ORIGIN', 'HTTP/2 ORIGIN frames require a valid origin');
+          list.push(o);
+          len += o.length;
+        }
+        if (len > 16382) throw nodeError(TypeError, 'ERR_HTTP2_ORIGIN_LENGTH', 'HTTP/2 ORIGIN frames are limited to 16382 bytes');
+        if (conn.h3) conn.h3.sendOrigin(list);
+      },
+      altsvc: function () {
+        if (connHandle.destroyed) throw sessionGone();
+        throw nodeError(Error, 'ERR_HTTP3_NO_ALTSVC', 'HTTP/3 has no ALTSVC frame: send an Alt-Svc header field instead');
+      }
+    });
+
+    // The goaway() above without its checks, for the server's own use (it
+    // does not throw on a connection already gone).
+    function goaway(code, lastStreamId) {
+      if (connHandle.destroyed) return;
+      if (!conn.h3) { try { quic.close(0x02, 'refused', false); } catch (e) {} return; }
+      var id = (quic.context.peer_max_opened_bidi + 1) * 4;
+      if (lastStreamId > 0) id = Math.min(id, Math.floor(lastStreamId / 4) * 4 + 4);
+      if (conn.goaway) {
+        if (id >= conn.goaway.id) return;
+        conn.goaway.id = id;
+      } else {
+        conn.goaway = { id: id, code: h3ConnCode(code), closing: false };
+      }
+      conn.h3.sendGoaway(conn.goaway.id);
+      closeAfterGoaway(conn);
+    }
+    conn.goawayNow = goaway;
+
+    // 'error' on the session, as node:http2's: only to a listener — the
+    // server's own report of a failure is unchanged ('error', below).
+    function sessionError(err) {
+      if (connHandle.listenerCount('error') > 0) connHandle.emit('error', err);
+    }
+
     conn.handle = connHandle;
 
     // Announced upward, before the handshake — the QUIC counterpart of
@@ -1462,12 +1648,12 @@ function createServer(options, handler) {
       // listens to, and the peer's ERR_QUIC_PROTOCOL_ERROR is the only sign
       // anything happened — invisible on this side, which is the exact failure
       // mode the error layer exists to remove.
-      h3.on('error', function (err) { ev.emit('error', err); });
+      h3.on('error', function (err) { sessionError(err); ev.emit('error', err); });
 
       // HTTP request headers received → set_http_stream (reactive)
-      h3.on('http_headers', function (streamId, headers) {
+      h3.on('http_headers', function (streamId, headers, endAfterHeaders) {
         clearHeadersDeadline(conn, streamId);
-        set_http_stream(conn, streamId, { request_headers: headers });
+        set_http_stream(conn, streamId, { request_headers: headers, end_after_headers: !!endAfterHeaders });
       });
 
       // The request's trailers (after its body, before its end): on req, as
@@ -1475,6 +1661,7 @@ function createServer(options, handler) {
       h3.on('http_trailers', function (streamId, trailers) {
         var st = conn.http_streams[streamId];
         if (st && st.req) st.req.trailers = trailers;
+        if (st && st.req && typeof st.req._onTrailers === 'function') st.req._onTrailers(trailers);
       });
 
       // HTTP request body chunk → set_http_stream
@@ -1524,6 +1711,7 @@ function createServer(options, handler) {
         } else {
           var hadRequest = streamId in conn.http_streams;
           var cancelled = conn.http_streams[streamId];
+          if (cancelled && cancelled.closeCode === undefined) cancelled.closeCode = code;
           var sendingOpen = !!cancelled && !(cancelled.res && cancelled.res._finished);
           releaseHttpStream(conn, streamId, true);
           // The client reset its request (RESET_STREAM alone — an upload
@@ -1576,18 +1764,6 @@ function createServer(options, handler) {
       // same end: the session's streams are released (destroyed).
       h3.on('wt_session_closed', function (sessionId) {
         releaseSessionStreams(conn, Number(sessionId));
-      });
-
-      h3.on('tunnel_data', function (streamId, data, fin) {
-        var stream = conn.http_streams[streamId];
-        if (!stream || !stream.tunnel) return;
-        if (data && data.byteLength) {
-          stream.tunnel.push(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-        }
-        if (fin) {
-          stream.tunnel.push(null);
-          releaseHttpStream(conn, streamId, false);
-        }
       });
 
       // ---- WebTransport stream events ----
@@ -1650,6 +1826,16 @@ function createServer(options, handler) {
         if (session.req._wtDatagrams) session.req._wtDatagrams._push(payload);
         _emitOnReq(session.req, 'datagram', Buffer.from(payload.buffer));
       });
+
+      // The client's SETTINGS: 'remoteSettings', as node:http2's.
+      h3.on('peer_settings', h3Ops.remote);
+
+      // node:http2's 'session': the connection is HTTP/3, its handlers on,
+      // before any request. A listener may destroy() it.
+      ev.emit('session', connHandle);
+      // Ours are in effect from the start (nothing acknowledges them): a
+      // listener attached in 'session' hears it.
+      h3Ops.local();
     });
   });
 
@@ -1673,7 +1859,7 @@ function createServer(options, handler) {
   // client that had gone held the close until its idle timeout.
   function closeIdle(conn) {
     if (!conn.handle) return;
-    conn.handle.goaway();
+    conn.goawayNow();
     conn.handle.destroy();
   }
   function closeIdleConnections() {
@@ -1691,7 +1877,7 @@ function createServer(options, handler) {
     closingServer = typeof callback === 'function' ? callback : function () {};
     for (var conn of conns) {
       if (isIdle(conn)) closeIdle(conn);
-      else if (conn.handle) conn.handle.goaway();
+      else if (conn.handle) conn.goawayNow();
     }
     connGone();
   }

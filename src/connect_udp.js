@@ -369,17 +369,21 @@ function createConnectUdp(options) {
     if (this.state !== 'pending' || this._accepting) return this;
     opts = opts || {};
     var self = this;
-    this._accepting = true;
+    // The options checked before anything is taken: an accept() that threw
+    // leaves the tunnel pending, for a corrected accept() or a reject().
+    var target = null;
     if (opts.target) {
       var p = Number(opts.target.port);
       if (!opts.target.host || !(p >= 1 && p <= 65535)) throw new TypeError('accept({ target }) needs a host and a port in 1..65535');
-      this.target = { host: String(opts.target.host), port: p };
+      target = { host: String(opts.target.host), port: p };
     }
-    var headers = opts.headers || null;
-    if (opts.relay === false) { this._open(headers); return this; }
     // The socket to the target, when this tunnel makes it (no opts.socket):
     // its buffers (utils.js), 4 MB by default; socketBufferSize 0, the OS's.
-    var bufferSize = checkedSocketBufferSize(opts.socketBufferSize, 'accept({ socketBufferSize })');
+    var bufferSize = opts.relay === false ? 0 : checkedSocketBufferSize(opts.socketBufferSize, 'accept({ socketBufferSize })');
+    this._accepting = true;
+    if (target) this.target = target;
+    var headers = opts.headers || null;
+    if (opts.relay === false) { this._open(headers); return this; }
 
     var allowPrivate = opts.allowPrivate != null ? !!opts.allowPrivate : allowPrivateDefault;
     var host = this.target.host;

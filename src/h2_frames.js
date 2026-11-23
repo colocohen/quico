@@ -50,6 +50,10 @@ var TYPE = {
   GOAWAY:        0x7,
   WINDOW_UPDATE: 0x8,
   CONTINUATION:  0x9,
+  // RFC 7838 §4: an alternative service, server to client.
+  ALTSVC:        0xa,
+  // RFC 8336: the origins this connection may serve, server to client.
+  ORIGIN:        0xc,
   // RFC 9218 §7.1: a stream's priority after its request, client to server,
   // on stream 0 — the scheme that replaced PRIORITY (RFC 9113 §5.3.2).
   PRIORITY_UPDATE: 0x10
@@ -357,6 +361,33 @@ function parsePayload(type, flags, streamId, payload) {
       return frame;
     }
 
+    case TYPE.ALTSVC: {
+      // RFC 7838 §4: Origin-Len, Origin, Alt-Svc-Field-Value. One that does
+      // not add up is ignored — the frame is advisory, and the connection
+      // owes it nothing.
+      if (payload.length < 2) { frame.unknown = true; return frame; }
+      var olen = payload.readUInt16BE(0);
+      if (2 + olen > payload.length) { frame.unknown = true; return frame; }
+      frame.origin = payload.subarray(2, 2 + olen).toString('latin1');
+      frame.altValue = payload.subarray(2 + olen).toString('latin1');
+      return frame;
+    }
+
+    case TYPE.ORIGIN: {
+      // RFC 8336 §2: a list of (Origin-Len, ASCII-Origin). Malformed, it is
+      // ignored, as ALTSVC is.
+      var origins = [];
+      for (var oi = 0; oi < payload.length;) {
+        if (oi + 2 > payload.length) { frame.unknown = true; return frame; }
+        var ol = payload.readUInt16BE(oi);
+        if (oi + 2 + ol > payload.length) { frame.unknown = true; return frame; }
+        origins.push(payload.subarray(oi + 2, oi + 2 + ol).toString('latin1'));
+        oi += 2 + ol;
+      }
+      frame.origins = origins;
+      return frame;
+    }
+
     case TYPE.CONTINUATION: {
       if (streamId === 0) throw h2Error('CONTINUATION on stream 0', ERROR.PROTOCOL_ERROR);
       frame.headerBlock = payload;
@@ -457,11 +488,28 @@ function buildData(streamId, data, endStream) {
   return buildFrame(TYPE.DATA, endStream ? FLAG.END_STREAM : 0, streamId, data);
 }
 
+// A frame's payload padded to `total` bytes (RFC 9113 §6.1): the Pad
+// Length byte, the content, the padding (zeros). `total` no more than the
+// content: unpadded.
+function padPayload(content, total) {
+  if (!(total > content.length)) return content;
+  var padLength = total - content.length - 1;
+  var p = Buffer.alloc(total);
+  p[0] = padLength;
+  content.copy ? content.copy(p, 1) : p.set(content, 1);
+  return p;
+}
+
 function buildHeaders(streamId, headerBlock, options) {
   options = options || {};
   var flags = 0;
   if (options.endStream) flags |= FLAG.END_STREAM;
   if (options.endHeaders !== false) flags |= FLAG.END_HEADERS;
+  // options.padTo: the payload's length, padded (padPayload).
+  if (options.padTo > headerBlock.length) {
+    flags |= FLAG.PADDED;
+    headerBlock = padPayload(headerBlock, options.padTo);
+  }
   return buildFrame(TYPE.HEADERS, flags, streamId, headerBlock);
 }
 
@@ -478,12 +526,23 @@ function buildRstStream(streamId, errorCode) {
 
 function buildSettings(settings, ack) {
   if (ack) return buildFrame(TYPE.SETTINGS, FLAG.ACK, 0, Buffer.alloc(0));
-  var names = Object.keys(settings || {});
+  // The RFC's settings first, then the custom ones (node:http2's order). A
+  // JS object lists integer keys before all others, so a custom setting
+  // (one by number) went first.
+  var keys = Object.keys(settings || {});
+  var names = keys.filter(function (k) { return SETTINGS[k] !== undefined; })
+    .concat(keys.filter(function (k) { return SETTINGS[k] === undefined; }));
   var p = Buffer.allocUnsafe(names.length * 6);
   var off = 0;
   for (var i = 0; i < names.length; i++) {
     var id = SETTINGS[names[i]];
-    if (id === undefined) continue;
+    // A setting this file has no name for goes by its number (a custom one,
+    // node:http2's customSettings).
+    if (id === undefined) {
+      var num = Number(names[i]);
+      if (!Number.isInteger(num) || num <= 0 || num > 0xffff) continue;
+      id = num;
+    }
     p.writeUInt16BE(id, off);
     p.writeUInt32BE(settings[names[i]] >>> 0, off + 2);
     off += 6;
@@ -504,6 +563,29 @@ function buildGoaway(lastStreamId, errorCode, debugData) {
   p.writeUInt32BE(errorCode >>> 0, 4);
   d.copy(p, 8);
   return buildFrame(TYPE.GOAWAY, 0, 0, p);
+}
+
+// RFC 7838 §4: on stream 0 with an origin, or on a stream without one.
+function buildAltsvc(streamId, origin, value) {
+  var o = Buffer.from(origin || '', 'latin1');
+  var v = Buffer.from(value || '', 'latin1');
+  var p = Buffer.allocUnsafe(2 + o.length + v.length);
+  p.writeUInt16BE(o.length, 0);
+  o.copy(p, 2);
+  v.copy(p, 2 + o.length);
+  return buildFrame(TYPE.ALTSVC, 0, streamId, p);
+}
+
+// RFC 8336 §2: on stream 0.
+function buildOrigin(origins) {
+  var parts = [];
+  for (var i = 0; i < origins.length; i++) {
+    var b = Buffer.from(origins[i], 'latin1');
+    var len = Buffer.allocUnsafe(2);
+    len.writeUInt16BE(b.length, 0);
+    parts.push(len, b);
+  }
+  return buildFrame(TYPE.ORIGIN, 0, 0, Buffer.concat(parts));
 }
 
 // RFC 9218 §7.1: the stream, then its Priority Field Value.
@@ -535,7 +617,9 @@ function buildHeaderFrames(streamId, headerBlock, options, maxFrameSize) {
   maxFrameSize = maxFrameSize || DEFAULT_MAX_FRAME_SIZE;
 
   if (headerBlock.length <= maxFrameSize) {
-    return [buildHeaders(streamId, headerBlock, { endStream: options.endStream, endHeaders: true })];
+    // options.padTo: padded to that payload (one frame only, as nghttp2 pads).
+    return [buildHeaders(streamId, headerBlock, { endStream: options.endStream, endHeaders: true,
+                                                  padTo: options.padTo <= maxFrameSize ? options.padTo : 0 })];
   }
 
   var out = [];
@@ -548,6 +632,34 @@ function buildHeaderFrames(streamId, headerBlock, options, maxFrameSize) {
     var end = Math.min(pos + maxFrameSize, headerBlock.length);
     out.push(buildContinuation(streamId, headerBlock.subarray(pos, end),
                                end >= headerBlock.length));
+    pos = end;
+  }
+  return out;
+}
+
+/**
+ * PUSH_PROMISE (RFC 9113 §6.6) on `streamId`, promising `promisedId`, then
+ * CONTINUATIONs for what of the block does not fit; one array, to be written
+ * as one (§6.10). The payload is the promised id and the block; options.padTo
+ * pads a one-frame payload to that length (as nghttp2 pads it).
+ */
+function buildPushPromiseFrames(streamId, promisedId, headerBlock, options, maxFrameSize) {
+  options = options || {};
+  maxFrameSize = maxFrameSize || DEFAULT_MAX_FRAME_SIZE;
+  var idBytes = Buffer.alloc(4);
+  idBytes.writeUInt32BE(promisedId & 0x7fffffff, 0);
+  var first = Math.min(headerBlock.length, maxFrameSize - 4);
+  var payload = Buffer.concat([idBytes, headerBlock.subarray(0, first)]);
+  var flags = first >= headerBlock.length ? FLAG.END_HEADERS : 0;
+  if (flags && options.padTo > payload.length && options.padTo <= maxFrameSize) {
+    flags |= FLAG.PADDED;
+    payload = padPayload(payload, options.padTo);
+  }
+  var out = [buildFrame(TYPE.PUSH_PROMISE, flags, streamId, payload)];
+  var pos = first;
+  while (pos < headerBlock.length) {
+    var end = Math.min(pos + maxFrameSize, headerBlock.length);
+    out.push(buildContinuation(streamId, headerBlock.subarray(pos, end), end >= headerBlock.length));
     pos = end;
   }
   return out;
@@ -571,6 +683,8 @@ export {
   frameHeader,
   buildData,
   buildHeaders,
+  padPayload,
+  buildPushPromiseFrames,
   buildContinuation,
   buildRstStream,
   buildSettings,
@@ -578,5 +692,7 @@ export {
   buildGoaway,
   buildWindowUpdate,
   buildPriorityUpdate,
+  buildAltsvc,
+  buildOrigin,
   buildHeaderFrames
 };

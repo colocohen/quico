@@ -29,6 +29,8 @@
 // ============================================================
 
 
+import fs from 'node:fs';
+import { Duplex } from 'node:stream';
 import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import { createEmitter } from './utils.js';
 
@@ -171,7 +173,11 @@ function parseContentLength(raw) {
   var parts = String(raw).split(',');
   var first = null;
   for (var i = 0; i < parts.length; i++) {
-    var p = parts[i].trim();
+    // OWS is SP and HTAB (RFC 9110 §5.6.3), and nothing else is taken off:
+    // trim() also took \v, \f and NBSP (0xA0, obs-text — legal in a value),
+    // so "5\xA0" was a length of 5 here and malformed to a parser that reads
+    // the grammar.
+    var p = parts[i].replace(/^[ \t]+|[ \t]+$/g, '');
     if (!/^[0-9]+$/.test(p)) throw new Error('invalid Content-Length: ' + JSON.stringify(raw));
     if (first === null) first = p;
     else if (p !== first) throw new Error('conflicting Content-Length values: ' + raw);
@@ -213,6 +219,7 @@ var STATUS_TEXT = {
   100: 'Continue', 101: 'Switching Protocols', 102: 'Processing', 103: 'Early Hints',
   200: 'OK', 201: 'Created', 202: 'Accepted', 203: 'Non-Authoritative Information',
   204: 'No Content', 205: 'Reset Content', 206: 'Partial Content', 207: 'Multi-Status',
+  208: 'Already Reported', 226: 'IM Used',
   300: 'Multiple Choices', 301: 'Moved Permanently', 302: 'Found', 303: 'See Other',
   304: 'Not Modified', 305: 'Use Proxy', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
   400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required', 403: 'Forbidden',
@@ -221,12 +228,14 @@ var STATUS_TEXT = {
   410: 'Gone', 411: 'Length Required', 412: 'Precondition Failed',
   413: 'Content Too Large', 414: 'URI Too Long', 415: 'Unsupported Media Type',
   416: 'Range Not Satisfiable', 417: 'Expectation Failed', 418: "I'm a Teapot",
-  421: 'Misdirected Request', 422: 'Unprocessable Content', 425: 'Too Early',
+  421: 'Misdirected Request', 422: 'Unprocessable Content', 423: 'Locked',
+  424: 'Failed Dependency', 425: 'Too Early',
   426: 'Upgrade Required', 428: 'Precondition Required', 429: 'Too Many Requests',
   431: 'Request Header Fields Too Large', 451: 'Unavailable For Legal Reasons',
   500: 'Internal Server Error', 501: 'Not Implemented', 502: 'Bad Gateway',
   503: 'Service Unavailable', 504: 'Gateway Timeout', 505: 'HTTP Version Not Supported',
-  507: 'Insufficient Storage', 508: 'Loop Detected', 511: 'Network Authentication Required'
+  506: 'Variant Also Negotiates', 507: 'Insufficient Storage', 508: 'Loop Detected',
+  509: 'Bandwidth Limit Exceeded', 510: 'Not Extended', 511: 'Network Authentication Required'
 };
 
 
@@ -303,6 +312,34 @@ function isConnectionSpecific(name) {
 var REQUEST_PSEUDO = { ':method': 1, ':scheme': 1, ':authority': 1, ':path': 1, ':protocol': 1 };
 var RESPONSE_PSEUDO = { ':status': 1 };
 
+// ---- Host names and authorities (RFC 3986 §3.2.2) ----
+//
+// An IPv6 literal is written in brackets in an authority — a URL, Host,
+// :authority, an Alt-Svc value — and without them everywhere a host is
+// connected to or compared: net.connect, a QUIC socket, a pool's key. node's
+// urlToHttpOptions takes them off a URL's hostname, and its client puts them
+// back on Host. Neither was done: "https://[::1]/" connected to "[::1]", which
+// no resolver knows, and a hostname of "::1" went out as "Host: ::1:8443".
+
+/** A URL's (or an authority's) host as one connects to it: no brackets. */
+function urlHostname(hostname) {
+  if (typeof hostname !== 'string') return hostname;
+  return hostname.charCodeAt(0) === 0x5b && hostname.charCodeAt(hostname.length - 1) === 0x5d
+    ? hostname.slice(1, -1) : hostname;
+}
+
+/**
+ * The authority of a request to `hostname` on `port` — for Host and
+ * :authority: an IPv6 literal in brackets, the port left out when it is the
+ * scheme's default (`defaultPort`), as every client does: including it
+ * changes the origin for virtual-host routing and for CORS.
+ */
+function formatAuthority(hostname, port, defaultPort) {
+  var h = String(hostname);
+  if (h.indexOf(':') >= 0 && h.charCodeAt(0) !== 0x5b) h = '[' + h + ']';
+  return port && Number(port) !== defaultPort ? h + ':' + port : h;
+}
+
 function isPseudoHeader(name) {
   return typeof name === 'string' && name.charCodeAt(0) === 0x3a;
 }
@@ -316,16 +353,14 @@ function isPseudoHeader(name) {
  *
  * `Host` is dropped in favour of `:authority` — sending both is permitted only
  * when they agree, and there is no reason to risk them disagreeing. The
- * default port is omitted from the authority, as every client does: including
- * it changes the origin for virtual-host routing and for CORS.
+ * authority is formatAuthority's.
  */
 function buildRequestPseudoHeaders(options) {
   var method = String(options.method || 'GET').toUpperCase();
   var scheme = options.scheme || 'https';
   var port = options.port;
   var defaultPort = scheme === 'http' ? 80 : 443;
-  var authority = options.authority ||
-    (options.hostname + (port && port !== defaultPort ? ':' + port : ''));
+  var authority = options.authority || formatAuthority(options.hostname, port, defaultPort);
 
   var list = [
     [':method', method],
@@ -547,7 +582,13 @@ function validateFieldSection(list, opts) {
       throw bad('request names no authority (:authority or host)');
     }
   }
-  if (!isServer && !trailers && !headers[':status']) throw bad('response is missing :status');
+  if (!isServer && !trailers) {
+    if (!headers[':status']) throw bad('response is missing :status');
+    // Three digits (RFC 9110 §15), as the HTTP/1.1 parser reads a status
+    // line: what was only checked for presence went to parseInt ("200abc"
+    // a 200) and to h3's /^1/ (an informational response for "1abc").
+    if (!/^[0-9]{3}$/.test(headers[':status'])) throw bad('invalid :status');
+  }
 
   Object.defineProperty(headers, '_rawHeaders', { value: raw, enumerable: false });
   return { headers: headers, pseudoOrder: pseudoOrder, protocol: protocol };
@@ -861,13 +902,697 @@ function streamResetLimiter(options) {
   };
 }
 
+// node:http2's errors for the session API, with its codes and messages.
+function argType(name, type, value) {
+  var e = new TypeError('The "' + name + '" argument must be of type ' + type + '. Received ' + (value === null ? 'null' : typeof value));
+  e.code = 'ERR_INVALID_ARG_TYPE';
+  return e;
+}
+function sessionGone() {
+  var e = new Error('The session has been destroyed');
+  e.code = 'ERR_HTTP2_INVALID_SESSION';
+  return e;
+}
+// A client stream that never got its id, its session gone (node:http2's
+// ERR_HTTP2_STREAM_CANCEL for the pending streams), with the cause if any.
+function pendingCancel(cause) {
+  var e = nodeError(Error, 'ERR_HTTP2_STREAM_CANCEL', 'The pending stream has been canceled' + (cause ? ' (caused by: ' + cause.message + ')' : ''));
+  if (cause) e.cause = cause;
+  return e;
+}
+function sessionCodeError(code) {
+  var e = new Error('Session closed with error code ' + code);
+  e.code = 'ERR_HTTP2_SESSION_ERROR';
+  return e;
+}
+
+// The fields a node:http2 stream may carry only once (node's
+// kSingleValueHeaders): the pseudo-headers and the fields RFC 9110 defines
+// as a single value. A list for one of them, or the name twice, throws.
+var HTTP2_SINGLE_VALUE = new Set([
+  ':status', ':method', ':authority', ':scheme', ':path', ':protocol',
+  'access-control-allow-credentials', 'access-control-max-age', 'access-control-request-method',
+  'age', 'authorization', 'content-encoding', 'content-language', 'content-length',
+  'content-location', 'content-md5', 'content-range', 'content-type', 'date', 'dnt', 'etag',
+  'expires', 'from', 'host', 'if-match', 'if-modified-since', 'if-none-match', 'if-range',
+  'if-unmodified-since', 'last-modified', 'location', 'max-forwards', 'proxy-authorization',
+  'range', 'referer', 'retry-after', 'tk', 'upgrade-insecure-requests', 'user-agent',
+  'x-content-type-options'
+]);
+
+/**
+ * A header block as node:http2's stream API takes it — an object, or the flat
+ * [name, value, name, value, …] array — as the [[name, value], …] list
+ * H2Connection sends, pseudo-headers first. The checks are nghttp2's
+ * (node's buildNgHeaderString), with node's codes: a pseudo-header
+ * `pseudoOk` does not allow, a name that is not a token, a connection-
+ * specific field (TE only as "trailers"), a single-value field given twice.
+ * A list value is one field line per value; an undefined one is left out.
+ */
+function http2FieldList(headers, pseudoOk) {
+  var pseudo = [], fields = [], singles = new Set();
+  function one(key, value) {
+    key = String(key).toLowerCase();
+    var single = HTTP2_SINGLE_VALUE.has(key);
+    var many = Array.isArray(value);
+    if (many) {
+      if (value.length === 0) return;
+      if (value.length === 1) { value = String(value[0]); many = false; }
+      else if (single) throw http2SingleValue(key);
+    } else {
+      value = String(value);
+    }
+    if (single) {
+      if (singles.has(key)) throw http2SingleValue(key);
+      singles.add(key);
+    }
+    if (key.charCodeAt(0) === 0x3a) {
+      if (!pseudoOk(key)) throw nodeError(TypeError, 'ERR_HTTP2_INVALID_PSEUDOHEADER', '"' + key + '" is an invalid pseudoheader or is used incorrectly');
+      pseudo.push([key, value]);
+      return;
+    }
+    if (!isToken(key)) throw nodeError(TypeError, 'ERR_INVALID_HTTP_TOKEN', 'Header name must be a valid HTTP token ["' + key + '"]');
+    if (key === 'http2-settings' || (key === 'te' ? value !== 'trailers' : isConnectionSpecific(key))) {
+      throw nodeError(TypeError, 'ERR_HTTP2_INVALID_CONNECTION_HEADERS', 'HTTP/1 Connection specific headers are forbidden: "' + key + '"');
+    }
+    if (many) for (var j = 0; j < value.length; j++) fields.push([key, String(value[j])]);
+    else fields.push([key, value]);
+  }
+  if (Array.isArray(headers)) {
+    for (var i = 0; i < headers.length; i += 2) {
+      if (headers[i + 1] === undefined || headers[i] === '') continue;
+      one(headers[i], headers[i + 1]);
+    }
+  } else {
+    for (var name of Object.keys(headers)) {
+      if (headers[name] === undefined || name === '') continue;
+      one(name, headers[name]);
+    }
+  }
+  return pseudo.concat(fields);
+}
+/**
+ * A received header block as node:http2 hands it to the application (node's
+ * toHeaderObject), from its field lines in order (a flat [name, value, …]):
+ * a null-prototype object, :status a number, set-cookie always a list, a
+ * repeated cookie joined with "; ", any other repeated field with ", " — and
+ * a single-value field that came twice keeps its first value.
+ */
+function http2HeaderObject(raw) {
+  var obj = Object.create(null);
+  for (var n = 0; n < raw.length; n += 2) {
+    var name = raw[n], value = raw[n + 1];
+    if (name === ':status') value |= 0;
+    var existing = obj[name];
+    if (existing === undefined) obj[name] = name === 'set-cookie' ? [value] : value;
+    else if (!HTTP2_SINGLE_VALUE.has(name)) {
+      if (name === 'cookie') obj[name] = existing + '; ' + value;
+      else if (name === 'set-cookie') existing.push(value);
+      else obj[name] = existing + ', ' + value;
+    }
+  }
+  return obj;
+}
+// A stream's state as node:http2's stream.state has it, for a stream with
+// no HTTP/2 state machine (HTTP/3's): nghttp2's state number — OPEN 2,
+// HALF_CLOSED_LOCAL 5, HALF_CLOSED_REMOTE 6, CLOSED 7 — from which sides
+// have ended. (Its weight and window are HTTP/2's: RFC 9218 replaces the
+// one, QUIC's flow control the other.)
+function streamStateOf(localClose, remoteClose) {
+  return {
+    state: localClose && remoteClose ? 7 : localClose ? 5 : remoteClose ? 6 : 2,
+    localClose: localClose ? 1 : 0,
+    remoteClose: remoteClose ? 1 : 0
+  };
+}
+
+// A client's request head, as node:http2's ClientHttp2Session.request()
+// builds it: [name, value] pairs, :method (GET), :scheme and :path ('/')
+// unless CONNECT, :authority (the session's), then the fields — lower-cased,
+// a list one line per value, :protocol let through (extended CONNECT), other
+// pseudo-headers and the connection-specific fields thrown on with node's
+// codes. HTTP/2's and HTTP/3's alike (h2_client, h3_client).
+function http2RequestFields(headers, scheme, authority) {
+  var list = [];
+  var method = headers[':method'] !== undefined ? String(headers[':method']).toUpperCase() : 'GET';
+  var isConnect = method === 'CONNECT';
+  if (headers[':authority'] !== undefined) authority = String(headers[':authority']);
+  list.push([':method', method]);
+  if (!isConnect) list.push([':scheme', headers[':scheme'] !== undefined ? String(headers[':scheme']) : scheme]);
+  list.push([':authority', authority]);
+  if (!isConnect) list.push([':path', headers[':path'] !== undefined ? String(headers[':path']) : '/']);
+  for (var name in headers) {
+    if (!Object.prototype.hasOwnProperty.call(headers, name)) continue;
+    var lower = String(name).toLowerCase();
+    if (lower.charCodeAt(0) === 0x3a) {
+      if (lower === ':method' || lower === ':scheme' || lower === ':authority' || lower === ':path') continue;
+      if (lower === ':protocol') { list.push([lower, String(headers[name])]); continue; }
+      throw nodeError(TypeError, 'ERR_HTTP2_INVALID_PSEUDOHEADER', '"' + lower + '" is an invalid pseudoheader or is used incorrectly');
+    }
+    var value = headers[name];
+    if (value === undefined || value === null) continue;
+    if (isConnectionSpecific(lower) && !(lower === 'te' && String(value).toLowerCase() === 'trailers')) {
+      throw nodeError(TypeError, 'ERR_HTTP2_INVALID_CONNECTION_HEADERS', 'HTTP/1 Connection specific headers are forbidden: "' + lower + '"');
+    }
+    if (Array.isArray(value)) for (var j = 0; j < value.length; j++) list.push([lower, String(value[j])]);
+    else list.push([lower, String(value)]);
+  }
+  return { list: list, method: method };
+}
+
+function http2SingleValue(key) {
+  return nodeError(TypeError, 'ERR_HTTP2_HEADER_SINGLE_VALUE', 'Header field "' + key + '" must only have a single value');
+}
+
+
+
+// node:http2's validateInt32 / getTimerDuration checks, with its codes.
+function checkInt(value, name, min, max) {
+  if (typeof value !== 'number') throw argType(name, 'number', value);
+  if (!Number.isInteger(value)) {
+    throw nodeError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
+  }
+  if (value < min || value > max) {
+    throw nodeError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be >= ' + min + ' && <= ' + max + '. Received ' + value);
+  }
+}
+
+
+// ============================================================
+//  node:http2's Http2Stream — what a server's stream and a client's share
+//
+//  The state and the operations node gives both: close(code) and rstCode,
+//  'aborted', setTimeout() and 'timeout', trailers (waitForTrailers,
+//  'wantTrailers', sendTrailers()), state, and how a stream ends — node's
+//  closeStream, onStreamClose and _destroy, whose rules are the API (which
+//  code is sent, when 'aborted' and 'error' come). What differs is how each
+//  reaches the wire, given by the subclass:
+//
+//    _sendRst(code)          RST_STREAM (the stream is still open)
+//    _sendTrailers(list)     trailers; an empty list is END_STREAM alone
+//    _streamState()          H2Connection.getStreamInfo, or null
+//    _endReads()             a clean close: end the readable side
+//    _sessionCode()          the session's GOAWAY or destroy code, or 0
+//    _release()              the stream is destroyed: let go of it
+//
+// `codes`: the version's stream codes — none, cancel, internal, the largest
+// code (max), wire(code) (a code given to close() as it goes on the wire)
+// and name(code) (for the error's message): H2_STREAM_CODES (h2.js),
+// H3_STREAM_CODES (h3_server.js).
+// ============================================================
+
+var RST_NONE = 0, RST_SUBMIT = 1, RST_FORCE = 2;
+
+function streamCodeError(code, codes) {
+  return nodeError(Error, 'ERR_HTTP2_STREAM_ERROR', 'Stream closed with error code ' + codes.name(code));
+}
+
+class StreamBase extends Duplex {
+  constructor(session, codes) {
+    super({ allowHalfOpen: true, decodeStrings: false, autoDestroy: false });
+    this._session = session;
+    this._codes = codes;
+    this._streamClosed = false;
+    this._aborted = false;
+    this._timer = null;
+    this._waitTrailers = false;    // waitForTrailers: 'wantTrailers' at the end of the body
+    this._trailersReady = false;
+    this._sentTrailers = undefined;
+    this.rstCode = undefined;
+    this.timeout = 0;
+  }
+
+  get session() { return this._session; }
+  get closed() { return this._streamClosed; }
+  get aborted() { return this._aborted; }
+  get sentTrailers() { return this._sentTrailers; }
+  get state() {
+    if (this.destroyed || this.id === undefined) return {};
+    return this._streamState() || {};
+  }
+
+  /**
+   * node's close(code = NO_ERROR, callback): RST_STREAM with the code —
+   * once a response that has ended has gone, for NO_ERROR. 'aborted' if the
+   * writable side was still open; the callback at 'close'.
+   */
+  close(code, callback) {
+    if (code === undefined) code = this._codes.none;
+    checkInt(code, 'code', 0, this._codes.max);
+    code = this._codes.wire(code);
+    if (callback !== undefined && typeof callback !== 'function') throw argType('callback', 'function', callback);
+    if (this._streamClosed) return;
+    if (callback !== undefined) this.once('close', callback);
+    this._closeStream(code, RST_SUBMIT);
+  }
+
+  // node's closeStream.
+  _closeStream(code, rst) {
+    this._streamClosed = true;
+    this.rstCode = code;
+    this.setTimeout(0);
+    this.removeAllListeners('timeout');
+    var ending = this._writableState.ending;
+    if (!ending) {
+      if (!this._aborted) { this._aborted = true; this.emit('aborted'); }
+      this.end();
+    }
+    if (rst === RST_NONE) return;
+    var self = this;
+    // Then it ends as a stream the peer closed would (the transport's own
+    // notice of the close, if it has one, says the same).
+    var reset = function () { self._sendRst(code); process.nextTick(function () { self._gone(code); }); };
+    if (!ending || this.writableFinished || code !== this._codes.none || rst === RST_FORCE) reset();
+    else this.once('finish', reset);
+  }
+
+  /**
+   * The HTTP/2 stream closed, with this code (node's onStreamClose): a reset,
+   * or the session gone (`now`), destroys it at once; a clean close ends its
+   * reads, and it is destroyed at their end.
+   */
+  _gone(code, now) {
+    if (this._goneDone) return;
+    this._goneDone = true;
+    if (!this._streamClosed) this._closeStream(code, RST_NONE);
+    if (this.destroyed) return;
+    if (now || code !== this._codes.none || !this.readable || this.readableEnded) { this.destroy(); return; }
+    var self = this;
+    this.once('end', function () { self.destroy(); });
+    this._endReads();
+    if (this.readableFlowing === null) this.resume();
+    else this.read(0);
+  }
+
+  // node's _destroy: the code is the close's, or the session's; with an
+  // error, INTERNAL_ERROR (CANCEL for an AbortError). An open stream is
+  // reset with it. A code other than NO_ERROR and CANCEL is an error.
+  _destroy(err, callback) {
+    var sessionCode = this._sessionCode();
+    var c = this._codes;
+    // A session code of 0, or NO_ERROR: the session ended cleanly (or did
+    // not end) — the stream's own codes decide.
+    if (sessionCode === c.none) sessionCode = 0;
+    var code = this._streamClosed ? this.rstCode : (sessionCode || c.none);
+    if (err != null) code = sessionCode || (err.name === 'AbortError' ? c.cancel : c.internal);
+    if (!this._streamClosed) this._closeStream(code, RST_FORCE);
+    // The reads end too ('end' before 'close' when nothing went wrong).
+    if (!this._readableState.ended) this.push(null);
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    this._release();
+    if (err == null && code !== c.none && code !== c.cancel) err = streamCodeError(code, c);
+    this._session = undefined;
+    callback(err);
+  }
+
+  // node's setTimeout(msecs[, callback]): 'timeout' after msecs with nothing
+  // sent or received on the stream.
+  setTimeout(msecs, callback) {
+    if (this.destroyed) return this;
+    this.timeout = msecs;
+    if (typeof msecs !== 'number') throw argType('msecs', 'number', msecs);
+    if (msecs < 0 || !Number.isFinite(msecs)) {
+      throw nodeError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "msecs" is out of range. It must be a non-negative finite number. Received ' + msecs);
+    }
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    if (msecs === 0) {
+      if (callback !== undefined) {
+        if (typeof callback !== 'function') throw argType('callback', 'function', callback);
+        this.removeListener('timeout', callback);
+      }
+      return this;
+    }
+    var self = this;
+    this._timer = setTimeout(function () { if (!self.destroyed) self.emit('timeout'); }, msecs);
+    if (this._timer.unref) this._timer.unref();
+    if (callback !== undefined) {
+      if (typeof callback !== 'function') throw argType('callback', 'function', callback);
+      this.once('timeout', callback);
+    }
+    return this;
+  }
+
+  // Activity on the stream: the timeout starts over.
+  _touch() { if (this._timer) this._timer.refresh(); }
+
+  /**
+   * The body has been written and waitForTrailers was asked for:
+   * 'wantTrailers', for sendTrailers(); nobody listening, the stream ends
+   * with no trailers.
+   */
+  _wantTrailers() {
+    this._trailersReady = true;
+    if (this.destroyed || this._streamClosed) return;
+    if (!this.emit('wantTrailers')) this.sendTrailers({});
+  }
+
+  sendTrailers(headers) {
+    if (this.destroyed || this._streamClosed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
+    if (this._sentTrailers) throw nodeError(Error, 'ERR_HTTP2_TRAILERS_ALREADY_SENT', 'Trailing headers have already been sent');
+    if (!this._trailersReady) throw nodeError(Error, 'ERR_HTTP2_TRAILERS_NOT_READY', 'Trailing headers cannot be sent until after the wantTrailers event is emitted');
+    if (headers !== undefined && (headers === null || typeof headers !== 'object' || Array.isArray(headers))) throw argType('headers', 'object', headers);
+    headers = Object.assign(Object.create(null), headers);
+    var list = http2FieldList(headers, function () { return false; });
+    this._touch();
+    this._sentTrailers = headers;
+    var self = this;
+    // As node's, on the next turn (not from inside 'wantTrailers').
+    setImmediate(function () { if (!self.destroyed) self._sendTrailers(list); });
+  }
+
+  // node's priority(): RFC 7540's priority signals are gone (RFC 9113 §5.3),
+  // and node's is a deprecated no-op too.
+  priority() {
+    if (this.destroyed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
+  }
+
+  _endReads() { this.push(null); }
+  _sessionCode() { return this._codes.none; }
+  _release() {}
+}
+
+
+// ============================================================
+//  ServerStream — node:http2's ServerHttp2Stream, for HTTP/2 and HTTP/3
+//
+//  The core API's view of one request's stream: a Duplex whose reads are the
+//  request body and whose writes are the response body, answered with
+//  respond(). It holds no state of the exchange itself: the head, the body
+//  and the end go through the same functions as the ServerResponse of the
+//  same request (`hooks`: h2_server's wireResponse, server.js's HTTP/3
+//  wrapping), so the two APIs can be mixed —
+//  respond() here and res.end() there — and agree on what was sent.
+// ============================================================
+
+// node's prepareResponseHeadersObject: a copy of the headers, :status a
+// number (200 when there is none), a Date unless sendDate is false.
+function prepareHeadObject(headers, options) {
+  if (headers !== undefined && (headers === null || typeof headers !== 'object' || Array.isArray(headers))) throw argType('headers', 'object', headers);
+  var prepared = Object.create(null);
+  for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) prepared[k] = headers[k];
+  prepared[':status'] = (prepared[':status'] | 0) || 200;
+  if ((options.sendDate == null || options.sendDate) && prepared.date == null) prepared.date = httpDate();
+  return prepared;
+}
+
+// respondWithFile's and respondWithFD's options, checked as node's.
+function fileOptions(options) {
+  if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw argType('options', 'object', options);
+  options = Object.assign({}, options);
+  var bad = function (name) {
+    return nodeError(TypeError, 'ERR_INVALID_ARG_VALUE', "The property 'options." + name + "' is invalid. Received " + String(options[name]));
+  };
+  if (options.offset !== undefined && typeof options.offset !== 'number') throw bad('offset');
+  if (options.length !== undefined && typeof options.length !== 'number') throw bad('length');
+  if (options.statCheck !== undefined && typeof options.statCheck !== 'function') throw bad('statCheck');
+  return options;
+}
+
+class ServerStream extends StreamBase {
+  constructor(session, id, hooks, codes) {
+    super(session, codes);
+    this._id = id;
+    this._hooks = hooks;
+    this._sent = undefined;       // sentHeaders, as respond() was given them (an object) …
+    this._sentRaw = undefined;    // … or as a flat array, made an object when asked for
+    this._info = undefined;       // sentInfoHeaders
+    this._endWaiting = false;     // end() before respond(): the head ends the stream
+  }
+
+  get id() { return this._id; }
+  // node's: no id yet. A stream the server is given always has one.
+  get pending() { return false; }
+  get headersSent() { return this._hooks.headersSent(); }
+  get endAfterHeaders() { return this._hooks.endAfterHeaders; }
+  get headRequest() { return this._hooks.isHead; }
+  get sentInfoHeaders() { return this._info; }
+
+  get sentHeaders() {
+    if (this._sent || !this._sentRaw) return this._sent;
+    var raw = this._sentRaw, o = Object.create(null);
+    for (var i = 0; i < raw.length; i += 2) {
+      var e = o[raw[i]];
+      if (e === undefined) o[raw[i]] = raw[i + 1];
+      else if (Array.isArray(e)) e.push(raw[i + 1]);
+      else o[raw[i]] = [e, raw[i + 1]];
+    }
+    return (this._sent = o);
+  }
+
+  /**
+   * node:http2's respond(headers, { endStream, waitForTrailers, sendDate }):
+   * the response's head — :status (200 when there is none), a Date unless
+   * sendDate is false. It ends the stream when asked to, and for a response
+   * that has no body (204, 205, 304, an answer to HEAD) or whose end()
+   * already came; with waitForTrailers, the end is the trailers', after
+   * 'wantTrailers'. The checks and codes are node's; a call that throws has
+   * sent nothing.
+   */
+  respond(headers, options) {
+    if (this.destroyed || this.closed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
+    if (this.headersSent) throw nodeError(Error, 'ERR_HTTP2_HEADERS_SENT', 'Response has already been initiated.');
+    if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw argType('options', 'object', options);
+    options = Object.assign({}, options);
+    this._touch();
+    var sendDate = options.sendDate == null || !!options.sendDate;
+    var status, prepared;
+    if (Array.isArray(headers)) {
+      prepared = headers.slice();
+      var dated = false;
+      for (var i = 0; i < prepared.length; i += 2) {
+        var n = String(prepared[i]).toLowerCase();
+        if (n === ':status') status = prepared[i + 1] | 0;
+        else if (n === 'date') dated = true;
+      }
+      if (!status) { status = 200; prepared.unshift(':status', status); }
+      if (!dated && sendDate) prepared.push('date', httpDate());
+    } else {
+      prepared = prepareHeadObject(headers, options);
+      status = prepared[':status'];
+    }
+    if (status < 200 || status > 599) throw nodeError(RangeError, 'ERR_HTTP2_STATUS_INVALID', 'Invalid status code: ' + status);
+    var list = http2FieldList(prepared, function (name) { return name === ':status'; });
+
+    var end = !!options.endStream || status === 204 || status === 205 || status === 304 ||
+              this._hooks.isHead || this._endWaiting;
+    if (options.waitForTrailers) this._waitTrailers = true;
+    if (Array.isArray(headers)) this._sentRaw = prepared; else this._sent = prepared;
+    try { this._hooks.respond(list, status, end && !this._waitTrailers); }
+    catch (e) { this.destroy(e); return; }
+    // The writable side closes with a head that ended the stream.
+    if (end && !this.writableEnded) this.end();
+    // end() came first: the body is over, the trailers are wanted now.
+    else if (this._endWaiting && this._waitTrailers) this._wantTrailers();
+  }
+
+  /**
+   * node:http2's additionalHeaders(headers): a 1xx head (103 Early Hints,
+   * say) before the response, the stream left open.
+   */
+  additionalHeaders(headers) {
+    if (this.destroyed || this.closed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
+    if (this.headersSent) throw nodeError(Error, 'ERR_HTTP2_HEADERS_AFTER_RESPOND', 'Cannot specify additional headers after response initiated');
+    if (headers !== undefined && (headers === null || typeof headers !== 'object' || Array.isArray(headers))) throw argType('headers', 'object', headers);
+    headers = Object.assign(Object.create(null), headers);
+    if (headers[':status'] != null) {
+      var code = headers[':status'] |= 0;
+      if (code === 101) throw nodeError(Error, 'ERR_HTTP2_STATUS_101', 'HTTP status code 101 (Switching Protocols) is forbidden in HTTP/2');
+      if (code < 100 || code >= 200) throw nodeError(RangeError, 'ERR_HTTP2_INVALID_INFO_STATUS', 'Invalid informational status code: ' + code);
+    }
+    this._touch();
+    var list = http2FieldList(headers, function (name) { return name === ':status'; });
+    (this._info || (this._info = [])).push(headers);
+    try { this._hooks.info(list); } catch (e) { this.destroy(e); }
+  }
+
+  /**
+   * node:http2's respondWithFile(path[, headers[, options]]): the response
+   * is a file — opened, checked (a regular file; a directory is
+   * ERR_HTTP2_SEND_FILE), statCheck(stat, headers) given its say, then its
+   * bytes from `offset` for `length` (the rest of it, by default) with a
+   * content-length. A failure goes to options.onError when there is one;
+   * otherwise it destroys the stream. The file is closed at the end.
+   */
+  respondWithFile(path, headers, options) {
+    if (this.destroyed || this.closed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
+    if (this.headersSent) throw nodeError(Error, 'ERR_HTTP2_HEADERS_SENT', 'Response has already been initiated.');
+    options = fileOptions(options);
+    if (options.waitForTrailers) this._waitTrailers = true;
+    this._touch();
+    var prepared = this._fileHead(headers, options);
+    var self = this, onError = options.onError;
+    var fail = function (err, fd) {
+      if (fd !== undefined) fs.close(fd, function () {});
+      if (onError) onError(err); else self.destroy(err);
+    };
+    fs.open(path, 'r', function (err, fd) {
+      if (err) { fail(err); return; }
+      if (self.destroyed || self.closed) { fs.close(fd, function () {}); return; }
+      fs.fstat(fd, function (err2, stat) {
+        if (err2) { fail(err2, fd); return; }
+        if (!stat.isFile()) {
+          var dir = stat.isDirectory();
+          if (options.offset !== undefined || options.length !== undefined || dir) {
+            fail(dir ? nodeError(Error, 'ERR_HTTP2_SEND_FILE', 'Directories cannot be sent')
+                     : nodeError(Error, 'ERR_HTTP2_SEND_FILE_NOSEEK', 'Offset or length can only be specified for regular files'), fd);
+            return;
+          }
+          options.offset = -1;   // a pipe, a device: read as it comes
+          options.length = -1;
+        }
+        if (self.destroyed || self.closed) {
+          fs.close(fd, function () {});
+          self.destroy(nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed'));
+          return;
+        }
+        var offset = options.offset !== undefined ? options.offset : 0;
+        var length = options.length !== undefined ? options.length : -1;
+        // statCheck may change the headers, answer otherwise, or cancel (false).
+        if ((typeof options.statCheck === 'function' && options.statCheck.call(self, stat, prepared) === false) || self.headersSent) {
+          fs.close(fd, function () {});
+          return;
+        }
+        if (stat.isFile()) {
+          length = length < 0 ? stat.size - offset : Math.min(stat.size - offset, length);
+          prepared['content-length'] = length;
+        }
+        self._sendFile(fd, prepared, offset | 0, length | 0, true);
+      });
+    });
+  }
+
+  /**
+   * node:http2's respondWithFD(fd[, headers[, options]]): the response is
+   * what is read from an open file descriptor (or FileHandle), from `offset`
+   * for `length`. It is not closed here — it is the caller's. With a
+   * statCheck, it is fstat()ed first, and statCheck(stat, headers,
+   * { offset, length }) may change them or cancel (false).
+   */
+  respondWithFD(fd, headers, options) {
+    if (this.destroyed || this.closed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
+    if (this.headersSent) throw nodeError(Error, 'ERR_HTTP2_HEADERS_SENT', 'Response has already been initiated.');
+    options = fileOptions(options);
+    if (options.waitForTrailers) this._waitTrailers = true;
+    if (fd !== null && typeof fd === 'object' && typeof fd.fd === 'number' && typeof fd.close === 'function') fd = fd.fd;   // a FileHandle
+    else if (typeof fd !== 'number') {
+      throw nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "fd" argument must be of type number or an instance of FileHandle. Received ' + typeof fd);
+    }
+    this._touch();
+    var prepared = this._fileHead(headers, options);
+    var self = this;
+    if (options.statCheck === undefined) {
+      this._sendFile(fd, prepared, options.offset !== undefined ? options.offset : 0, options.length !== undefined ? options.length : -1, false);
+      return;
+    }
+    fs.fstat(fd, function (err, stat) {
+      if (err) { self.destroy(err); return; }
+      if (self.destroyed || self.closed) { self.destroy(nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed')); return; }
+      var so = { offset: options.offset !== undefined ? options.offset : 0, length: options.length !== undefined ? options.length : -1 };
+      if (options.statCheck.call(self, stat, prepared, so) === false || self.headersSent) return;
+      self._sendFile(fd, prepared, so.offset | 0, so.length | 0, false);
+    });
+  }
+
+  // The head of a file response, as respond()'s; a status that has no body
+  // (or an answer to HEAD) cannot carry one.
+  _fileHead(headers, options) {
+    var prepared = prepareHeadObject(headers, options);
+    var status = prepared[':status'];
+    if (status === 204 || status === 205 || status === 304 || this._hooks.isHead) {
+      throw nodeError(Error, 'ERR_HTTP2_PAYLOAD_FORBIDDEN', 'Responses with ' + status + ' status must not have a payload');
+    }
+    return prepared;
+  }
+
+  /**
+   * The head, then the file's bytes: read a chunk at a time, each read only
+   * once the one before has been taken (the send window and the socket hold
+   * them back), from `offset` (-1: from where the descriptor is) for
+   * `length` bytes (-1: to its end). The writable side is closed: the body
+   * is the file's. A read that fails resets the stream, INTERNAL_ERROR.
+   */
+  _sendFile(fd, prepared, offset, length, owns) {
+    var list;
+    try { list = http2FieldList(prepared, function (name) { return name === ':status'; }); }
+    catch (err) { if (owns) fs.close(fd, function () {}); this.destroy(err); return; }
+    this._sent = prepared;
+    this._fileBody = true;
+    this.end();
+    var status = prepared[':status'];
+    try { this._hooks.respond(list, status, false); }
+    catch (err) { if (owns) fs.close(fd, function () {}); this.destroy(err); return; }
+    var self = this;
+    var position = offset < 0 ? null : offset;
+    var remaining = length < 0 ? Infinity : length;
+    var done = function () { if (owns) fs.close(fd, function () {}); };
+    (function next() {
+      if (self.destroyed || self.closed) { done(); return; }
+      var n = Math.min(65536, remaining);
+      if (n <= 0) { done(); self._fileEnd(); return; }
+      fs.read(fd, Buffer.allocUnsafe(n), 0, n, position, function (err, bytes, buf) {
+        if (self.destroyed || self.closed) { done(); return; }
+        if (err) { done(); self.close(self._codes.internal); return; }
+        if (bytes === 0) { done(); self._fileEnd(); return; }
+        if (position !== null) position += bytes;
+        remaining -= bytes;
+        self._touch();
+        self._hooks.body(bytes === buf.length ? buf : buf.subarray(0, bytes), null, next);
+      });
+    })();
+  }
+
+  _fileEnd() {
+    if (this._waitTrailers) this._wantTrailers();
+    else this._hooks.end();
+  }
+
+  // node's: whether the client takes pushed streams. quico does not push
+  // (RFC 9113 §8.4 makes it optional, and browsers have dropped it).
+  get pushAllowed() { return false; }
+
+  pushStream() {
+    throw nodeError(Error, 'ERR_HTTP2_PUSH_DISABLED', 'HTTP/2 client has disabled push streams');
+  }
+
+  _read() { this._hooks.read(); }
+
+  // A write before respond() sends the default head first, as node's does.
+  _write(chunk, encoding, callback) {
+    if (this.closed) { callback(); return; }
+    if (!this.headersSent) {
+      try { this.respond(); } catch (e) { callback(e); return; }
+    }
+    this._touch();
+    this._hooks.body(chunk, encoding, callback);
+  }
+
+  // end() before respond() sends nothing: the head, when it comes, ends the
+  // stream (node's order — a stream may be ended and answered later).
+  _final(callback) {
+    if (this.closed || this._fileBody) { callback(); return; }
+    if (!this.headersSent) this._endWaiting = true;
+    else if (this._waitTrailers) this._wantTrailers();
+    else this._hooks.end();
+    callback();
+  }
+
+  _sendRst(code) { this._hooks.reset(code); }
+  _sendTrailers(list) { this._hooks.trailers(list); }
+  _streamState() { return this._hooks.state(); }
+  _endReads() { this._hooks.endReads(); }
+}
+
+
 export {
+  argType, sessionGone, sessionCodeError, pendingCancel,
   streamResetLimiter,
   runEarlyDataFilter,
   httpDate,
   maxRequestsPerSocket,
   validateFieldSection,
   isValidAuthority,
+  urlHostname,
+  formatAuthority,
   validateHeaderName,
   validateHeaderValue,
   validateStatus,
@@ -897,6 +1622,14 @@ export {
   STATUS_TEXT,
   CONNECTION_SPECIFIC,
   isConnectionSpecific,
+  http2FieldList,
+  checkInt,
+  http2RequestFields,
+  streamStateOf,
+  StreamBase,
+  ServerStream,
+  http2HeaderObject,
+  nodeError,
   trailerFields,
   TRAILER_FORBIDDEN,
   REQUEST_PSEUDO,

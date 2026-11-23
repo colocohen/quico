@@ -23,9 +23,9 @@ import { createTcpListener } from './tcp_listener.js';
 import { createSecureContext } from './tls_bridge.js';
 import { IncomingMessage, ServerResponse, _makeSocketStub, adoptApp } from './streams.js';
 import { creditAsRead, randomBuffer } from './utils.js';
-import { runEarlyDataFilter } from './http_common.js';
+import { runEarlyDataFilter, STATUS_TEXT, ServerStream, http2HeaderObject, streamStateOf } from './http_common.js';
+import { H3_STREAM_CODES } from './h3.js';
 import { serverTlsOptions, pickTlsOptions, withPfx } from './tls_options.js';
-import { STATUS_CODES } from 'node:http';
 import { ServerStats } from './server_stats.js';
 import { createConnectUdp, isConnectUdp, datagramCapsule, STREAM_QUEUE_MAX } from './connect_udp.js';
 
@@ -326,7 +326,7 @@ function createServer(options, handler) {
       },
       function (status, h) {
         try {
-          socket.end('HTTP/1.1 ' + status + ' ' + (STATUS_CODES[status] || 'Error') + '\r\nConnection: close\r\nContent-Length: 0\r\n' + fieldLines(h) + '\r\n');
+          socket.end('HTTP/1.1 ' + status + ' ' + (STATUS_TEXT[status] || 'Error') + '\r\nConnection: close\r\nContent-Length: 0\r\n' + fieldLines(h) + '\r\n');
         } catch (e) {}
       });
   }
@@ -493,7 +493,19 @@ function createServer(options, handler) {
       // wait for.
       req.on('close', function () { plainReq._releaseBody(); });
     }
+    // Into req — and, once node:http2's stream API has the request's stream
+    // (`core`, below), into it, req then reading from it: as over HTTP/2
+    // (h2_server's wireResponse), so a 'stream' listener that reads the body,
+    // or only listens to it, takes nothing from a handler that reads req.
+    var core = null, coreReceived = null;
     plainReq.on('data', function (chunk) {
+      if (core) {
+        if (core.destroyed) { if (holdsBody) plainReq._releaseBody(); return; }
+        if (coreReceived) coreReceived(chunk.length);
+        core._touch();
+        core.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        return;
+      }
       // Nobody will read it: let it go, credit and all.
       if (req.destroyed) { if (holdsBody) plainReq._releaseBody(); return; }
       if (received) received(chunk.length);
@@ -506,11 +518,15 @@ function createServer(options, handler) {
         req.rawTrailers = [];
         for (var tn in plainReq.trailers) req.rawTrailers.push(tn, String(plainReq.trailers[tn]));
       }
-      req._endData();
+      if (!core) { req._endData(); return; }
+      req.complete = true;
+      core.push(null);
     });
     // Once the response is complete: is the rest of the body still wanted?
     // As node:http2 decides it — if the application has started reading it.
-    plainReq._wantsRest = function () { return !req.destroyed && req.readableFlowing !== null; };
+    plainReq._wantsRest = function () {
+      return (!req.destroyed && req.readableFlowing !== null) || !!(core && !core.destroyed && core.readableFlowing !== null);
+    };
 
     // ---- Wrap plain res into ServerResponse (Writable) ----
     // ServerResponse._write → plainRes.write
@@ -547,13 +563,13 @@ function createServer(options, handler) {
     plainRes._wrapper = res;
 
     // Override internal methods to delegate to the plain H3 res.
-    // One chunk is held back so that _final can send the last data and the
-    // FIN together via plainRes.end(chunk): res.end('ok') is one packet, not
-    // the data and then a FIN-only packet. (A FIN-only packet is recovered
-    // like any other when lost — see fin_pns in quic_connection — so this is
-    // about packets, not correctness.) Backpressure therefore bounds what is
-    // held at the high-water mark plus that one chunk.
-    var _pendingChunk = null;
+    // Each chunk is written as it comes. One used to be held back, for _final
+    // to send with the FIN — and nothing sent it before the next write or the
+    // end, so a streamed response (an event stream, a long poll) reached the
+    // client a message late, the last one only at the end. Holding it bought
+    // nothing: quic_connection gathers a tick's writes into one send pass
+    // (scheduleSend, a microtask), and _final runs before it (nextTick), so
+    // res.end('ok') still leaves as one packet, the data and the FIN together.
 
     res._flushHeaders = function () {
       if (res.headersSent) return;
@@ -565,11 +581,7 @@ function createServer(options, handler) {
       if (!res.headersSent) res._flushHeaders();
       if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
 
-      // Flush the previous chunk (not the current one — hold it for _final)
-      if (_pendingChunk !== null) {
-        plainRes.write(_pendingChunk);
-      }
-      _pendingChunk = chunk;
+      plainRes.write(chunk);
       // Done with this write once the stream has caught up to within the
       // high-water mark — not at once. Calling back at once told Writable
       // nothing was ever buffered, so write() never returned false and a
@@ -582,11 +594,7 @@ function createServer(options, handler) {
       // res.addTrailers(): a HEADERS frame after the body, which carries the
       // FIN instead (gRPC's grpc-status rides there).
       var trailers = res.trailers && Object.keys(res.trailers).length ? res.trailers : null;
-      if (_pendingChunk !== null) {
-        plainRes.end(_pendingChunk, trailers);   // data + FIN together
-      } else {
-        plainRes.end(null, trailers);            // FIN only (no body written)
-      }
+      plainRes.end(null, trailers);   // the FIN (with the trailers, if any)
       callback();
     };
 
@@ -612,8 +620,106 @@ function createServer(options, handler) {
       Object.defineProperty(res, 'datagrams', { enumerable: true, get: function () { return plainRes.datagrams; } });
     }
 
+    // ---- node:http2's stream API over HTTP/3 (http_common's ServerStream) ----
+    //
+    // The same as HTTP/2's, made the same way — only when asked for (a
+    // 'stream' listener, req.stream / res.stream) — and on the same plain
+    // response as `res`: one head, one body, one end, whichever API sends
+    // them. The codes are HTTP/3's (h3.js's H3_STREAM_CODES).
+    var reqReading = false, reqViewing = false, closedCode;
+    var viewStream = function () {
+      reqViewing = true;
+      if (core.readableEnded) { if (!req.readableEnded) req.push(null); return; }
+      core.on('data', function (chunk) { if (!req.push(chunk)) core.pause(); });
+      core.on('end', function () { if (!req.readableEnded) req.push(null); });
+    };
+    var plainRead = req._read;
+    req._read = function (n) {
+      reqReading = true;
+      if (!core) return plainRead.call(this, n);
+      if (!reqViewing) viewStream();
+      else process.nextTick(function () { if (!core.destroyed) core.resume(); });
+    };
+    var fieldsObject = function (list) {
+      var o = {};
+      for (var i = 0; i < list.length; i++) {
+        var n = list[i][0], v = list[i][1];
+        if (o[n] === undefined) o[n] = v;
+        else if (Array.isArray(o[n])) o[n].push(v);
+        else o[n] = [o[n], v];
+      }
+      return o;
+    };
+    var hooks = {
+      isHead: req.method === 'HEAD',
+      get endAfterHeaders() { return !!plainReq._endAfterHeaders; },
+      headersSent: function () { return !!plainRes.headersSent; },
+      respond: function (list, status, endStream) {
+        plainRes._sendHead(fieldsObject(list), status);
+        res.headersSent = true;
+        if (endStream) plainRes.end(null, null);
+      },
+      body: function (chunk, encoding, callback) {
+        if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
+        plainRes.write(chunk);
+        plainRes.whenSent(res.writableHighWaterMark, callback);
+      },
+      end: function () { plainRes.end(null, null); },
+      trailers: function (list) { plainRes.end(null, list.length ? fieldsObject(list) : null); },
+      info: function (list) { plainRes._sendInfo(fieldsObject(list)); },
+      // HTTP/3 has no stream state of node:http2's kind: which ends are done.
+      state: function () {
+        if (closedCode !== undefined) return null;
+        return streamStateOf(!!plainRes._finished, !!plainReq._ended);
+      },
+      read: function () {},
+      endReads: function () {
+        if (!core._readableState.ended) core.push(null);
+        if (!reqViewing) viewStream();
+      },
+      reset: function (code) { if (closedCode === undefined) plainRes._reset(code); }
+    };
+    var getStream = function () {
+      if (!core) {
+        core = new ServerStream(plainReq.session, plainReq.stream_id, hooks, H3_STREAM_CODES);
+        // As node's compat layer does: its errors are not the request's.
+        core.on('error', function () {});
+        if (holdsBody) coreReceived = creditAsRead(core, function (n) { plainReq._creditBody(n); });
+        if (req.complete) core.push(null);
+        if (reqReading) viewStream();
+        if (closedCode !== undefined) core._gone(closedCode, true);
+      }
+      return core;
+    };
+    Object.defineProperty(req, 'stream', { get: getStream, configurable: true });
+    Object.defineProperty(res, 'stream', { get: getStream, configurable: true });
+    plainReq._onClose = function (code, now) {
+      if (closedCode !== undefined) return;
+      closedCode = code;
+      if (core) process.nextTick(function () { core._gone(code, now); });
+    };
+    plainReq._onTrailers = function (trailers) {
+      if (!core) return;
+      core._touch();
+      core.emit('trailers', http2HeaderObject(trailers._rawHeaders || []), 5);
+    };
+
     if (typeof handler === 'function') handler(req, res);
     ev.emit('request', req, res);
+
+    // node:http2's 'stream' (stream, headers, flags, rawHeaders): after
+    // 'request', on this server and then on the session, as over HTTP/2.
+    // Not for a WebTransport session's CONNECT, which is no request.
+    var session = plainReq.session;
+    if (!plainReq.headers[':protocol'] &&
+        (ev.listenerCount('stream') > 0 || (session && session.listenerCount('stream') > 0))) {
+      var stream = getStream();
+      var raw = (plainReq.headers && plainReq.headers._rawHeaders) || [];
+      var obj = http2HeaderObject(raw);
+      var flags = 4 | (plainReq._endAfterHeaders ? 1 : 0);
+      ev.emit('stream', stream, obj, flags, raw.slice());
+      if (session) session.emit('stream', stream, obj, flags, raw.slice());
+    }
   });
 
 
@@ -623,6 +729,7 @@ function createServer(options, handler) {
   // Three transports, one event, one WebSocketServer.
   h3srv.on('upgrade', function (req, stream, head) { ev.emit('upgrade', req, stream, head); });
   h3srv.on('stream_open', function (conn, id) { ev.emit('stream_open', conn, id); });
+  h3srv.on('session', function (session) { ev.emit('session', session); });
   h3srv.on('stream_reset', function (conn, id, code) { ev.emit('stream_reset', conn, id, code); });
 
   // A new QUIC connection, before its handshake. On a server that runs all
@@ -747,6 +854,9 @@ function createServer(options, handler) {
   function runHandler(req, res) {
     if (typeof handler === 'function') handler(req, res);
     ev.emit('request', req, res);
+    // node:http2's 'stream' (an HTTP/2 request's core-API stream), after
+    // 'request' as node orders them — and past the same gates.
+    if (req._announceStream) req._announceStream(ev);
   }
 
   // A request read from TLS early data (HTTP/2, HTTP/1.1; HTTP/3's is
@@ -784,6 +894,10 @@ function createServer(options, handler) {
       streamResetBurst: options.streamResetBurst, streamResetRate: options.streamResetRate,
       maxHeadSize: options.maxHeadSize || options.maxHeaderSize,
       maxHeaderCount: options.maxHeaderCount,
+      // node:http's: an HTTP/1.1 request without Host is answered 400 (false: served).
+      requireHostHeader: options.requireHostHeader,
+      // node:http's lenient HTTP/1.1 parser (h1.js's H1Parser).
+      insecureHTTPParser: options.insecureHTTPParser,
       // These were being dropped: an application could set them and nothing
       // downstream ever saw them, which is worse than not offering the option
       // at all — it looks configured and is not.
@@ -794,6 +908,20 @@ function createServer(options, handler) {
       maxFrameSize: options.maxFrameSize,
       headerTableSize: options.headerTableSize,
       enableConnectProtocol: options.enableConnectProtocol,
+      maxSettings: options.maxSettings,
+      maxSessionInvalidFrames: options.maxSessionInvalidFrames,
+      maxSendHeaderBlockLength: options.maxSendHeaderBlockLength,
+      paddingStrategy: options.paddingStrategy,
+      // node:http2's session options: the initial SETTINGS by its names, the
+      // custom ones to read from the client, the origins to announce
+      // (ORIGIN), and the bounds on unanswered PINGs and SETTINGS.
+      settings: options.settings,
+      remoteCustomSettings: options.remoteCustomSettings,
+      origins: options.origins,
+      maxOutstandingPings: options.maxOutstandingPings,
+      maxOutstandingSettings: options.maxOutstandingSettings,
+      // node:http2's 'stream' event is this server's: runHandler emits it.
+      announcesStream: true,
       stats: stats
     };
 
@@ -829,6 +957,7 @@ function createServer(options, handler) {
       h2srv = createH2Server(shared, onRequest);
       h2srv.on('clientError', function (err, sock) { ev.emit('clientError', err, sock); });
       h2srv.on('sessionError', function (err, session) { ev.emit('sessionError', err, session); });
+      h2srv.on('session', function (session) { ev.emit('session', session); });
       // Extended CONNECT (RFC 8441) arrives on the same 'upgrade' event as an
       // HTTP/1.1 Upgrade, so a WebSocketServer attached to this server serves
       // both without knowing which carried the connection.

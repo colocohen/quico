@@ -376,12 +376,25 @@ function remove_header_protection(array, pnOffset, hpKey, isShort, aead) {
 //  Packet number encoding
 // ============================================================
 
+// RFC 9000 Appendix A.3: the packet number closest to the next expected one
+// whose low pnLen bytes are `truncated` — but never below 0 nor at 2^62 or
+// above. The closest alone (one formula, as it was) went negative for a
+// number more than half a window above the expected one: with nothing
+// received yet (largestReceived -1) a first packet numbered 129..255 in one
+// byte, or the first after 128 lost in a row, came out as -127..-1 — the
+// wrong nonce, the packet dropped, and those after it until the numbers
+// took two bytes.
+// (Math.pow, not <<: 1 << 32 === 1 in JavaScript.)
+var PN_MAX = Math.pow(2, 62);
 function expandPacketNumber(truncated, pnLen, largestReceived) {
-  // Use Math.pow instead of << to avoid JavaScript 32-bit overflow (1 << 32 === 1)
   var pnWin = Math.pow(2, pnLen * 8);
   var pnHalf = pnWin / 2;
   var expected = largestReceived + 1;
-  return truncated + pnWin * Math.floor((expected - truncated + pnHalf) / pnWin);
+  // expected with its low pnLen bytes replaced by truncated
+  var candidate = Math.floor(expected / pnWin) * pnWin + truncated;
+  if (candidate <= expected - pnHalf && candidate < PN_MAX - pnWin) return candidate + pnWin;
+  if (candidate > expected + pnHalf && candidate >= pnWin) return candidate - pnWin;
+  return candidate;
 }
 
 // The packet number's length on the wire: the fewest bytes that hold it.

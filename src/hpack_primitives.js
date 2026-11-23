@@ -329,11 +329,13 @@ function encodePrefixedInt(value, prefixBits) {
  * `bytes` is a Uint8Array for the same reason huffDecode returns one: the text
  * codec is the caller's decision.
  */
-function decodeStringLiteral(buf, prefixBits, pos, strict) {
+function decodeStringLiteral(buf, prefixBits, pos, strict, maxLength) {
   if (pos >= buf.length) return null;
   var huffman = (buf[pos] & (1 << prefixBits)) !== 0;
   var len = readPrefixedInt(buf, prefixBits, pos);
   if (!len) return null;
+  // Longer, as encoded, than the caller takes: { tooLong }, nothing decoded.
+  if (maxLength !== undefined && len.value > maxLength) return { tooLong: true };
   pos = len.next;
   if (pos + len.value > buf.length) return null;   // truncated payload
   var raw = buf.subarray(pos, pos + len.value);
@@ -350,7 +352,8 @@ function decodeStringLiteral(buf, prefixBits, pos, strict) {
  * Encode a string literal. Returns a plain Array of bytes whose byte 0 already
  * carries the H bit; the caller ORs in the opcode bits above it.
  *
- * `input` may be a Uint8Array (used as-is) or a string (UTF-8 encoded).
+ * `input` may be a Uint8Array (used as-is) or a string — field text, one
+ * octet per character (fieldBytes, below).
  *
  * useHuffman:
  *   undefined  — Huffman only when it actually shrinks the string. This is what
@@ -360,7 +363,7 @@ function decodeStringLiteral(buf, prefixBits, pos, strict) {
  *                that way keeps the bytes on the wire unchanged.
  */
 function encodeStringLiteral(input, prefixBits, useHuffman) {
-  var raw = (typeof input === 'string') ? _utf8(input) : input;
+  var raw = (typeof input === 'string') ? fieldBytes(input) : input;
   var body = raw;
   var huffman = false;
 
@@ -487,15 +490,26 @@ function buildStaticLookup(table, offset) {
 
 
 // ============================================================
-//  Text helpers
+//  Field text — the one codec between a field's octets and its string
 //
-//  Offered, not imposed — see the note on huffDecode. TextDecoder('utf-8')
-//  replaces any non-UTF-8 byte with U+FFFD and loses it; latin-1 is a lossless
-//  byte↔char mapping, which is also how node:http surfaces header values. A new
-//  decoder should prefer bytesToLatin1; QPACK below stays on UTF-8 because that
-//  is what it has always done and this refactor is not the place to change it.
+//  A field name or value is octets on the wire (RFC 9110 §5.5: obs-text,
+//  0x80-0xFF, is allowed in a value), and node:http and node:http2 hand them
+//  to the application as latin-1: one character per octet, both ways —
+//  validateHeaderValue (http_common) refuses a character past 0xFF from the
+//  application, as node does, and one that gets through regardless goes out
+//  as its low byte, as node:http2 sends it. HTTP/1.1 here (h1.js), HPACK and
+//  QPACK all use this pair, so a field reads the same on every version and
+//  comes back the octets it went out as.
+//
+//  QPACK used TextDecoder (UTF-8) one way and TextEncoder the other, and the
+//  HPACK encoder TextEncoder against a latin-1 decoder: a value with an
+//  octet past 0x7F changed on the way — 'é' sent as two octets, read back by
+//  node as 'Ã©'; an octet that is not UTF-8 read as U+FFFD, lost. And the
+//  dynamic tables were sized from that changed text (entrySize, below), so
+//  they drifted from the peer's: see there.
 // ============================================================
 
+/** A field's octets as text: one character per octet. */
 function bytesToLatin1(bytes) {
   var s = '';
   // Chunked to stay clear of the argument-count limit on very long values.
@@ -504,9 +518,11 @@ function bytesToLatin1(bytes) {
   }
   return s;
 }
+var fieldText = bytesToLatin1;
 
-function _utf8(str) {
-  return new TextEncoder().encode(str);
+/** Field text as its octets: each character's low byte. */
+function fieldBytes(str) {
+  return new Uint8Array(Buffer.from(str, 'latin1'));
 }
 
 
@@ -519,14 +535,21 @@ function _utf8(str) {
 //  AGREE ON IT — a table sized any other way drifts apart from the peer's and
 //  every index after the first eviction resolves to the wrong field.
 //
-//  In bytes, not characters. Sizing by string length overflows the table on
-//  any non-ASCII header value, and does so silently.
+//  In the field's octets, as on the wire — which for field text (above) is
+//  its length, one octet per character. This measured the UTF-8 of the
+//  decoded text instead: an octet past 0x7F counted two (HPACK, read as
+//  latin-1) or three (QPACK, read as UTF-8: U+FFFD for one that is not), so
+//  a peer's entry of 4000 such octets — 4033 bytes, which fits the default
+//  4096 table — was 8033 here: the table emptied instead of storing it, and
+//  the peer's next reference to it ('index 62') a COMPRESSION_ERROR that
+//  closed the connection. Short of that, entries were evicted before the
+//  peer's, and from then on indices named the wrong fields.
 // ============================================================
 
 var ENTRY_OVERHEAD = 32;
 
 function entrySize(name, value) {
-  return Buffer.byteLength(name, 'utf8') + Buffer.byteLength(value, 'utf8') + ENTRY_OVERHEAD;
+  return name.length + value.length + ENTRY_OVERHEAD;
 }
 
 
@@ -554,6 +577,8 @@ export {
   QPACK_STATIC,
   buildStaticLookup,
 
-  // Text
-  bytesToLatin1
+  // Field text
+  bytesToLatin1,
+  fieldText,
+  fieldBytes
 };

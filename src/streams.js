@@ -387,7 +387,19 @@ class ServerResponse extends Writable {
   // ---- writeHead ----
 
   writeHead(statusCode, statusMessage, headers) {
-    if (this.headersSent) return this;
+    // A second head is an error, as node's: node:http's ERR_HTTP_HEADERS_SENT
+    // (HTTP/1.1, and HTTP/3, which node has no API of its own for);
+    // node:http2's ERR_HTTP2_HEADERS_SENT, and nothing once the stream was
+    // reset. It returned quietly: a handler that answered twice never knew
+    // its second status and headers went nowhere.
+    if (this.headersSent) {
+      var v = this.req && this.req.httpVersion;
+      if (v !== '2.0') throw headersSentError('write', v);
+      if (this._aborted) return this;
+      var e = new Error('Response has already been initiated.');
+      e.code = 'ERR_HTTP2_HEADERS_SENT';
+      throw e;
+    }
 
     if (typeof statusMessage === 'object' && !headers) {
       headers = statusMessage;

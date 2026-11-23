@@ -15,6 +15,7 @@
 import { EventEmitter } from 'node:events';
 import { sha256_create } from 'cryptographic-primitives/sha2.js';
 import lemonTls from 'lemon-tls';
+import { urlHostname } from './http_common.js';
 
 
 // ============================================================
@@ -243,7 +244,7 @@ class Agent extends EventEmitter {
       var authority = match[1];
       var colonIdx = authority.lastIndexOf(':');
       if (colonIdx < 0) continue;
-      var altHost = authority.substring(0, colonIdx);
+      var altHost = urlHostname(authority.substring(0, colonIdx));   // "[2001:db8::1]:443": the host without brackets
       var altPort = parseInt(authority.substring(colonIdx + 1), 10);
       if (!(altPort > 0 && altPort < 65536)) continue;
       if (altHost && altHost.toLowerCase() !== String(host).toLowerCase()) continue;

@@ -15,7 +15,7 @@
 import { EventEmitter } from 'node:events';
 
 import { H1Parser, buildResponseHead, encodeChunk, encodeLastChunk } from './h1.js';
-import { corkForTick, STATUS_TEXT, runRequestHandler, DEFAULT_HEADERS_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, maxRequestsPerSocket, trailerFields, statusHasNoBody, httpDate } from './http_common.js';
+import { corkForTick, STATUS_TEXT, validateStatus, runRequestHandler, DEFAULT_HEADERS_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, maxRequestsPerSocket, trailerFields, statusHasNoBody, httpDate } from './http_common.js';
 import { IncomingMessage, ServerResponse } from './streams.js';
 import { createTcpListener } from './tcp_listener.js';
 
@@ -103,6 +103,8 @@ function createServer(options, handler) {
       isServer: true,
       maxHeadSize: maxHeadSize,
       maxHeaderCount: maxHeaderCount,
+      requireHostHeader: options.requireHostHeader,
+      insecureHTTPParser: options.insecureHTTPParser === true,
       // The request as the callback sees it: method, url, headers — what
       // node:http's IncomingMessage carries at that point.
       shouldUpgrade: function (info) {
@@ -114,6 +116,10 @@ function createServer(options, handler) {
     });
 
     var current = null;        // { req, res, info }
+    // A request whose response went before its body had all arrived (a 413,
+    // an early 202): the rest of the body still reaches it, as on node:http.
+    var draining = null;
+    var halfClosed = false;    // we ended the socket: no next request on it
     var served = 0;            // requests seen on this connection (maxRequestsPerSocket)
     var destroyed = false;
     var timer = null;
@@ -143,6 +149,7 @@ function createServer(options, handler) {
       clearTimer();
       connections.delete(socket);
       if (current && current.req && !current.req.complete) current.req._abort(err || null);
+      if (draining && !draining.complete) draining._abort(err || null);
       if (current && current.res) current.res._abortResponse();   // see ServerResponse
       try { socket.destroy(); } catch (e) {}
     }
@@ -215,7 +222,9 @@ function createServer(options, handler) {
     // ---- Parser events ----
 
     parser.on('error', function (err) {
-      ev.emit('clientError', err, socket);
+      // An HTTP/1.1 request without Host (`quiet`): answered 400 and closed,
+      // with no 'clientError', as node:http does (its requireHostHeader).
+      if (!err.quiet) ev.emit('clientError', err, socket);
 
       // Answer if we still can. A framing failure means we no longer know where
       // the next message starts, so the connection always closes after this.
@@ -271,7 +280,7 @@ function createServer(options, handler) {
       // The reader wants more: reading from the socket goes on (see
       // holdForReader).
       req._read = function () {
-        if (holdForReader && current && current.req === req) { holdForReader = false; updateReading(); }
+        if (holdForReader && ((current && current.req === req) || draining === req)) { holdForReader = false; updateReading(); }
       };
 
       current = { req: req, res: res, info: info };
@@ -319,7 +328,7 @@ function createServer(options, handler) {
     });
 
     parser.on('body', function (chunk) {
-      var req = current && current.req;
+      var req = current ? current.req : draining;
       if (!req) return;
       // Destroyed by the application: it will read no more. Dropped, and
       // reading goes on — a body nobody reads must not stop the connection.
@@ -331,7 +340,8 @@ function createServer(options, handler) {
     });
 
     parser.on('trailers', function (trailers) {
-      if (current && current.req) current.req.trailers = trailers;
+      var req = current ? current.req : draining;
+      if (req) req.trailers = trailers;
     });
 
     parser.on('end', function () {
@@ -349,6 +359,14 @@ function createServer(options, handler) {
       // that waits for 100-continue.
       if (current && !current.res.finished) { parser.pause(); holdForResponse = true; updateReading(); }
       if (current && current.req) current.req._endData();
+      else if (draining) {
+        // The body of a request already answered is whole: the exchange is
+        // over, and the next request's clock starts now.
+        var req = draining;
+        draining = null;
+        req._endData();
+        afterExchange();
+      }
     });
 
     parser.on('upgrade', function (info, head) {
@@ -407,6 +425,14 @@ function createServer(options, handler) {
 
         var headers = res.getHeaders();
         var code = res.statusCode;
+        // res.statusCode and res.statusMessage may have been set directly,
+        // past writeHead's check: checked here, as node:http checks them when
+        // it writes the head (ERR_HTTP_INVALID_STATUS_CODE, ERR_INVALID_CHAR,
+        // thrown to the caller of end / write). A reason phrase went out as
+        // given — and with a character past 0xFF, which the latin-1 head
+        // cannot hold, as its low byte: U+010D U+010A, CR LF, split the
+        // response.
+        validateStatus(code, res.statusMessage || undefined);
 
         // Status codes that define themselves as bodiless, plus HEAD, whose
         // response carries the headers of the body it is not sending.
@@ -535,25 +561,45 @@ function createServer(options, handler) {
       };
 
       function onResponseComplete() {
-        clearTimer();
         current = null;
-        socket._quicoBusy = false;
-        // Whatever of the body is still to come is dropped from here on (the
-        // parser reads it, to find the next request): the reader no longer
-        // holds the socket back.
-        holdForReader = false;
+        // The body not all here yet (the response went first, or the
+        // request's end is still to be seen): the rest still goes to req, as
+        // node:http does it — to a reader that is reading it, with its
+        // back-pressure; one nobody reads is dumped (resume(): read to no
+        // one, and 'end' after), so it never holds the connection back. It
+        // was dropped: req never had its 'end' or 'close', and an
+        // application that answered first and read the upload after (a 202)
+        // waited for it forever. The request timer goes on bounding its
+        // arrival.
+        if (!req.complete && !req.destroyed) {
+          draining = req;
+          if (req.readableFlowing === null) { holdForReader = false; req.resume(); }
+        } else {
+          holdForReader = false;
+        }
         updateReading();
 
         if (willClose || closing) {
+          clearTimer();
+          socket._quicoBusy = false;
+          halfClosed = true;
           // Half-close: let the peer read what we wrote before the socket goes.
           try { socket.end(); } catch (e) {}
           return;
         }
-
-        // Ready for the next request on this connection.
-        setTimer(keepAliveTimeout, 'keep-alive');
-        resumeParsing();
+        // The rest of the exchange is its body's end (parser 'end').
+        if (!draining) afterExchange();
       }
+    }
+
+    // An exchange is over — its response sent, its request read: the
+    // connection is idle, and ready for the next request on it.
+    function afterExchange() {
+      if (halfClosed) return;
+      clearTimer();
+      socket._quicoBusy = false;
+      setTimer(keepAliveTimeout, 'keep-alive');
+      resumeParsing();
     }
   }
 
