@@ -1384,6 +1384,8 @@ function createServer(options, handler) {
       },
       closed: { get: function () { return sessionClosed; }, enumerable: true },
       encrypted: { value: true, enumerable: true },
+      // Requests in flight, as h2_server's (the README lists it for both).
+      activeStreams: { get: function () { return Object.keys(conn.http_streams).length; }, enumerable: true },
       alpnProtocol: { value: 'h3', enumerable: true },
       type: { value: 0, enumerable: true }   // node:http2's NGHTTP2_SESSION_SERVER
     });

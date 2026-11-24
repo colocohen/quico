@@ -1417,9 +1417,10 @@ class ServerStream extends StreamBase {
     if (this.destroyed || this.closed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
     if (this.headersSent) throw nodeError(Error, 'ERR_HTTP2_HEADERS_SENT', 'Response has already been initiated.');
     options = fileOptions(options);
-    if (options.waitForTrailers) this._waitTrailers = true;
     this._touch();
     var prepared = this._fileHead(headers, options);
+    // Armed once nothing can throw (a throw leaves the stream as it was).
+    if (options.waitForTrailers) this._waitTrailers = true;
     var self = this, onError = options.onError;
     var fail = function (err, fd) {
       if (fd !== undefined) fs.close(fd, function () {});
@@ -1472,13 +1473,14 @@ class ServerStream extends StreamBase {
     if (this.destroyed || this.closed) throw nodeError(Error, 'ERR_HTTP2_INVALID_STREAM', 'The stream has been destroyed');
     if (this.headersSent) throw nodeError(Error, 'ERR_HTTP2_HEADERS_SENT', 'Response has already been initiated.');
     options = fileOptions(options);
-    if (options.waitForTrailers) this._waitTrailers = true;
     if (fd !== null && typeof fd === 'object' && typeof fd.fd === 'number' && typeof fd.close === 'function') fd = fd.fd;   // a FileHandle
     else if (typeof fd !== 'number') {
       throw nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "fd" argument must be of type number or an instance of FileHandle. Received ' + typeof fd);
     }
     this._touch();
     var prepared = this._fileHead(headers, options);
+    // Armed once nothing can throw (a throw leaves the stream as it was).
+    if (options.waitForTrailers) this._waitTrailers = true;
     var self = this;
     if (options.statCheck === undefined) {
       this._sendFile(fd, prepared, options.offset !== undefined ? options.offset : 0, options.length !== undefined ? options.length : -1, false);

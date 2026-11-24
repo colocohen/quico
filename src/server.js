@@ -380,6 +380,8 @@ function createServer(options, handler) {
     headersTimeout: options.headersTimeout,
     requestTimeout: options.requestTimeout,
     maxRequestsPerSocket: options.maxRequestsPerSocket,
+    // node:http2's: ping()s unacknowledged at once (10); h3's session ops.
+    maxOutstandingPings: options.maxOutstandingPings,
     // Rapid Reset: cancelled streams a connection may send (http_common).
     streamResetBurst: options.streamResetBurst, streamResetRate: options.streamResetRate,
     // WebTransport sessions a connection may hold at once (SETTINGS_WT_MAX_
