@@ -399,6 +399,11 @@ class WebSocket extends EventTarget {
       tls: secure ? (this._options.tls || lemonTls) : null,
       ca: this._options.ca,
       rejectUnauthorized: this._options.rejectUnauthorized,
+      // The name the certificate is checked against (and the SNI), as
+      // tls.connect's servername: the URL's host by default. It was dropped,
+      // so a wss:// URL by IP to a server whose certificate names it only by
+      // DNS name could never be verified.
+      servername: this._options.servername,
       // The key-exchange groups to offer (tls.connect's ecdhCurve).
       ecdhCurve: this._options.ecdhCurve,
       sigalgs: this._options.sigalgs,
